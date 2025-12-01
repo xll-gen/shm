@@ -48,6 +48,8 @@ void test_batch_basic() {
 void test_wrapping() {
     std::cout << "Testing Wrapping..." << std::endl;
     // Small buffer: 128 header + 100 capacity
+    // QueueHeader is 128 bytes.
+    // Capacity 200.
     size_t cap = 200;
     size_t shmSize = SPSCQueue::GetRequiredSize(cap);
     void* buffer = malloc(shmSize);
@@ -65,21 +67,22 @@ void test_wrapping() {
     queue.Dequeue(out);
     assert(out.size() == 50);
 
-    // Now wPos is advanced. 50 + 8 = 58.
+    // Now wPos is advanced. 50 + 16 (Header) = 66.
     // Capacity 200.
     // Let's write enough to wrap.
-    // Free space at end: 200 - 58 = 142.
-    // Write 100 bytes (total 108).
+    // Free space at end: 200 - 66 = 134.
+    // Write 100 bytes (total 116).
     std::vector<uint8_t> d2(100, 2);
     queue.Enqueue(d2.data(), 100);
 
-    // wPos: 58 + 108 = 166.
-    // Free space at end: 200 - 166 = 34.
+    // wPos: 66 + 116 = 182.
+    // Free space at end: 200 - 182 = 18.
 
     // Write batch that forces wrap.
-    // Need > 34 bytes (header+data).
-    // Try writing 40 bytes data (+8 = 48).
-    // Should pad 34 bytes, wrap to 0, write 48 bytes.
+    // Need > 18 bytes (header+data).
+    // BlockHeader is 16.
+    // Write 40 bytes data (+16 = 56).
+    // Should pad 18 bytes (header 16 + 2 size), wrap to 0, write 56 bytes.
     std::vector<std::vector<uint8_t>> batch;
     batch.push_back(std::vector<uint8_t>(40, 3));
 
@@ -103,8 +106,53 @@ void test_wrapping() {
     std::cout << "PASS" << std::endl;
 }
 
+void test_msg_id() {
+    std::cout << "Testing MsgId..." << std::endl;
+    size_t cap = 1024;
+    size_t shmSize = SPSCQueue::GetRequiredSize(cap);
+    void* buffer = malloc(shmSize);
+    SPSCQueue::Init(buffer, cap);
+
+    EventHandle hEvent = Platform::CreateNamedEvent("test_msg_id");
+    SPSCQueue queue(buffer, cap, hEvent);
+
+    // Write Normal
+    std::vector<uint8_t> d1(10, 1);
+    queue.Enqueue(d1.data(), 10, 0);
+
+    // Write Heartbeat
+    queue.Enqueue(nullptr, 0, 1); // MsgId 1
+
+    // Write Data with MsgId 2
+    std::vector<uint8_t> d2(10, 2);
+    queue.Enqueue(d2.data(), 10, 2);
+
+    // Read 1
+    std::vector<uint8_t> out;
+    uint32_t msgId = queue.Dequeue(out);
+    assert(msgId == 0);
+    assert(out.size() == 10);
+    assert(out[0] == 1);
+
+    // Read 2
+    msgId = queue.Dequeue(out);
+    assert(msgId == 1);
+    assert(out.size() == 0);
+
+    // Read 3
+    msgId = queue.Dequeue(out);
+    assert(msgId == 2);
+    assert(out.size() == 10);
+    assert(out[0] == 2);
+
+    Platform::CloseEvent(hEvent);
+    free(buffer);
+    std::cout << "PASS" << std::endl;
+}
+
 int main() {
     test_batch_basic();
     test_wrapping();
+    test_msg_id();
     return 0;
 }

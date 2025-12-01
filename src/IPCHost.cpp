@@ -1,48 +1,42 @@
 #include "IPCHost.h"
 #include <iostream>
-#ifdef _WIN32
-#include <emmintrin.h> // _mm_pause
-#else
-#include <x86intrin.h> // __builtin_ia32_pause
-#endif
-#include "../benchmarks/include/ipc_generated.h" // For ipc::GetMessage
+#include "../benchmarks/include/ipc_generated.h" // For FlatBuffers decoding
 
 namespace shm {
 
 bool IPCHost::Init(const std::string& shmName, uint64_t queueSize) {
-    // 1. Create/Open Events
-    std::string toGuestEvName = shmName + "_REQ";
-    std::string fromGuestEvName = shmName + "_RESP";
+    this->shmName = shmName;
+    this->queueSize = queueSize;
 
-    hToGuestEvent = Platform::CreateNamedEvent(toGuestEvName.c_str());
-    hFromGuestEvent = Platform::CreateNamedEvent(fromGuestEvName.c_str());
-
-    if (!hToGuestEvent || !hFromGuestEvent) return false;
-
-    // 2. Create SHM
-    // Total size = 2 * (Header + Data)
-    uint64_t qTotalSize = SPSCQueue::GetRequiredSize(queueSize);
-    uint64_t totalShmSize = qTotalSize * 2;
+    // 1. Create SHM
+    // Layout: [QueueHeader ToGuest][Data...][QueueHeader FromGuest][Data...]
+    size_t qTotalSize = SPSCQueue::GetRequiredSize(queueSize);
+    size_t totalShmSize = qTotalSize * 2;
 
     bool exists = false;
     shmBase = Platform::CreateNamedShm(shmName.c_str(), totalShmSize, hMapFile, exists);
-
     if (!shmBase) return false;
 
-    // Layout: [ToGuestQueue] [FromGuestQueue]
-    uint8_t* reqBase = (uint8_t*)shmBase;
+    // Zero out if new? Or always zero out?
+    // If it already existed, we might be attaching to a dead session or a live one.
+    // For Host, we typically own it.
+    memset(shmBase, 0, totalShmSize);
 
-    // Init if created new OR if existing but uninitialized (capacity 0)
-    QueueHeader* hdr = reinterpret_cast<QueueHeader*>(reqBase);
-    if (!exists || hdr->capacity == 0) {
-        SPSCQueue::Init(reqBase, queueSize);
-        SPSCQueue::Init(reqBase + qTotalSize, queueSize);
-    }
+    // 2. Init Queues
+    uint8_t* reqBase = (uint8_t*)shmBase;
+    SPSCQueue::Init(reqBase, queueSize);
+
+    uint8_t* respBase = reqBase + qTotalSize;
+    SPSCQueue::Init(respBase, queueSize);
+
+    // Create Events
+    hToGuestEvent = Platform::CreateNamedEvent((shmName + "_event_req").c_str());
+    hFromGuestEvent = Platform::CreateNamedEvent((shmName + "_event_resp").c_str());
 
     toGuestQueue = std::make_unique<SPSCQueue>(reqBase, queueSize, hToGuestEvent);
-    fromGuestQueue = std::make_unique<SPSCQueue>(reqBase + qTotalSize, queueSize, hFromGuestEvent);
+    fromGuestQueue = std::make_unique<SPSCQueue>(respBase, queueSize, hFromGuestEvent);
 
-    // 3. Start Threads
+    // 3. Start Reader Thread
     running = true;
     readerThread = std::thread(&IPCHost::ReaderLoop, this);
 
@@ -55,58 +49,102 @@ void IPCHost::Shutdown() {
     if (readerThread.joinable()) readerThread.join();
 
     if (shmBase) Platform::CloseShm(hMapFile, shmBase);
-    if (hToGuestEvent) Platform::CloseEvent(hToGuestEvent);
-    if (hFromGuestEvent) Platform::CloseEvent(hFromGuestEvent);
+    Platform::CloseEvent(hToGuestEvent);
+    Platform::CloseEvent(hFromGuestEvent);
 }
 
 void IPCHost::ReaderLoop() {
     std::vector<uint8_t> buffer;
-    buffer.reserve(4096);
+    buffer.reserve(1024);
 
     while (running) {
         // Dequeue blocks until data is available
-        fromGuestQueue->Dequeue(buffer);
+        uint32_t msgId = fromGuestQueue->Dequeue(buffer);
 
-        // Got message
-        auto msg = ipc::GetMessage(buffer.data());
-        if (!msg) continue;
+        if (msgId == MSG_ID_HEARTBEAT_RESP) {
+            std::lock_guard<std::mutex> lock(heartbeatMutex);
+            if (heartbeatPromise) {
+                heartbeatPromise->set_value();
+                heartbeatPromise.reset();
+            }
+            continue;
+        }
 
-        uint64_t reqId = msg->req_id();
+        if (msgId == MSG_ID_NORMAL) {
+            // Got message
+            auto msg = ipc::GetMessage(buffer.data());
+            // Verify verifier?
+            // flatbuffers::Verifier verifier(buffer.data(), buffer.size());
+            // if (!msg->Verify(verifier)) continue;
 
-        std::lock_guard<std::mutex> lock(pendingMutex);
-        auto it = pendingRequests.find(reqId);
-        if (it != pendingRequests.end()) {
-            RequestContext* ctx = it->second;
-            ctx->promise.set_value(std::move(buffer));
-            pendingRequests.erase(it);
+            if (!msg) continue;
+
+            uint64_t reqId = msg->req_id();
+
+            std::lock_guard<std::mutex> lock(pendingMutex);
+            auto it = pendingRequests.find(reqId);
+            if (it != pendingRequests.end()) {
+                RequestContext* ctx = it->second;
+                ctx->promise.set_value(std::move(buffer));
+                pendingRequests.erase(it);
+            }
         }
     }
 }
 
 bool IPCHost::Call(const uint8_t* reqData, size_t reqSize, std::vector<uint8_t>& outResponse) {
-    // 1. Prepare Context
+    // 1. Create Promise
+    uint64_t reqId = 0;
+    // We need to parse reqId from FlatBuffer to register it.
+    // Assuming the caller constructed a valid FlatBuffer Message.
+    auto msg = ipc::GetMessage(reqData);
+    reqId = msg->req_id();
+
     RequestContext ctx;
     auto future = ctx.promise.get_future();
-
-    // Parse to find ReqID - we trust the caller has set it in the FlatBuffer
-    auto msg = ipc::GetMessage(reqData);
-    uint64_t reqId = msg->req_id();
 
     {
         std::lock_guard<std::mutex> lock(pendingMutex);
         pendingRequests[reqId] = &ctx;
     }
 
-    // 2. Enqueue directly
+    // 2. Enqueue
     {
-        std::lock_guard<std::mutex> lock(writeMutex);
-        toGuestQueue->Enqueue(reqData, (uint32_t)reqSize);
+        std::lock_guard<std::mutex> lock(sendMutex);
+        toGuestQueue->Enqueue(reqData, (uint32_t)reqSize, MSG_ID_NORMAL);
     }
 
     // 3. Wait
-    // In a real system, we should have a timeout
+    // TODO: Timeout
+    future.wait();
     outResponse = future.get();
+
     return true;
+}
+
+bool IPCHost::SendHeartbeat() {
+    std::future<void> future;
+    {
+        std::lock_guard<std::mutex> lock(heartbeatMutex);
+        heartbeatPromise = std::make_unique<std::promise<void>>();
+        future = heartbeatPromise->get_future();
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(sendMutex);
+        toGuestQueue->Enqueue(nullptr, 0, MSG_ID_HEARTBEAT_REQ);
+    }
+
+    // Wait for response with timeout
+    if (future.wait_for(std::chrono::seconds(1)) == std::future_status::timeout) {
+        return false;
+    }
+    return true;
+}
+
+void IPCHost::SendShutdown() {
+    std::lock_guard<std::mutex> lock(sendMutex);
+    toGuestQueue->Enqueue(nullptr, 0, MSG_ID_SHUTDOWN);
 }
 
 }

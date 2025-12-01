@@ -16,11 +16,13 @@ namespace shm {
 
 static const uint32_t BLOCK_MAGIC_DATA = 0xDA7A0001;
 static const uint32_t BLOCK_MAGIC_PAD  = 0xDA7A0002;
-static const uint32_t BLOCK_HEADER_SIZE = 8;
+static const uint32_t BLOCK_HEADER_SIZE = 16;
 
 struct BlockHeader {
     uint32_t size;
+    uint32_t msgId;
     alignas(4) std::atomic<uint32_t> magic;
+    uint32_t padding;
 };
 
 // Layout must match Go struct
@@ -30,7 +32,20 @@ struct QueueHeader {
     std::atomic<uint64_t> capacity;
     // Added for signal optimization: 1 if consumer is waiting/sleeping, 0 otherwise
     std::atomic<uint32_t> consumerWaiting;
-    uint8_t padding[44]; // Reduced padding by 4 bytes
+    uint8_t padding[44]; // Reduced padding by 4 bytes to keep 128 byte alignment if needed, or 48?
+    // originally 56 bytes pad1, then 44 bytes pad2.
+    // wait, let's calculate:
+    // wPos (8), rPos (8), cap (8), consumerWaiting (4) = 28 bytes.
+    // 128 bytes total size.
+    // 128 - 28 = 100 bytes padding.
+    // The struct has explicit alignment on wPos and rPos though.
+    // wPos @ 0.
+    // rPos @ 64.
+    // So wPos (8) + pad1 (56) = 64.
+    // rPos (8) + cap (8) + consumerWaiting (4) + pad2 (?) = 64.
+    // 8 + 8 + 4 = 20.
+    // 64 - 20 = 44.
+    // So padding is 44 bytes. Correct.
 };
 
 class SPSCQueue {
@@ -59,7 +74,7 @@ public:
 
     // Producer: Enqueue data
     // Blocks/Spins if full.
-    void Enqueue(const void* data, uint32_t size) {
+    void Enqueue(const void* data, uint32_t size, uint32_t msgId = 0) {
         uint32_t alignedSize = (size + 7) & ~7;
         uint32_t totalSize = alignedSize + BLOCK_HEADER_SIZE;
         uint64_t cap = header->capacity.load(std::memory_order_relaxed);
@@ -93,6 +108,7 @@ public:
                     // Write Padding
                     BlockHeader* bh = reinterpret_cast<BlockHeader*>(buffer + offset);
                     bh->size = (uint32_t)spaceToEnd - BLOCK_HEADER_SIZE;
+                    bh->msgId = 0;
                     bh->magic.store(BLOCK_MAGIC_PAD, std::memory_order_relaxed);
 
                     header->writePos.store(wPos + spaceToEnd, std::memory_order_release);
@@ -103,8 +119,11 @@ public:
             // Write Data
             BlockHeader* bh = reinterpret_cast<BlockHeader*>(buffer + offset);
             bh->size = size;
+            bh->msgId = msgId;
             bh->magic.store(BLOCK_MAGIC_DATA, std::memory_order_relaxed);
-            memcpy(buffer + offset + BLOCK_HEADER_SIZE, data, size);
+            if (size > 0 && data != nullptr) {
+                memcpy(buffer + offset + BLOCK_HEADER_SIZE, data, size);
+            }
 
             header->writePos.store(wPos + totalSize, std::memory_order_release);
 
@@ -118,6 +137,9 @@ public:
         }
     }
 
+    // Producer: Enqueue Batch
+    // Only supports normal messages (msgId=0) implicitly for now, or we need to change signature.
+    // Assuming batch is for data payload.
     void EnqueueBatch(const std::vector<std::vector<uint8_t>>& msgs) {
         if (msgs.empty()) return;
 
@@ -169,6 +191,7 @@ public:
                         // Padding
                         BlockHeader* bh = reinterpret_cast<BlockHeader*>(buffer + offset);
                         bh->size = (uint32_t)spaceToEnd - BLOCK_HEADER_SIZE;
+                        bh->msgId = 0;
                         bh->magic.store(BLOCK_MAGIC_PAD, std::memory_order_relaxed);
 
                         tempWPos += spaceToEnd;
@@ -180,6 +203,7 @@ public:
                 // Write Data
                 BlockHeader* bh = reinterpret_cast<BlockHeader*>(buffer + offset);
                 bh->size = size;
+                bh->msgId = 0; // Batch implies normal data
                 bh->magic.store(BLOCK_MAGIC_DATA, std::memory_order_relaxed);
                 memcpy(buffer + offset + BLOCK_HEADER_SIZE, data.data(), size);
 
@@ -202,7 +226,8 @@ public:
 
     // Consumer: Dequeue data
     // Blocks if empty.
-    void Dequeue(std::vector<uint8_t>& outBuffer) {
+    // Returns msgId.
+    uint32_t Dequeue(std::vector<uint8_t>& outBuffer) {
         int spinCount = 0;
         while (true) {
             uint64_t rPos = header->readPos.load(std::memory_order_relaxed);
@@ -260,14 +285,17 @@ public:
 
             // DATA
             uint32_t size = bh->size;
+            uint32_t msgId = bh->msgId;
             uint32_t alignedSize = (size + 7) & ~7;
             uint64_t nextRPosDiff = alignedSize + BLOCK_HEADER_SIZE;
 
             outBuffer.resize(size);
-            memcpy(outBuffer.data(), buffer + offset + BLOCK_HEADER_SIZE, size);
+            if (size > 0) {
+                memcpy(outBuffer.data(), buffer + offset + BLOCK_HEADER_SIZE, size);
+            }
 
             header->readPos.store(rPos + nextRPosDiff, std::memory_order_release);
-            return;
+            return msgId;
         }
     }
 
@@ -329,11 +357,14 @@ public:
 
                 // DATA
                 uint32_t size = bh->size;
+                // uint32_t msgId = bh->msgId; // Ignored for batch
                 uint32_t alignedSize = (size + 7) & ~7;
                 uint64_t nextRPosDiff = alignedSize + BLOCK_HEADER_SIZE;
 
                 std::vector<uint8_t> msg(size);
-                memcpy(msg.data(), buffer + offset + BLOCK_HEADER_SIZE, size);
+                if (size > 0) {
+                    memcpy(msg.data(), buffer + offset + BLOCK_HEADER_SIZE, size);
+                }
                 outMsgs.push_back(std::move(msg));
 
                 rPos += nextRPosDiff;

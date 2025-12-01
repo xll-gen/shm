@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"os"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -10,12 +11,23 @@ import (
 
 	flatbuffers "github.com/google/flatbuffers/go"
 	"benchmark/ipc" // Using local generated code
-	"xll-gen/shm/go" // Changed import path to match module
+	"github.com/xll-gen/shm/go" // Changed import path to match module
 )
 
 const (
 	QUEUE_SIZE = 1024 * 1024 * 32 // 32MB
 )
+
+// Message IDs
+const (
+	MSG_ID_NORMAL         = 0
+	MSG_ID_HEARTBEAT_REQ  = 1
+	MSG_ID_HEARTBEAT_RESP = 2
+	MSG_ID_SHUTDOWN       = 3
+)
+
+// Mutex to protect SPSCQueue Write
+var respMutex sync.Mutex
 
 func main() {
 	workers := flag.Int("w", 1, "Number of worker threads")
@@ -45,7 +57,7 @@ func main() {
 	var hToGuest, hFromGuest shm.EventHandle
 
 	for {
-		hToGuest, err = shm.OpenEvent("SimpleIPC_REQ") // REQ = ToGuest
+		hToGuest, err = shm.OpenEvent("SimpleIPC_event_req") // REQ = ToGuest
 		if err == nil {
 			break
 		}
@@ -53,7 +65,7 @@ func main() {
 	}
 
 	for {
-		hFromGuest, err = shm.OpenEvent("SimpleIPC_RESP") // RESP = FromGuest
+		hFromGuest, err = shm.OpenEvent("SimpleIPC_event_resp") // RESP = FromGuest
 		if err == nil {
 			break
 		}
@@ -75,14 +87,9 @@ func main() {
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	// 4. Init IPC Client
-	client := shm.NewIPCClient(toGuestQueue, fromGuestQueue)
-	client.Start()
-	defer client.Stop()
-
 	fmt.Println("[Go] Guest Ready. Waiting for requests from Host...")
 
-	// 5. Start Workers
+	// 4. Start Workers
 	workChan := make(chan []byte, 1024)
 
 	var wg sync.WaitGroup
@@ -92,34 +99,44 @@ func main() {
 			defer wg.Done()
 			builder := flatbuffers.NewBuilder(1024)
 			for data := range workChan {
-				handleRequest(data, client, builder)
+				handleRequest(data, fromGuestQueue, builder)
 			}
 		}(i)
 	}
 
-	// 6. Consumer Loop (Reading from toGuestQueue)
-	// We can use client.StartReader if we refactor, but strict loop here is fine too.
-	// But `client.StartReader` runs in background.
-	// To keep `main` blocking, we can use `StartReader` and then wait?
-	// Or just loop here manually calling Dequeue (as Client is mainly for Sending).
-	// Let's loop manually to read from toGuestQueue and push to workers.
-
-	// Actually, if we use Client.StartReader, we need to pass a callback.
-	// client.StartReader(func(data []byte) { workChan <- data })
-	// select {}
-
+	// 5. Consumer Loop (Reading from toGuestQueue)
 	for {
-		data := toGuestQueue.Dequeue()
-		workChan <- data
+		// Dequeue blocks now
+		data, msgId := toGuestQueue.Dequeue()
+
+		switch msgId {
+		case MSG_ID_NORMAL:
+			workChan <- data
+
+		case MSG_ID_HEARTBEAT_REQ:
+			// Send Heartbeat Response immediately
+			respMutex.Lock()
+			fromGuestQueue.Enqueue(nil, MSG_ID_HEARTBEAT_RESP)
+			respMutex.Unlock()
+
+		case MSG_ID_SHUTDOWN:
+			fmt.Println("[Go] Received Shutdown Request. Exiting...")
+			close(workChan)
+			wg.Wait()
+			os.Exit(0)
+
+		default:
+			fmt.Printf("[Go] Unknown msgId: %d\n", msgId)
+		}
 	}
 
 	_ = hMap
 }
 
-func handleRequest(data []byte, client *shm.IPCClient, builder *flatbuffers.Builder) {
+func handleRequest(data []byte, respQ *shm.SPSCQueue, builder *flatbuffers.Builder) {
 	defer func() {
 		if r := recover(); r != nil {
-			// Recover
+			// Recover from potential FlatBuffers panics due to corrupt data
 		}
 	}()
 
@@ -164,20 +181,9 @@ func handleRequest(data []byte, client *shm.IPCClient, builder *flatbuffers.Buil
 	builder.Finish(resMsg)
 	resBytes := builder.FinishedBytes()
 
-	// Get buffer from pool and copy
-	// Because FlatBuffers builder reuses its internal buffer, we must copy out.
-	// `resBytes` is a slice of builder's buffer.
-
-	bufPtr := client.GetBuffer()
-
-	// Resize bufPtr if needed
-	if cap(*bufPtr) < len(resBytes) {
-		*bufPtr = make([]byte, len(resBytes))
-	} else {
-		*bufPtr = (*bufPtr)[:len(resBytes)]
-	}
-	copy(*bufPtr, resBytes)
-
-	// Send (Client takes ownership and returns to pool)
-	client.Send(bufPtr)
+	// Enqueue blocks if full
+	// SPSCQueue is Single Producer, so multiple workers must serialize writes
+	respMutex.Lock()
+	respQ.Enqueue(resBytes, MSG_ID_NORMAL)
+	respMutex.Unlock()
 }

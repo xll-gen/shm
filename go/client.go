@@ -6,6 +6,13 @@ import (
 	"sync/atomic"
 )
 
+const (
+	MsgIdNormal        = 0
+	MsgIdHeartbeatReq  = 1
+	MsgIdHeartbeatResp = 2
+	MsgIdShutdown      = 3
+)
+
 // IPCClient manages the Go-side Guest connection.
 type IPCClient struct {
 	ReqQueue  *SPSCQueue // Read from here (Host->Guest)
@@ -64,7 +71,7 @@ func (c *IPCClient) Send(msg *[]byte) {
 		runtime.Gosched()
 	}
 
-	c.RespQueue.Enqueue(*msg)
+	c.RespQueue.Enqueue(*msg, MsgIdNormal)
 
 	atomic.StoreInt32(&c.writeLock, 0)
 
@@ -82,8 +89,36 @@ func (c *IPCClient) StartReader(handler func([]byte)) {
 	go func() {
 		defer c.wg.Done()
 		for atomic.LoadInt32(&c.running) == 1 {
-			data := c.ReqQueue.Dequeue()
-			handler(data)
+			data, msgId := c.ReqQueue.Dequeue()
+
+			if msgId == MsgIdHeartbeatReq {
+				// Respond immediately
+				c.sendControlMessage(MsgIdHeartbeatResp)
+				continue
+			}
+
+			if msgId == MsgIdShutdown {
+				// Stop
+				atomic.StoreInt32(&c.running, 0)
+				return
+			}
+
+			if msgId == MsgIdNormal {
+				handler(data)
+			}
 		}
 	}()
+}
+
+func (c *IPCClient) sendControlMessage(msgId uint32) {
+	// Spin Lock
+	for {
+		if atomic.CompareAndSwapInt32(&c.writeLock, 0, 1) {
+			break
+		}
+		runtime.Gosched()
+	}
+
+	c.RespQueue.Enqueue(nil, msgId)
+	atomic.StoreInt32(&c.writeLock, 0)
 }
