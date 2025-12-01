@@ -18,17 +18,6 @@ const (
 	QUEUE_SIZE = 1024 * 1024 * 32 // 32MB
 )
 
-// Message IDs
-const (
-	MSG_ID_NORMAL         = 0
-	MSG_ID_HEARTBEAT_REQ  = 1
-	MSG_ID_HEARTBEAT_RESP = 2
-	MSG_ID_SHUTDOWN       = 3
-)
-
-// Mutex to protect SPSCQueue Write
-var respMutex sync.Mutex
-
 func main() {
 	workers := flag.Int("w", 1, "Number of worker threads")
 	flag.Parse()
@@ -89,6 +78,9 @@ func main() {
 
 	fmt.Println("[Go] Guest Ready. Waiting for requests from Host...")
 
+	// Init IPCGuest
+	client := shm.NewIPCGuest(toGuestQueue, fromGuestQueue)
+
 	// 4. Start Workers
 	workChan := make(chan []byte, 1024)
 
@@ -99,41 +91,31 @@ func main() {
 			defer wg.Done()
 			builder := flatbuffers.NewBuilder(1024)
 			for data := range workChan {
-				handleRequest(data, fromGuestQueue, builder)
+				handleRequest(data, client, builder)
 			}
 		}(i)
 	}
 
-	// 5. Consumer Loop (Reading from toGuestQueue)
-	for {
-		// Dequeue blocks now
-		data, msgId := toGuestQueue.Dequeue()
+	// 5. Start Reader (handles normal, heartbeat, shutdown)
+	client.StartReader(func(data []byte) {
+		// Copy data because IPCGuest reuses/frees buffer?
+		// SPSCQueue Dequeue returns allocated buffer.
+		// IPCGuest.StartReader just passes it.
+		// So it's safe to pass to channel.
+		workChan <- data
+	})
 
-		switch msgId {
-		case MSG_ID_NORMAL:
-			workChan <- data
+	// Wait for Shutdown
+	client.Wait()
 
-		case MSG_ID_HEARTBEAT_REQ:
-			// Send Heartbeat Response immediately
-			respMutex.Lock()
-			fromGuestQueue.Enqueue(nil, MSG_ID_HEARTBEAT_RESP)
-			respMutex.Unlock()
-
-		case MSG_ID_SHUTDOWN:
-			fmt.Println("[Go] Received Shutdown Request. Exiting...")
-			close(workChan)
-			wg.Wait()
-			os.Exit(0)
-
-		default:
-			fmt.Printf("[Go] Unknown msgId: %d\n", msgId)
-		}
-	}
-
+	fmt.Println("[Go] Received Shutdown. Exiting...")
+	close(workChan)
+	wg.Wait()
 	_ = hMap
+	os.Exit(0)
 }
 
-func handleRequest(data []byte, respQ *shm.SPSCQueue, builder *flatbuffers.Builder) {
+func handleRequest(data []byte, client *shm.IPCGuest, builder *flatbuffers.Builder) {
 	defer func() {
 		if r := recover(); r != nil {
 			// Recover from potential FlatBuffers panics due to corrupt data
@@ -181,9 +163,6 @@ func handleRequest(data []byte, respQ *shm.SPSCQueue, builder *flatbuffers.Build
 	builder.Finish(resMsg)
 	resBytes := builder.FinishedBytes()
 
-	// Enqueue blocks if full
-	// SPSCQueue is Single Producer, so multiple workers must serialize writes
-	respMutex.Lock()
-	respQ.Enqueue(resBytes, MSG_ID_NORMAL)
-	respMutex.Unlock()
+	// Use IPCGuest to send (uses spinlock and signal-before-lock opt)
+	client.SendBytes(resBytes)
 }

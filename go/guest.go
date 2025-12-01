@@ -1,7 +1,6 @@
 package shm
 
 import (
-	"runtime"
 	"sync"
 	"sync/atomic"
 )
@@ -13,8 +12,8 @@ const (
 	MsgIdShutdown      = 3
 )
 
-// IPCClient manages the Go-side Guest connection.
-type IPCClient struct {
+// IPCGuest manages the Go-side Guest connection.
+type IPCGuest struct {
 	ReqQueue  *SPSCQueue // Read from here (Host->Guest)
 	RespQueue *SPSCQueue // Write to here (Guest->Host)
 
@@ -23,12 +22,13 @@ type IPCClient struct {
 	running int32
 	wg      sync.WaitGroup
 
-	// spinLock for writing, to avoid syscalls in sync.Mutex
-	writeLock int32
+	// Mutex for writing.
+	// Previously used spinlock, but sync.Mutex proved more stable in benchmarks.
+	mu sync.Mutex
 }
 
-func NewIPCClient(reqQ *SPSCQueue, respQ *SPSCQueue) *IPCClient {
-	c := &IPCClient{
+func NewIPCGuest(reqQ *SPSCQueue, respQ *SPSCQueue) *IPCGuest {
+	c := &IPCGuest{
 		ReqQueue:  reqQ,
 		RespQueue: respQ,
 		pool: &sync.Pool{
@@ -42,11 +42,11 @@ func NewIPCClient(reqQ *SPSCQueue, respQ *SPSCQueue) *IPCClient {
 	return c
 }
 
-func (c *IPCClient) Start() {
+func (c *IPCGuest) Start() {
 	// No background threads needed for writing anymore
 }
 
-func (c *IPCClient) Stop() {
+func (c *IPCGuest) Stop() {
 	atomic.StoreInt32(&c.running, 0)
 	c.wg.Wait()
 }
@@ -54,37 +54,29 @@ func (c *IPCClient) Stop() {
 // Send queues a message for sending.
 // The message buffer *must* be one allocated from c.GetBuffer() or compatible.
 // It writes directly to the queue.
-func (c *IPCClient) Send(msg *[]byte) {
+func (c *IPCGuest) Send(msg *[]byte) {
 	if atomic.LoadInt32(&c.running) == 0 {
 		return
 	}
 
-	// Spin Lock
-	for {
-		if atomic.CompareAndSwapInt32(&c.writeLock, 0, 1) {
-			break
-		}
-		// Pause/Yield
-		for i := 0; i < 30; i++ {
-			// CPU pause hint? Go doesn't expose it directly except internal.
-		}
-		runtime.Gosched()
+	if atomic.LoadUint32(&c.RespQueue.Header.ConsumerWaiting) == 1 {
+		SignalEvent(c.RespQueue.Event)
 	}
 
+	c.mu.Lock()
 	c.RespQueue.Enqueue(*msg, MsgIdNormal)
-
-	atomic.StoreInt32(&c.writeLock, 0)
+	c.mu.Unlock()
 
 	// Recycle buffer
 	*msg = (*msg)[:0]
 	c.pool.Put(msg)
 }
 
-func (c *IPCClient) GetBuffer() *[]byte {
+func (c *IPCGuest) GetBuffer() *[]byte {
 	return c.pool.Get().(*[]byte)
 }
 
-func (c *IPCClient) StartReader(handler func([]byte)) {
+func (c *IPCGuest) StartReader(handler func([]byte)) {
 	c.wg.Add(1)
 	go func() {
 		defer c.wg.Done()
@@ -93,7 +85,7 @@ func (c *IPCClient) StartReader(handler func([]byte)) {
 
 			if msgId == MsgIdHeartbeatReq {
 				// Respond immediately
-				c.sendControlMessage(MsgIdHeartbeatResp)
+				c.SendControl(MsgIdHeartbeatResp)
 				continue
 			}
 
@@ -110,15 +102,27 @@ func (c *IPCClient) StartReader(handler func([]byte)) {
 	}()
 }
 
-func (c *IPCClient) sendControlMessage(msgId uint32) {
-	// Spin Lock
-	for {
-		if atomic.CompareAndSwapInt32(&c.writeLock, 0, 1) {
-			break
-		}
-		runtime.Gosched()
+func (c *IPCGuest) SendControl(msgId uint32) {
+	c.mu.Lock()
+	c.RespQueue.Enqueue(nil, msgId)
+	c.mu.Unlock()
+}
+
+// SendBytes sends a raw byte slice without pooling.
+func (c *IPCGuest) SendBytes(data []byte) {
+	if atomic.LoadInt32(&c.running) == 0 {
+		return
 	}
 
-	c.RespQueue.Enqueue(nil, msgId)
-	atomic.StoreInt32(&c.writeLock, 0)
+	if atomic.LoadUint32(&c.RespQueue.Header.ConsumerWaiting) == 1 {
+		SignalEvent(c.RespQueue.Event)
+	}
+
+	c.mu.Lock()
+	c.RespQueue.Enqueue(data, MsgIdNormal)
+	c.mu.Unlock()
+}
+
+func (c *IPCGuest) Wait() {
+	c.wg.Wait()
 }
