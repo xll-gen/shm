@@ -28,7 +28,9 @@ struct QueueHeader {
     alignas(64) std::atomic<uint64_t> writePos;
     alignas(64) std::atomic<uint64_t> readPos;
     std::atomic<uint64_t> capacity;
-    uint8_t padding[48];
+    // Added for signal optimization: 1 if consumer is waiting/sleeping, 0 otherwise
+    std::atomic<uint32_t> consumerWaiting;
+    uint8_t padding[44]; // Reduced padding by 4 bytes
 };
 
 class SPSCQueue {
@@ -52,6 +54,7 @@ public:
         h->writePos = 0;
         h->readPos = 0;
         h->capacity = capacity;
+        h->consumerWaiting = 0;
     }
 
     // Producer: Enqueue data
@@ -92,7 +95,6 @@ public:
                     bh->size = (uint32_t)spaceToEnd - BLOCK_HEADER_SIZE;
                     bh->magic.store(BLOCK_MAGIC_PAD, std::memory_order_relaxed);
 
-                    std::atomic_thread_fence(std::memory_order_release);
                     header->writePos.store(wPos + spaceToEnd, std::memory_order_release);
                     continue;
                 }
@@ -104,10 +106,14 @@ public:
             bh->magic.store(BLOCK_MAGIC_DATA, std::memory_order_relaxed);
             memcpy(buffer + offset + BLOCK_HEADER_SIZE, data, size);
 
-            std::atomic_thread_fence(std::memory_order_release);
             header->writePos.store(wPos + totalSize, std::memory_order_release);
 
-            Platform::SignalEvent(hEvent);
+            // Ensure Store(WritePos) is visible before Load(ConsumerWaiting)
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+
+            if (header->consumerWaiting.load(std::memory_order_relaxed) == 1) {
+                Platform::SignalEvent(hEvent);
+            }
             return;
         }
     }
@@ -182,9 +188,14 @@ public:
             }
 
             if (tempWPos != wPos) {
-                 std::atomic_thread_fence(std::memory_order_release);
                  header->writePos.store(tempWPos, std::memory_order_release);
-                 Platform::SignalEvent(hEvent);
+
+                 // Ensure Store(WritePos) is visible before Load(ConsumerWaiting)
+                 std::atomic_thread_fence(std::memory_order_seq_cst);
+
+                 if (header->consumerWaiting.load(std::memory_order_relaxed) == 1) {
+                     Platform::SignalEvent(hEvent);
+                 }
             }
         }
     }
@@ -208,7 +219,16 @@ public:
 #endif
                     continue;
                 } else {
+                    header->consumerWaiting.store(1, std::memory_order_relaxed);
+                    // Double check
+                    std::atomic_thread_fence(std::memory_order_seq_cst);
+                    if (header->readPos.load(std::memory_order_relaxed) != header->writePos.load(std::memory_order_acquire)) {
+                        header->consumerWaiting.store(0, std::memory_order_relaxed);
+                        continue;
+                    }
+
                     Platform::WaitEvent(hEvent, 100);
+                    header->consumerWaiting.store(0, std::memory_order_relaxed);
                     spinCount = 0;
                     continue;
                 }
@@ -273,7 +293,15 @@ public:
 #endif
                     continue;
                 } else {
+                    header->consumerWaiting.store(1, std::memory_order_relaxed);
+                    std::atomic_thread_fence(std::memory_order_seq_cst);
+                    if (header->readPos.load(std::memory_order_relaxed) != header->writePos.load(std::memory_order_acquire)) {
+                        header->consumerWaiting.store(0, std::memory_order_relaxed);
+                        continue;
+                    }
+
                     Platform::WaitEvent(hEvent, 100);
+                    header->consumerWaiting.store(0, std::memory_order_relaxed);
                     spinCount = 0;
                     continue;
                 }

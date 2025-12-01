@@ -28,17 +28,14 @@ class IPCHost {
 
     std::atomic<bool> running;
     std::thread readerThread;
-    std::thread writerThread; // Dedicated writer thread
 
     std::atomic<uint64_t> nextReqId{1};
 
     std::mutex pendingMutex;
     std::unordered_map<uint64_t, RequestContext*> pendingRequests;
 
-    // Outbound Queue for Writer Thread
-    std::mutex outboundMutex;
-    std::condition_variable outboundCV;
-    std::vector<std::vector<uint8_t>> outboundQueue;
+    // Mutex for direct writing to SPSCQueue (since multiple threads might call Call)
+    std::mutex writeMutex;
 
 public:
     IPCHost() : shmBase(nullptr), hMapFile(0), running(false) {}
@@ -55,7 +52,6 @@ public:
 
 private:
     void ReaderLoop();
-    void WriterLoop();
 };
 
 }
