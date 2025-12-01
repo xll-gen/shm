@@ -64,20 +64,31 @@ void IPCHost::ReaderLoop() {
 
     while (running) {
         // Dequeue blocks until data is available
-        fromGuestQueue->Dequeue(buffer);
+        uint32_t msgId = fromGuestQueue->Dequeue(buffer);
 
-        // Got message
-        auto msg = ipc::GetMessage(buffer.data());
-        if (!msg) continue;
+        if (msgId == MSG_ID_HEARTBEAT_RESP) {
+            std::lock_guard<std::mutex> lock(heartbeatMutex);
+            if (heartbeatPromise) {
+                heartbeatPromise->set_value();
+                heartbeatPromise.reset();
+            }
+            continue;
+        }
 
-        uint64_t reqId = msg->req_id();
+        if (msgId == MSG_ID_NORMAL) {
+            // Got message
+            auto msg = ipc::GetMessage(buffer.data());
+            if (!msg) continue;
 
-        std::lock_guard<std::mutex> lock(pendingMutex);
-        auto it = pendingRequests.find(reqId);
-        if (it != pendingRequests.end()) {
-            RequestContext* ctx = it->second;
-            ctx->promise.set_value(std::move(buffer));
-            pendingRequests.erase(it);
+            uint64_t reqId = msg->req_id();
+
+            std::lock_guard<std::mutex> lock(pendingMutex);
+            auto it = pendingRequests.find(reqId);
+            if (it != pendingRequests.end()) {
+                RequestContext* ctx = it->second;
+                ctx->promise.set_value(std::move(buffer));
+                pendingRequests.erase(it);
+            }
         }
     }
 }
@@ -99,13 +110,38 @@ bool IPCHost::Call(const uint8_t* reqData, size_t reqSize, std::vector<uint8_t>&
     // 2. Enqueue
     {
         std::lock_guard<std::mutex> lock(sendMutex);
-        toGuestQueue->Enqueue(reqData, (uint32_t)reqSize);
+        toGuestQueue->Enqueue(reqData, (uint32_t)reqSize, MSG_ID_NORMAL);
     }
 
     // 3. Wait
     // In a real system, we should have a timeout
     outResponse = future.get();
     return true;
+}
+
+bool IPCHost::SendHeartbeat() {
+    std::future<void> future;
+    {
+        std::lock_guard<std::mutex> lock(heartbeatMutex);
+        heartbeatPromise = std::make_unique<std::promise<void>>();
+        future = heartbeatPromise->get_future();
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(sendMutex);
+        toGuestQueue->Enqueue(nullptr, 0, MSG_ID_HEARTBEAT_REQ);
+    }
+
+    // Wait for response with timeout
+    if (future.wait_for(std::chrono::seconds(1)) == std::future_status::timeout) {
+        return false;
+    }
+    return true;
+}
+
+void IPCHost::SendShutdown() {
+    std::lock_guard<std::mutex> lock(sendMutex);
+    toGuestQueue->Enqueue(nullptr, 0, MSG_ID_SHUTDOWN);
 }
 
 }

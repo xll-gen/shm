@@ -9,7 +9,7 @@ import (
 const (
 	BlockMagicData  = 0xDA7A0001
 	BlockMagicPad   = 0xDA7A0002
-	BlockHeaderSize = 8
+	BlockHeaderSize = 16 // Changed to 16
 	QueueHeaderSize = 128
 )
 
@@ -37,7 +37,7 @@ func NewSPSCQueue(shmBase uintptr, capacity uint64, event EventHandle) *SPSCQueu
 }
 
 // Enqueue blocks if full
-func (q *SPSCQueue) Enqueue(data []byte) {
+func (q *SPSCQueue) Enqueue(data []byte, msgId uint32) {
 	// Align total size to 8 bytes
 	alignedSize := (len(data) + 7) & ^7
 	totalSize := uint64(alignedSize + BlockHeaderSize)
@@ -67,7 +67,10 @@ func (q *SPSCQueue) Enqueue(data []byte) {
 				// Write Padding Header
 				ptr := unsafe.Pointer(&q.Buffer[offset])
 				*(*uint32)(ptr) = uint32(spaceToEnd) - BlockHeaderSize
-				magicPtr := (*uint32)(unsafe.Pointer(uintptr(ptr) + 4))
+				// offset 4: msgId = 0
+				*(*uint32)(unsafe.Pointer(uintptr(ptr) + 4)) = 0
+				// offset 8: magic
+				magicPtr := (*uint32)(unsafe.Pointer(uintptr(ptr) + 8))
 				atomic.StoreUint32(magicPtr, BlockMagicPad) // Release
 
 				atomic.StoreUint64(&q.Header.WritePos, wPos+spaceToEnd)
@@ -77,10 +80,17 @@ func (q *SPSCQueue) Enqueue(data []byte) {
 
 		// Fits
 		ptr := unsafe.Pointer(&q.Buffer[offset])
+		// size (offset 0)
 		*(*uint32)(ptr) = uint32(len(data))
-		copy(q.Buffer[offset+BlockHeaderSize:], data)
+		// msgId (offset 4)
+		*(*uint32)(unsafe.Pointer(uintptr(ptr) + 4)) = msgId
 
-		magicPtr := (*uint32)(unsafe.Pointer(uintptr(ptr) + 4))
+		if len(data) > 0 {
+			copy(q.Buffer[offset+BlockHeaderSize:], data)
+		}
+
+		// magic (offset 8)
+		magicPtr := (*uint32)(unsafe.Pointer(uintptr(ptr) + 8))
 		atomic.StoreUint32(magicPtr, BlockMagicData) // Release
 
 		atomic.StoreUint64(&q.Header.WritePos, wPos+totalSize) // Release
@@ -91,7 +101,8 @@ func (q *SPSCQueue) Enqueue(data []byte) {
 }
 
 // Dequeue blocks if empty
-func (q *SPSCQueue) Dequeue() []byte {
+// Returns (data, msgId)
+func (q *SPSCQueue) Dequeue() ([]byte, uint32) {
 	spinCount := 0
 	for {
 		rPos := atomic.LoadUint64(&q.Header.ReadPos)
@@ -117,7 +128,8 @@ func (q *SPSCQueue) Dequeue() []byte {
 		}
 
 		ptr := unsafe.Pointer(&q.Buffer[offset])
-		magicPtr := (*uint32)(unsafe.Pointer(uintptr(ptr) + 4))
+		// Magic is at offset 8 now
+		magicPtr := (*uint32)(unsafe.Pointer(uintptr(ptr) + 8))
 
 		// Wait for magic
 		spin := 0
@@ -143,18 +155,23 @@ func (q *SPSCQueue) Dequeue() []byte {
 			continue
 		}
 
+		// Read MsgId (offset 4)
+		msgId := *(*uint32)(unsafe.Pointer(uintptr(ptr) + 4))
+
 		// Data
 		alignedSize := (size + 7) & ^uint32(7)
 		nextRPosDiff := uint64(alignedSize + BlockHeaderSize)
 
 		data := make([]byte, size)
-		copy(data, q.Buffer[offset+BlockHeaderSize:offset+BlockHeaderSize+uint64(size)])
+		if size > 0 {
+			copy(data, q.Buffer[offset+BlockHeaderSize:offset+BlockHeaderSize+uint64(size)])
+		}
 
 		// Clear magic
 		atomic.StoreUint32(magicPtr, 0)
 		// Advance ReadPos
 		atomic.StoreUint64(&q.Header.ReadPos, rPos+nextRPosDiff)
 
-		return data
+		return data, msgId
 	}
 }

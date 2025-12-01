@@ -27,6 +27,15 @@ struct MyRandRequestBuilder;
 struct MyRandResponse;
 struct MyRandResponseBuilder;
 
+struct HeartbeatRequest;
+struct HeartbeatRequestBuilder;
+
+struct HeartbeatResponse;
+struct HeartbeatResponseBuilder;
+
+struct ShutdownRequest;
+struct ShutdownRequestBuilder;
+
 struct Message;
 struct MessageBuilder;
 
@@ -36,35 +45,44 @@ enum Payload : uint8_t {
   Payload_AddResponse = 2,
   Payload_MyRandRequest = 3,
   Payload_MyRandResponse = 4,
+  Payload_HeartbeatRequest = 5,
+  Payload_HeartbeatResponse = 6,
+  Payload_ShutdownRequest = 7,
   Payload_MIN = Payload_NONE,
-  Payload_MAX = Payload_MyRandResponse
+  Payload_MAX = Payload_ShutdownRequest
 };
 
-inline const Payload (&EnumValuesPayload())[5] {
+inline const Payload (&EnumValuesPayload())[8] {
   static const Payload values[] = {
     Payload_NONE,
     Payload_AddRequest,
     Payload_AddResponse,
     Payload_MyRandRequest,
-    Payload_MyRandResponse
+    Payload_MyRandResponse,
+    Payload_HeartbeatRequest,
+    Payload_HeartbeatResponse,
+    Payload_ShutdownRequest
   };
   return values;
 }
 
 inline const char * const *EnumNamesPayload() {
-  static const char * const names[6] = {
+  static const char * const names[9] = {
     "NONE",
     "AddRequest",
     "AddResponse",
     "MyRandRequest",
     "MyRandResponse",
+    "HeartbeatRequest",
+    "HeartbeatResponse",
+    "ShutdownRequest",
     nullptr
   };
   return names;
 }
 
 inline const char *EnumNamePayload(Payload e) {
-  if (::flatbuffers::IsOutRange(e, Payload_NONE, Payload_MyRandResponse)) return "";
+  if (::flatbuffers::IsOutRange(e, Payload_NONE, Payload_ShutdownRequest)) return "";
   const size_t index = static_cast<size_t>(e);
   return EnumNamesPayload()[index];
 }
@@ -87,6 +105,18 @@ template<> struct PayloadTraits<ipc::MyRandRequest> {
 
 template<> struct PayloadTraits<ipc::MyRandResponse> {
   static const Payload enum_value = Payload_MyRandResponse;
+};
+
+template<> struct PayloadTraits<ipc::HeartbeatRequest> {
+  static const Payload enum_value = Payload_HeartbeatRequest;
+};
+
+template<> struct PayloadTraits<ipc::HeartbeatResponse> {
+  static const Payload enum_value = Payload_HeartbeatResponse;
+};
+
+template<> struct PayloadTraits<ipc::ShutdownRequest> {
+  static const Payload enum_value = Payload_ShutdownRequest;
 };
 
 bool VerifyPayload(::flatbuffers::Verifier &verifier, const void *obj, Payload type);
@@ -254,6 +284,93 @@ inline ::flatbuffers::Offset<MyRandResponse> CreateMyRandResponse(
   return builder_.Finish();
 }
 
+struct HeartbeatRequest FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
+  typedef HeartbeatRequestBuilder Builder;
+  bool Verify(::flatbuffers::Verifier &verifier) const {
+    return VerifyTableStart(verifier) &&
+           verifier.EndTable();
+  }
+};
+
+struct HeartbeatRequestBuilder {
+  typedef HeartbeatRequest Table;
+  ::flatbuffers::FlatBufferBuilder &fbb_;
+  ::flatbuffers::uoffset_t start_;
+  explicit HeartbeatRequestBuilder(::flatbuffers::FlatBufferBuilder &_fbb)
+        : fbb_(_fbb) {
+    start_ = fbb_.StartTable();
+  }
+  ::flatbuffers::Offset<HeartbeatRequest> Finish() {
+    const auto end = fbb_.EndTable(start_);
+    auto o = ::flatbuffers::Offset<HeartbeatRequest>(end);
+    return o;
+  }
+};
+
+inline ::flatbuffers::Offset<HeartbeatRequest> CreateHeartbeatRequest(
+    ::flatbuffers::FlatBufferBuilder &_fbb) {
+  HeartbeatRequestBuilder builder_(_fbb);
+  return builder_.Finish();
+}
+
+struct HeartbeatResponse FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
+  typedef HeartbeatResponseBuilder Builder;
+  bool Verify(::flatbuffers::Verifier &verifier) const {
+    return VerifyTableStart(verifier) &&
+           verifier.EndTable();
+  }
+};
+
+struct HeartbeatResponseBuilder {
+  typedef HeartbeatResponse Table;
+  ::flatbuffers::FlatBufferBuilder &fbb_;
+  ::flatbuffers::uoffset_t start_;
+  explicit HeartbeatResponseBuilder(::flatbuffers::FlatBufferBuilder &_fbb)
+        : fbb_(_fbb) {
+    start_ = fbb_.StartTable();
+  }
+  ::flatbuffers::Offset<HeartbeatResponse> Finish() {
+    const auto end = fbb_.EndTable(start_);
+    auto o = ::flatbuffers::Offset<HeartbeatResponse>(end);
+    return o;
+  }
+};
+
+inline ::flatbuffers::Offset<HeartbeatResponse> CreateHeartbeatResponse(
+    ::flatbuffers::FlatBufferBuilder &_fbb) {
+  HeartbeatResponseBuilder builder_(_fbb);
+  return builder_.Finish();
+}
+
+struct ShutdownRequest FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
+  typedef ShutdownRequestBuilder Builder;
+  bool Verify(::flatbuffers::Verifier &verifier) const {
+    return VerifyTableStart(verifier) &&
+           verifier.EndTable();
+  }
+};
+
+struct ShutdownRequestBuilder {
+  typedef ShutdownRequest Table;
+  ::flatbuffers::FlatBufferBuilder &fbb_;
+  ::flatbuffers::uoffset_t start_;
+  explicit ShutdownRequestBuilder(::flatbuffers::FlatBufferBuilder &_fbb)
+        : fbb_(_fbb) {
+    start_ = fbb_.StartTable();
+  }
+  ::flatbuffers::Offset<ShutdownRequest> Finish() {
+    const auto end = fbb_.EndTable(start_);
+    auto o = ::flatbuffers::Offset<ShutdownRequest>(end);
+    return o;
+  }
+};
+
+inline ::flatbuffers::Offset<ShutdownRequest> CreateShutdownRequest(
+    ::flatbuffers::FlatBufferBuilder &_fbb) {
+  ShutdownRequestBuilder builder_(_fbb);
+  return builder_.Finish();
+}
+
 struct Message FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
   typedef MessageBuilder Builder;
   enum FlatBuffersVTableOffset FLATBUFFERS_VTABLE_UNDERLYING_TYPE {
@@ -283,6 +400,15 @@ struct Message FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
   const ipc::MyRandResponse *payload_as_MyRandResponse() const {
     return payload_type() == ipc::Payload_MyRandResponse ? static_cast<const ipc::MyRandResponse *>(payload()) : nullptr;
   }
+  const ipc::HeartbeatRequest *payload_as_HeartbeatRequest() const {
+    return payload_type() == ipc::Payload_HeartbeatRequest ? static_cast<const ipc::HeartbeatRequest *>(payload()) : nullptr;
+  }
+  const ipc::HeartbeatResponse *payload_as_HeartbeatResponse() const {
+    return payload_type() == ipc::Payload_HeartbeatResponse ? static_cast<const ipc::HeartbeatResponse *>(payload()) : nullptr;
+  }
+  const ipc::ShutdownRequest *payload_as_ShutdownRequest() const {
+    return payload_type() == ipc::Payload_ShutdownRequest ? static_cast<const ipc::ShutdownRequest *>(payload()) : nullptr;
+  }
   bool Verify(::flatbuffers::Verifier &verifier) const {
     return VerifyTableStart(verifier) &&
            VerifyField<uint64_t>(verifier, VT_REQ_ID, 8) &&
@@ -307,6 +433,18 @@ template<> inline const ipc::MyRandRequest *Message::payload_as<ipc::MyRandReque
 
 template<> inline const ipc::MyRandResponse *Message::payload_as<ipc::MyRandResponse>() const {
   return payload_as_MyRandResponse();
+}
+
+template<> inline const ipc::HeartbeatRequest *Message::payload_as<ipc::HeartbeatRequest>() const {
+  return payload_as_HeartbeatRequest();
+}
+
+template<> inline const ipc::HeartbeatResponse *Message::payload_as<ipc::HeartbeatResponse>() const {
+  return payload_as_HeartbeatResponse();
+}
+
+template<> inline const ipc::ShutdownRequest *Message::payload_as<ipc::ShutdownRequest>() const {
+  return payload_as_ShutdownRequest();
 }
 
 struct MessageBuilder {
@@ -364,6 +502,18 @@ inline bool VerifyPayload(::flatbuffers::Verifier &verifier, const void *obj, Pa
     }
     case Payload_MyRandResponse: {
       auto ptr = reinterpret_cast<const ipc::MyRandResponse *>(obj);
+      return verifier.VerifyTable(ptr);
+    }
+    case Payload_HeartbeatRequest: {
+      auto ptr = reinterpret_cast<const ipc::HeartbeatRequest *>(obj);
+      return verifier.VerifyTable(ptr);
+    }
+    case Payload_HeartbeatResponse: {
+      auto ptr = reinterpret_cast<const ipc::HeartbeatResponse *>(obj);
+      return verifier.VerifyTable(ptr);
+    }
+    case Payload_ShutdownRequest: {
+      auto ptr = reinterpret_cast<const ipc::ShutdownRequest *>(obj);
       return verifier.VerifyTable(ptr);
     }
     default: return true;

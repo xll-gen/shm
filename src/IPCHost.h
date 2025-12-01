@@ -12,6 +12,12 @@
 
 namespace shm {
 
+// Message ID Constants
+const uint32_t MSG_ID_NORMAL = 0;
+const uint32_t MSG_ID_HEARTBEAT_REQ = 1;
+const uint32_t MSG_ID_HEARTBEAT_RESP = 2;
+const uint32_t MSG_ID_SHUTDOWN = 3;
+
 class IPCHost {
     struct RequestContext {
         std::promise<std::vector<uint8_t>> promise;
@@ -34,6 +40,10 @@ class IPCHost {
     std::mutex pendingMutex;
     std::unordered_map<uint64_t, RequestContext*> pendingRequests;
 
+    // For Heartbeat
+    std::mutex heartbeatMutex;
+    std::unique_ptr<std::promise<void>> heartbeatPromise;
+
     std::mutex sendMutex; // Protects toGuestQueue (Single Producer)
 
 public:
@@ -48,6 +58,10 @@ public:
     // Sends request and waits for response (Blocking)
     // For manual FlatBuffer construction
     bool Call(const uint8_t* reqData, size_t reqSize, std::vector<uint8_t>& outResponse);
+
+    // Control Messages
+    bool SendHeartbeat();
+    void SendShutdown();
 
 private:
     void ReaderLoop();

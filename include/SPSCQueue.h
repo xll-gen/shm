@@ -16,11 +16,13 @@ namespace shm {
 
 static const uint32_t BLOCK_MAGIC_DATA = 0xDA7A0001;
 static const uint32_t BLOCK_MAGIC_PAD  = 0xDA7A0002;
-static const uint32_t BLOCK_HEADER_SIZE = 8;
+static const uint32_t BLOCK_HEADER_SIZE = 16; // Changed from 8 to 16
 
 struct BlockHeader {
     uint32_t size;
+    uint32_t msgId; // Added msgId
     alignas(4) std::atomic<uint32_t> magic;
+    uint32_t padding; // Padding to make it 16 bytes
 };
 
 // Layout must match Go struct
@@ -56,7 +58,7 @@ public:
 
     // Producer: Enqueue data
     // Blocks/Spins if full.
-    void Enqueue(const void* data, uint32_t size) {
+    void Enqueue(const void* data, uint32_t size, uint32_t msgId = 0) {
         uint32_t alignedSize = (size + 7) & ~7;
         uint32_t totalSize = alignedSize + BLOCK_HEADER_SIZE;
         uint64_t cap = header->capacity.load(std::memory_order_relaxed);
@@ -90,6 +92,7 @@ public:
                     // Write Padding
                     BlockHeader* bh = reinterpret_cast<BlockHeader*>(buffer + offset);
                     bh->size = (uint32_t)spaceToEnd - BLOCK_HEADER_SIZE;
+                    bh->msgId = 0; // Pad message ID
                     bh->magic.store(BLOCK_MAGIC_PAD, std::memory_order_release);
 
                     header->writePos.store(wPos + spaceToEnd, std::memory_order_release);
@@ -100,7 +103,10 @@ public:
             // Write Data
             BlockHeader* bh = reinterpret_cast<BlockHeader*>(buffer + offset);
             bh->size = size;
-            memcpy(buffer + offset + BLOCK_HEADER_SIZE, data, size);
+            bh->msgId = msgId;
+            if (size > 0 && data != nullptr) {
+                memcpy(buffer + offset + BLOCK_HEADER_SIZE, data, size);
+            }
 
             bh->magic.store(BLOCK_MAGIC_DATA, std::memory_order_release);
             header->writePos.store(wPos + totalSize, std::memory_order_release);
@@ -112,7 +118,8 @@ public:
 
     // Consumer: Dequeue data
     // Blocks if empty.
-    void Dequeue(std::vector<uint8_t>& outBuffer) {
+    // Returns msgId.
+    uint32_t Dequeue(std::vector<uint8_t>& outBuffer) {
         int spinCount = 0;
         while (true) {
             uint64_t rPos = header->readPos.load(std::memory_order_relaxed);
@@ -168,15 +175,19 @@ public:
 
             // DATA
             uint32_t size = bh->size;
+            uint32_t msgId = bh->msgId;
+
             uint32_t alignedSize = (size + 7) & ~7;
             uint64_t nextRPosDiff = alignedSize + BLOCK_HEADER_SIZE;
 
             outBuffer.resize(size);
-            memcpy(outBuffer.data(), buffer + offset + BLOCK_HEADER_SIZE, size);
+            if (size > 0) {
+                memcpy(outBuffer.data(), buffer + offset + BLOCK_HEADER_SIZE, size);
+            }
 
             bh->magic.store(0, std::memory_order_relaxed);
             header->readPos.store(rPos + nextRPosDiff, std::memory_order_release);
-            return;
+            return msgId;
         }
     }
 };

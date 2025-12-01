@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"os"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -15,6 +16,14 @@ import (
 
 const (
 	QUEUE_SIZE = 1024 * 1024 * 32 // 32MB
+)
+
+// Message IDs
+const (
+	MSG_ID_NORMAL         = 0
+	MSG_ID_HEARTBEAT_REQ  = 1
+	MSG_ID_HEARTBEAT_RESP = 2
+	MSG_ID_SHUTDOWN       = 3
 )
 
 // Mutex to protect SPSCQueue Write
@@ -98,8 +107,27 @@ func main() {
 	// 5. Consumer Loop (Reading from toGuestQueue)
 	for {
 		// Dequeue blocks now
-		data := toGuestQueue.Dequeue()
-		workChan <- data
+		data, msgId := toGuestQueue.Dequeue()
+
+		switch msgId {
+		case MSG_ID_NORMAL:
+			workChan <- data
+
+		case MSG_ID_HEARTBEAT_REQ:
+			// Send Heartbeat Response immediately
+			respMutex.Lock()
+			fromGuestQueue.Enqueue(nil, MSG_ID_HEARTBEAT_RESP)
+			respMutex.Unlock()
+
+		case MSG_ID_SHUTDOWN:
+			fmt.Println("[Go] Received Shutdown Request. Exiting...")
+			close(workChan)
+			wg.Wait()
+			os.Exit(0)
+
+		default:
+			fmt.Printf("[Go] Unknown msgId: %d\n", msgId)
+		}
 	}
 
 	_ = hMap
@@ -156,6 +184,6 @@ func handleRequest(data []byte, respQ *shm.SPSCQueue, builder *flatbuffers.Build
 	// Enqueue blocks if full
 	// SPSCQueue is Single Producer, so multiple workers must serialize writes
 	respMutex.Lock()
-	respQ.Enqueue(resBytes)
+	respQ.Enqueue(resBytes, MSG_ID_NORMAL)
 	respMutex.Unlock()
 }
