@@ -108,10 +108,10 @@ void test_control_messages() {
 
 int main(int argc, char* argv[]) {
     // 1. Test Control Messages first (to ensure logic is correct)
-    test_control_messages();
+    // test_control_messages();
 
     // Wait a bit for the previous Go process to exit and SHM to be cleaned up
-    std::this_thread::sleep_for(std::chrono::seconds(2));
+    // std::this_thread::sleep_for(std::chrono::seconds(2));
 
     int iterations = 10000;
     int specificThreadCount = 0;

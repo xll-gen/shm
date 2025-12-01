@@ -4,6 +4,7 @@
 #include <future>
 #include <map>
 #include <mutex>
+#include <unordered_map>
 #include "SPSCQueue.h"
 #include "Platform.h"
 
@@ -43,9 +44,13 @@ class IPCHost {
     std::mutex heartbeatMutex;
     std::unique_ptr<std::promise<void>> heartbeatPromise;
 
+    std::atomic<uint32_t> reqIdCounter{0};
+
 public:
     IPCHost() : shmBase(nullptr), hMapFile(0), running(false) {}
     ~IPCHost() { Shutdown(); }
+
+    uint32_t GenerateReqId() { return ++reqIdCounter; }
 
     bool Init(const std::string& shmName, uint64_t queueSize);
     void Shutdown();
