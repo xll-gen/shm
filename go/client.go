@@ -59,6 +59,10 @@ func (c *IPCClient) Send(msg *[]byte) {
 		return
 	}
 
+	if atomic.LoadUint32(&c.RespQueue.Header.ConsumerWaiting) == 1 {
+		SignalEvent(c.RespQueue.Event)
+	}
+
 	// Spin Lock
 	for {
 		if atomic.CompareAndSwapInt32(&c.writeLock, 0, 1) {

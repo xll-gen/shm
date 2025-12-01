@@ -183,6 +183,10 @@ func handleRequest(data []byte, respQ *shm.SPSCQueue, builder *flatbuffers.Build
 
 	// Enqueue blocks if full
 	// SPSCQueue is Single Producer, so multiple workers must serialize writes
+	if atomic.LoadUint32(&respQ.Header.ConsumerWaiting) == 1 {
+		shm.SignalEvent(respQ.Event)
+	}
+
 	respMutex.Lock()
 	respQ.Enqueue(resBytes, MSG_ID_NORMAL)
 	respMutex.Unlock()
