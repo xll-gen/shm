@@ -3,7 +3,6 @@ package shm
 import (
 	"runtime"
 	"sync/atomic"
-	"syscall"
 	"unsafe"
 )
 
@@ -13,19 +12,6 @@ const (
 	BlockHeaderSize = 8
 	QueueHeaderSize = 128
 )
-
-var (
-	kernel32     = syscall.NewLazyDLL("kernel32.dll")
-	procSetEvent = kernel32.NewProc("SetEvent")
-)
-
-func setEvent(h syscall.Handle) error {
-	r1, _, err := procSetEvent.Call(uintptr(h))
-	if r1 == 0 {
-		return err
-	}
-	return nil
-}
 
 // Corresponds to the C++ layout
 type QueueHeader struct {
@@ -39,10 +25,10 @@ type QueueHeader struct {
 type MPSCQueue struct {
 	Header *QueueHeader
 	Buffer []byte
-	Event  syscall.Handle
+	Event  EventHandle
 }
 
-func NewMPSCQueue(shmBase uintptr, capacity uint64, event syscall.Handle) *MPSCQueue {
+func NewMPSCQueue(shmBase uintptr, capacity uint64, event EventHandle) *MPSCQueue {
 	return &MPSCQueue{
 		Header: (*QueueHeader)(unsafe.Pointer(shmBase)),
 		Buffer: unsafe.Slice((*byte)(unsafe.Pointer(shmBase + QueueHeaderSize)), capacity),
@@ -104,7 +90,7 @@ func (q *MPSCQueue) Enqueue(data []byte) bool {
 				atomic.StoreUint32(magicPtr, BlockMagicData)
 
 				// Signal
-				setEvent(q.Event)
+				SignalEvent(q.Event)
 				return true
 			}
 		}

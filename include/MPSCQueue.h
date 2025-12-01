@@ -2,7 +2,15 @@
 #include <atomic>
 #include <cstdint>
 #include <thread>
-#include <windows.h>
+#include <cstring> // memcpy
+#include <vector>
+#include "../src/Platform.h"
+
+#ifdef _WIN32
+#include <emmintrin.h> // _mm_pause
+#else
+#include <x86intrin.h> // __builtin_ia32_pause
+#endif
 
 // Lock-Free MPSC Queue (Multi-Producer Single-Consumer)
 // Designed for Shared Memory IPC.
@@ -43,9 +51,9 @@ class MPSCQueue {
 public:
     QueueHeader* header;
     uint8_t* buffer;
-    HANDLE hEvent; // Kernel Event for Consumer
+    EventHandle hEvent; // Kernel Event for Consumer
 
-    MPSCQueue(void* shmBase, uint64_t capacity, HANDLE eventHandle)
+    MPSCQueue(void* shmBase, uint64_t capacity, EventHandle eventHandle)
         : hEvent(eventHandle) {
         header = reinterpret_cast<QueueHeader*>(shmBase);
         buffer = reinterpret_cast<uint8_t*>(header) + sizeof(QueueHeader);
@@ -119,13 +127,17 @@ public:
                     bh->magic.store(BLOCK_MAGIC_DATA, std::memory_order_release);
 
                     // Signal Consumer (Optimistic: always signal for now, or if queue was empty)
-                    SetEvent(hEvent);
+                    Platform::SignalEvent(hEvent);
 
                     return true;
                 }
             }
             // CAS failed, retry
+#ifdef _WIN32
              _mm_pause();
+#else
+             __builtin_ia32_pause();
+#endif
         }
     }
 
@@ -154,9 +166,13 @@ public:
         int spin = 0;
         uint32_t magic;
         while ((magic = bh->magic.load(std::memory_order_acquire)) == 0) {
-            _mm_pause();
+#ifdef _WIN32
+             _mm_pause();
+#else
+             __builtin_ia32_pause();
+#endif
             if (++spin > 1000) {
-                 SwitchToThread();
+                 Platform::Yield();
             }
         }
 
@@ -165,16 +181,6 @@ public:
         // Writer used aligned size for reservation
         uint32_t alignedSize = (size + 7) & ~7;
         uint32_t totalBlockSize = alignedSize + BLOCK_HEADER_SIZE;
-
-        // If it was PAD, the size in header is (spaceToEnd - HeaderSize), so totalBlockSize matches spaceToEnd.
-        // Wait, for PAD, Writer did: size = spaceToEnd - BLOCK_HEADER_SIZE.
-        // So totalBlockSize = (spaceToEnd - HeaderSize) + HeaderSize = spaceToEnd.
-        // But Writer PAD logic didn't align size (it filled exactly spaceToEnd).
-        // Let's check logic:
-        // PAD: bh->size = spaceToEnd - BLOCK_HEADER_SIZE.
-        // Consumer: totalBlockSize = aligned(bh->size) + HEADER?
-        // NO. PAD block takes exactly `spaceToEnd` bytes.
-        // We need to differentiate calculating next rPos for PAD vs DATA.
 
         uint64_t nextRPosDiff;
 
