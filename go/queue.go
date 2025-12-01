@@ -22,21 +22,22 @@ type QueueHeader struct {
 	_pad2    [48]byte // 48 bytes
 }
 
-type MPSCQueue struct {
+type SPSCQueue struct {
 	Header *QueueHeader
 	Buffer []byte
 	Event  EventHandle
 }
 
-func NewMPSCQueue(shmBase uintptr, capacity uint64, event EventHandle) *MPSCQueue {
-	return &MPSCQueue{
+func NewSPSCQueue(shmBase uintptr, capacity uint64, event EventHandle) *SPSCQueue {
+	return &SPSCQueue{
 		Header: (*QueueHeader)(unsafe.Pointer(shmBase)),
 		Buffer: unsafe.Slice((*byte)(unsafe.Pointer(shmBase + QueueHeaderSize)), capacity),
 		Event:  event,
 	}
 }
 
-func (q *MPSCQueue) Enqueue(data []byte) bool {
+// Enqueue blocks if full
+func (q *SPSCQueue) Enqueue(data []byte) {
 	// Align total size to 8 bytes
 	alignedSize := (len(data) + 7) & ^7
 	totalSize := uint64(alignedSize + BlockHeaderSize)
@@ -48,7 +49,9 @@ func (q *MPSCQueue) Enqueue(data []byte) bool {
 
 		used := wPos - rPos
 		if used+totalSize > cap {
-			return false // Full
+			// Full - Spin/Yield
+			runtime.Gosched()
+			continue
 		}
 
 		offset := wPos % cap
@@ -58,109 +61,100 @@ func (q *MPSCQueue) Enqueue(data []byte) bool {
 		if spaceToEnd < totalSize {
 			if spaceToEnd < BlockHeaderSize {
 				// Too small for header, skip
-				if atomic.CompareAndSwapUint64(&q.Header.WritePos, wPos, wPos+spaceToEnd) {
-					continue
-				}
+				atomic.StoreUint64(&q.Header.WritePos, wPos+spaceToEnd)
+				continue
 			} else {
-				// Wrap needed. Reserve padding.
-				if atomic.CompareAndSwapUint64(&q.Header.WritePos, wPos, wPos+spaceToEnd) {
-					// Write Padding Header
-					ptr := unsafe.Pointer(&q.Buffer[offset])
-					// Size
-					*(*uint32)(ptr) = uint32(spaceToEnd) - BlockHeaderSize
-					// Magic (Release)
-					magicPtr := (*uint32)(unsafe.Pointer(uintptr(ptr) + 4))
-					atomic.StoreUint32(magicPtr, BlockMagicPad)
-
-					continue // Retry for data
-				}
-			}
-		} else {
-			// Fits
-			if atomic.CompareAndSwapUint64(&q.Header.WritePos, wPos, wPos+totalSize) {
+				// Write Padding Header
 				ptr := unsafe.Pointer(&q.Buffer[offset])
-				// Size (actual size)
-				*(*uint32)(ptr) = uint32(len(data))
-
-				// Copy Data
-				copy(q.Buffer[offset+BlockHeaderSize:], data)
-
-				// Magic (Release)
+				*(*uint32)(ptr) = uint32(spaceToEnd) - BlockHeaderSize
 				magicPtr := (*uint32)(unsafe.Pointer(uintptr(ptr) + 4))
-				atomic.StoreUint32(magicPtr, BlockMagicData)
+				atomic.StoreUint32(magicPtr, BlockMagicPad) // Release
 
-				// Signal
-				SignalEvent(q.Event)
-				return true
+				atomic.StoreUint64(&q.Header.WritePos, wPos+spaceToEnd)
+				continue
 			}
 		}
-		runtime.Gosched()
+
+		// Fits
+		ptr := unsafe.Pointer(&q.Buffer[offset])
+		*(*uint32)(ptr) = uint32(len(data))
+		copy(q.Buffer[offset+BlockHeaderSize:], data)
+
+		magicPtr := (*uint32)(unsafe.Pointer(uintptr(ptr) + 4))
+		atomic.StoreUint32(magicPtr, BlockMagicData) // Release
+
+		atomic.StoreUint64(&q.Header.WritePos, wPos+totalSize) // Release
+
+		SignalEvent(q.Event)
+		return
 	}
 }
 
-func (q *MPSCQueue) Dequeue() ([]byte, bool) {
-	rPos := atomic.LoadUint64(&q.Header.ReadPos)
-	wPos := atomic.LoadUint64(&q.Header.WritePos)
-
-	if rPos == wPos {
-		return nil, false
-	}
-
-	cap := atomic.LoadUint64(&q.Header.Capacity)
-	offset := rPos % cap
-	spaceToEnd := cap - offset
-
-	if spaceToEnd < BlockHeaderSize {
-		// Small tail skip
-		atomic.StoreUint64(&q.Header.ReadPos, rPos+spaceToEnd)
-		return q.Dequeue()
-	}
-
-	ptr := unsafe.Pointer(&q.Buffer[offset])
-	magicPtr := (*uint32)(unsafe.Pointer(uintptr(ptr) + 4))
-
-	// Wait for magic
-	spin := 0
+// Dequeue blocks if empty
+func (q *SPSCQueue) Dequeue() []byte {
+	spinCount := 0
 	for {
+		rPos := atomic.LoadUint64(&q.Header.ReadPos)
+		wPos := atomic.LoadUint64(&q.Header.WritePos)
+
+		if rPos == wPos {
+			if spinCount < 4000 {
+				spinCount++
+				continue
+			}
+			WaitForEvent(q.Event, 100)
+			spinCount = 0
+			continue
+		}
+
+		cap := atomic.LoadUint64(&q.Header.Capacity)
+		offset := rPos % cap
+		spaceToEnd := cap - offset
+
+		if spaceToEnd < BlockHeaderSize {
+			atomic.StoreUint64(&q.Header.ReadPos, rPos+spaceToEnd)
+			continue
+		}
+
+		ptr := unsafe.Pointer(&q.Buffer[offset])
+		magicPtr := (*uint32)(unsafe.Pointer(uintptr(ptr) + 4))
+
+		// Wait for magic
+		spin := 0
+		for {
+			magic := atomic.LoadUint32(magicPtr)
+			if magic != 0 {
+				break
+			}
+			spin++
+			if spin > 1000 {
+				runtime.Gosched()
+			}
+		}
+
 		magic := atomic.LoadUint32(magicPtr)
-		if magic != 0 {
-			break
+		size := *(*uint32)(ptr)
+
+		if magic == BlockMagicPad {
+			// Clear magic
+			atomic.StoreUint32(magicPtr, 0)
+			// Advance ReadPos
+			atomic.StoreUint64(&q.Header.ReadPos, rPos+uint64(size+BlockHeaderSize))
+			continue
 		}
-		spin++
-		if spin > 1000 {
-			runtime.Gosched()
-		}
-	}
 
-	magic := atomic.LoadUint32(magicPtr)
-	size := *(*uint32)(ptr)
+		// Data
+		alignedSize := (size + 7) & ^uint32(7)
+		nextRPosDiff := uint64(alignedSize + BlockHeaderSize)
 
-	var nextRPosDiff uint64
-
-	if magic == BlockMagicPad {
-		// PAD
-		nextRPosDiff = uint64(size + BlockHeaderSize)
+		data := make([]byte, size)
+		copy(data, q.Buffer[offset+BlockHeaderSize:offset+BlockHeaderSize+uint64(size)])
 
 		// Clear magic
 		atomic.StoreUint32(magicPtr, 0)
 		// Advance ReadPos
 		atomic.StoreUint64(&q.Header.ReadPos, rPos+nextRPosDiff)
-		// Recurse
-		return q.Dequeue()
+
+		return data
 	}
-
-	// Data
-	// Align
-	alignedSize := (size + 7) & ^uint32(7)
-	nextRPosDiff = uint64(alignedSize + BlockHeaderSize)
-
-	data := make([]byte, size)
-	copy(data, q.Buffer[offset+BlockHeaderSize : offset+BlockHeaderSize+uint64(size)])
-
-	// Clear magic
-	atomic.StoreUint32(magicPtr, 0)
-	// Advance ReadPos
-	atomic.StoreUint64(&q.Header.ReadPos, rPos+nextRPosDiff)
-
-	return data, true
 }
