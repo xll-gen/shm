@@ -6,33 +6,25 @@
 #include <atomic>
 #include <mutex>
 #include <thread>
+#include <future>
 #include "../src/Platform.h"
 #include "../include/MPSCQueue.h"
 
 namespace shm {
 
-class IPCClient {
+class IPCHost {
     struct RequestContext {
-        EventHandle hCompleteEvent;
-        std::vector<uint8_t> responseData;
-    };
-
-    struct SharedMemoryLayout {
-        // We use 2 queues.
-        // 1. ReqQueue: C++ -> Go
-        // 2. RespQueue: Go -> C++
-        // They are placed sequentially in SHM.
-        // QueueHeader (128) + Data ...
+        std::promise<std::vector<uint8_t>> promise;
     };
 
     void* shmBase;
     ShmHandle hMapFile;
 
-    std::unique_ptr<MPSCQueue> reqQueue; // To Go
-    std::unique_ptr<MPSCQueue> respQueue; // From Go
+    std::unique_ptr<MPSCQueue> toGuestQueue;   // Host -> Guest
+    std::unique_ptr<MPSCQueue> fromGuestQueue; // Guest -> Host
 
-    EventHandle hReqEvent; // Signaled when we write to ReqQueue
-    EventHandle hRespEvent; // Signaled when Go writes to RespQueue
+    EventHandle hToGuestEvent;   // Signaled when Host writes to toGuestQueue
+    EventHandle hFromGuestEvent; // Signaled when Guest writes to fromGuestQueue
 
     std::atomic<bool> running;
     std::thread readerThread;
@@ -43,11 +35,13 @@ class IPCClient {
     std::unordered_map<uint64_t, RequestContext*> pendingRequests;
 
 public:
-    IPCClient() : shmBase(nullptr), hMapFile(0), running(false) {}
-    ~IPCClient() { Shutdown(); }
+    IPCHost() : shmBase(nullptr), hMapFile(0), running(false) {}
+    ~IPCHost() { Shutdown(); }
 
     bool Init(const std::string& shmName, uint64_t queueSize);
     void Shutdown();
+
+    uint64_t GenerateReqId() { return nextReqId.fetch_add(1); }
 
     // Sends request and waits for response (Blocking)
     // For manual FlatBuffer construction

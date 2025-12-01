@@ -1,4 +1,4 @@
-#include "IPC.h"
+#include "IPCHost.h"
 #include <iostream>
 #ifdef _WIN32
 #include <emmintrin.h> // _mm_pause
@@ -9,16 +9,18 @@
 
 namespace shm {
 
-bool IPCClient::Init(const std::string& shmName, uint64_t queueSize) {
+bool IPCHost::Init(const std::string& shmName, uint64_t queueSize) {
     // 1. Create/Open Events
     // Suffixes are added by Platform if needed, but here we add _REQ/_RESP to base name
-    std::string reqEvName = shmName + "_REQ";
-    std::string respEvName = shmName + "_RESP";
+    // _REQ -> Host -> Guest (ToGuest)
+    // _RESP -> Guest -> Host (FromGuest)
+    std::string toGuestEvName = shmName + "_REQ";
+    std::string fromGuestEvName = shmName + "_RESP";
 
-    hReqEvent = Platform::CreateNamedEvent(reqEvName.c_str());
-    hRespEvent = Platform::CreateNamedEvent(respEvName.c_str());
+    hToGuestEvent = Platform::CreateNamedEvent(toGuestEvName.c_str());
+    hFromGuestEvent = Platform::CreateNamedEvent(fromGuestEvName.c_str());
 
-    if (!hReqEvent || !hRespEvent) return false;
+    if (!hToGuestEvent || !hFromGuestEvent) return false;
 
     // 2. Create SHM
     // Total size = 2 * (Header + Data)
@@ -30,7 +32,7 @@ bool IPCClient::Init(const std::string& shmName, uint64_t queueSize) {
 
     if (!shmBase) return false;
 
-    // Layout: [ReqQueue] [RespQueue]
+    // Layout: [ToGuestQueue] [FromGuestQueue]
     uint8_t* reqBase = (uint8_t*)shmBase;
 
     // Init if created new OR if existing but uninitialized (capacity 0)
@@ -41,32 +43,32 @@ bool IPCClient::Init(const std::string& shmName, uint64_t queueSize) {
         MPSCQueue::Init(reqBase + qTotalSize, queueSize);
     }
 
-    reqQueue = std::make_unique<MPSCQueue>(reqBase, queueSize, hReqEvent);
-    respQueue = std::make_unique<MPSCQueue>(reqBase + qTotalSize, queueSize, hRespEvent);
+    toGuestQueue = std::make_unique<MPSCQueue>(reqBase, queueSize, hToGuestEvent);
+    fromGuestQueue = std::make_unique<MPSCQueue>(reqBase + qTotalSize, queueSize, hFromGuestEvent);
 
     // 3. Start Reader Thread
     running = true;
-    readerThread = std::thread(&IPCClient::ReaderLoop, this);
+    readerThread = std::thread(&IPCHost::ReaderLoop, this);
 
     return true;
 }
 
-void IPCClient::Shutdown() {
+void IPCHost::Shutdown() {
     running = false;
     if (readerThread.joinable()) readerThread.join();
 
     if (shmBase) Platform::CloseShm(hMapFile, shmBase);
-    if (hReqEvent) Platform::CloseEvent(hReqEvent);
-    if (hRespEvent) Platform::CloseEvent(hRespEvent);
+    if (hToGuestEvent) Platform::CloseEvent(hToGuestEvent);
+    if (hFromGuestEvent) Platform::CloseEvent(hFromGuestEvent);
 }
 
-void IPCClient::ReaderLoop() {
+void IPCHost::ReaderLoop() {
     std::vector<uint8_t> buffer;
     buffer.reserve(4096);
 
     while (running) {
         // 1. Try Dequeue
-        if (respQueue->Dequeue(buffer)) {
+        if (fromGuestQueue->Dequeue(buffer)) {
             // Got message
             auto msg = ipc::GetMessage(buffer.data());
             // Need to verify message validity before accessing req_id, technically
@@ -78,8 +80,7 @@ void IPCClient::ReaderLoop() {
             auto it = pendingRequests.find(reqId);
             if (it != pendingRequests.end()) {
                 RequestContext* ctx = it->second;
-                ctx->responseData = buffer; // Copy data
-                Platform::SignalEvent(ctx->hCompleteEvent);
+                ctx->promise.set_value(std::move(buffer));
                 pendingRequests.erase(it);
             }
             continue;
@@ -88,8 +89,8 @@ void IPCClient::ReaderLoop() {
         // 2. Hybrid Wait
         // Short Spin
         for (int i = 0; i < 4000; ++i) {
-            if (respQueue->header->readPos.load(std::memory_order_relaxed) !=
-                respQueue->header->writePos.load(std::memory_order_acquire)) { // Acquire matches MPSCQueue.h logic
+            if (fromGuestQueue->header->readPos.load(std::memory_order_relaxed) !=
+                fromGuestQueue->header->writePos.load(std::memory_order_acquire)) { // Acquire matches MPSCQueue.h logic
                 goto NEXT_LOOP; // Data arrived
             }
 #ifdef _WIN32
@@ -100,21 +101,16 @@ void IPCClient::ReaderLoop() {
         }
 
         // Wait Kernel
-        Platform::WaitEvent(hRespEvent, 100); // 100ms timeout to check 'running'
+        Platform::WaitEvent(hFromGuestEvent, 100); // 100ms timeout to check 'running'
 
     NEXT_LOOP:;
     }
 }
 
-bool IPCClient::Call(const uint8_t* reqData, size_t reqSize, std::vector<uint8_t>& outResponse) {
+bool IPCHost::Call(const uint8_t* reqData, size_t reqSize, std::vector<uint8_t>& outResponse) {
     // 1. Prepare Context
     RequestContext ctx;
-    // Anonymous event for this thread/request
-    // On Linux, sem_open requires a name. We might need unnamed semaphores (sem_init) but those are for threads in same process (unless in shm).
-    // For simplicity, we use a unique name.
-    static std::atomic<uint64_t> uniq{0};
-    std::string evName = "ReqEv_" + std::to_string(Platform::GetPid()) + "_" + std::to_string(uniq.fetch_add(1));
-    ctx.hCompleteEvent = Platform::CreateNamedEvent(evName.c_str());
+    auto future = ctx.promise.get_future();
 
     // Parse to find ReqID - we trust the caller has set it in the FlatBuffer
     auto msg = ipc::GetMessage(reqData);
@@ -126,22 +122,22 @@ bool IPCClient::Call(const uint8_t* reqData, size_t reqSize, std::vector<uint8_t
     }
 
     // 2. Enqueue
-    if (!reqQueue->Enqueue(reqData, (uint32_t)reqSize)) {
-        // Queue Full
-        {
-            std::lock_guard<std::mutex> lock(pendingMutex);
-            pendingRequests.erase(reqId);
+    // Retry loop for Enqueue
+    int retries = 0;
+    while (!toGuestQueue->Enqueue(reqData, (uint32_t)reqSize)) {
+        if (retries++ > 10000) { // Approx 1-10ms depending on pause
+            {
+                std::lock_guard<std::mutex> lock(pendingMutex);
+                pendingRequests.erase(reqId);
+            }
+            return false;
         }
-        Platform::CloseEvent(ctx.hCompleteEvent);
-        return false;
+        std::this_thread::yield();
     }
 
     // 3. Wait
-    Platform::WaitEvent(ctx.hCompleteEvent);
-
-    // 4. Result
-    outResponse = std::move(ctx.responseData);
-    Platform::CloseEvent(ctx.hCompleteEvent);
+    // In a real system, we should have a timeout
+    outResponse = future.get();
     return true;
 }
 
