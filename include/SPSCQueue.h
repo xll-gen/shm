@@ -90,8 +90,9 @@ public:
                     // Write Padding
                     BlockHeader* bh = reinterpret_cast<BlockHeader*>(buffer + offset);
                     bh->size = (uint32_t)spaceToEnd - BLOCK_HEADER_SIZE;
-                    bh->magic.store(BLOCK_MAGIC_PAD, std::memory_order_release);
+                    bh->magic.store(BLOCK_MAGIC_PAD, std::memory_order_relaxed);
 
+                    std::atomic_thread_fence(std::memory_order_release);
                     header->writePos.store(wPos + spaceToEnd, std::memory_order_release);
                     continue;
                 }
@@ -100,13 +101,91 @@ public:
             // Write Data
             BlockHeader* bh = reinterpret_cast<BlockHeader*>(buffer + offset);
             bh->size = size;
+            bh->magic.store(BLOCK_MAGIC_DATA, std::memory_order_relaxed);
             memcpy(buffer + offset + BLOCK_HEADER_SIZE, data, size);
 
-            bh->magic.store(BLOCK_MAGIC_DATA, std::memory_order_release);
+            std::atomic_thread_fence(std::memory_order_release);
             header->writePos.store(wPos + totalSize, std::memory_order_release);
 
             Platform::SignalEvent(hEvent);
             return;
+        }
+    }
+
+    void EnqueueBatch(const std::vector<std::vector<uint8_t>>& msgs) {
+        if (msgs.empty()) return;
+
+        uint64_t cap = header->capacity.load(std::memory_order_relaxed);
+
+        size_t currentIdx = 0;
+        while (currentIdx < msgs.size()) {
+            uint64_t wPos = header->writePos.load(std::memory_order_relaxed);
+            uint64_t rPos = header->readPos.load(std::memory_order_acquire);
+
+            uint64_t tempWPos = wPos;
+            bool writtenAny = false;
+
+            for (; currentIdx < msgs.size(); ++currentIdx) {
+                const auto& data = msgs[currentIdx];
+                uint32_t size = (uint32_t)data.size();
+                uint32_t alignedSize = (size + 7) & ~7;
+                uint32_t totalSize = alignedSize + BLOCK_HEADER_SIZE;
+
+                // Check capacity
+                if ((tempWPos - rPos) + totalSize > cap) {
+                    if (!writtenAny) {
+                        // Full - Spin/Yield
+#ifdef _WIN32
+                        _mm_pause();
+#else
+                        __builtin_ia32_pause();
+#endif
+                        std::this_thread::yield();
+                        // Refresh rPos
+                        rPos = header->readPos.load(std::memory_order_acquire);
+                        currentIdx--;
+                        break;
+                    } else {
+                        break;
+                    }
+                }
+
+                uint64_t offset = tempWPos % cap;
+                uint64_t spaceToEnd = cap - offset;
+
+                // Check wrapping
+                if (spaceToEnd < totalSize) {
+                    if (spaceToEnd < BLOCK_HEADER_SIZE) {
+                         tempWPos += spaceToEnd;
+                         currentIdx--;
+                         continue;
+                    } else {
+                        // Padding
+                        BlockHeader* bh = reinterpret_cast<BlockHeader*>(buffer + offset);
+                        bh->size = (uint32_t)spaceToEnd - BLOCK_HEADER_SIZE;
+                        bh->magic.store(BLOCK_MAGIC_PAD, std::memory_order_relaxed);
+
+                        tempWPos += spaceToEnd;
+                        currentIdx--;
+                        continue;
+                    }
+                }
+
+                // Write Data
+                BlockHeader* bh = reinterpret_cast<BlockHeader*>(buffer + offset);
+                bh->size = size;
+                bh->magic.store(BLOCK_MAGIC_DATA, std::memory_order_relaxed);
+                memcpy(buffer + offset + BLOCK_HEADER_SIZE, data.data(), size);
+
+                tempWPos += totalSize;
+                writtenAny = true;
+            }
+
+            if (tempWPos != wPos) {
+                 std::atomic_thread_fence(std::memory_order_release);
+                 header->writePos.store(tempWPos, std::memory_order_release);
+                 Platform::SignalEvent(hEvent);
+            }
         }
     }
 
@@ -119,7 +198,7 @@ public:
             uint64_t wPos = header->writePos.load(std::memory_order_acquire);
 
             if (rPos == wPos) {
-                // Empty - Hybrid Wait
+                // Empty
                 if (spinCount < 4000) {
                     spinCount++;
 #ifdef _WIN32
@@ -145,23 +224,16 @@ public:
             }
 
             BlockHeader* bh = reinterpret_cast<BlockHeader*>(buffer + offset);
-
-            uint32_t magic;
-            int magicSpin = 0;
-            while ((magic = bh->magic.load(std::memory_order_acquire)) == 0) {
-#ifdef _WIN32
-                 _mm_pause();
-#else
-                 __builtin_ia32_pause();
-#endif
-                 if (++magicSpin > 1000) std::this_thread::yield();
-            }
+            // No spin on magic. Just read.
+            uint32_t magic = bh->magic.load(std::memory_order_relaxed);
 
             if (magic == BLOCK_MAGIC_PAD) {
                 uint32_t size = bh->size;
                 uint64_t nextRPosDiff = size + BLOCK_HEADER_SIZE;
 
-                bh->magic.store(0, std::memory_order_relaxed);
+                // Optional: Clear magic? Not needed for protocol, but maybe for debugging?
+                // bh->magic.store(0, std::memory_order_relaxed);
+
                 header->readPos.store(rPos + nextRPosDiff, std::memory_order_release);
                 continue;
             }
@@ -174,8 +246,72 @@ public:
             outBuffer.resize(size);
             memcpy(outBuffer.data(), buffer + offset + BLOCK_HEADER_SIZE, size);
 
-            bh->magic.store(0, std::memory_order_relaxed);
             header->readPos.store(rPos + nextRPosDiff, std::memory_order_release);
+            return;
+        }
+    }
+
+    // Consumer: Dequeue Batch
+    void DequeueBatch(std::vector<std::vector<uint8_t>>& outMsgs, size_t maxCount) {
+        if (maxCount == 0) return;
+
+        int spinCount = 0;
+
+        while (true) {
+            uint64_t rPos = header->readPos.load(std::memory_order_relaxed);
+            uint64_t wPos = header->writePos.load(std::memory_order_acquire);
+
+            if (rPos == wPos) {
+                if (!outMsgs.empty()) return;
+
+                if (spinCount < 4000) {
+                    spinCount++;
+#ifdef _WIN32
+                    _mm_pause();
+#else
+                    __builtin_ia32_pause();
+#endif
+                    continue;
+                } else {
+                    Platform::WaitEvent(hEvent, 100);
+                    spinCount = 0;
+                    continue;
+                }
+            }
+
+            uint64_t cap = header->capacity.load(std::memory_order_relaxed);
+
+            while (outMsgs.size() < maxCount && rPos != wPos) {
+                uint64_t offset = rPos % cap;
+                uint64_t spaceToEnd = cap - offset;
+
+                if (spaceToEnd < BLOCK_HEADER_SIZE) {
+                    rPos += spaceToEnd;
+                    continue;
+                }
+
+                BlockHeader* bh = reinterpret_cast<BlockHeader*>(buffer + offset);
+                uint32_t magic = bh->magic.load(std::memory_order_relaxed);
+
+                if (magic == BLOCK_MAGIC_PAD) {
+                     uint32_t size = bh->size;
+                     rPos += size + BLOCK_HEADER_SIZE;
+                     continue;
+                }
+
+                // DATA
+                uint32_t size = bh->size;
+                uint32_t alignedSize = (size + 7) & ~7;
+                uint64_t nextRPosDiff = alignedSize + BLOCK_HEADER_SIZE;
+
+                std::vector<uint8_t> msg(size);
+                memcpy(msg.data(), buffer + offset + BLOCK_HEADER_SIZE, size);
+                outMsgs.push_back(std::move(msg));
+
+                rPos += nextRPosDiff;
+            }
+
+            header->readPos.store(rPos, std::memory_order_release);
             return;
         }
     }
