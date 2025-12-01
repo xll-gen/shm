@@ -45,18 +45,14 @@ bool IPCHost::Init(const std::string& shmName, uint64_t queueSize) {
     // 3. Start Threads
     running = true;
     readerThread = std::thread(&IPCHost::ReaderLoop, this);
-    writerThread = std::thread(&IPCHost::WriterLoop, this);
 
     return true;
 }
 
 void IPCHost::Shutdown() {
     running = false;
-    // Wake up writer thread
-    outboundCV.notify_all();
 
     if (readerThread.joinable()) readerThread.join();
-    if (writerThread.joinable()) writerThread.join();
 
     if (shmBase) Platform::CloseShm(hMapFile, shmBase);
     if (hToGuestEvent) Platform::CloseEvent(hToGuestEvent);
@@ -87,29 +83,6 @@ void IPCHost::ReaderLoop() {
     }
 }
 
-void IPCHost::WriterLoop() {
-    std::vector<std::vector<uint8_t>> batch;
-    batch.reserve(100);
-
-    while (running) {
-        {
-            std::unique_lock<std::mutex> lock(outboundMutex);
-            outboundCV.wait(lock, [this] { return !outboundQueue.empty() || !running; });
-
-            if (!running && outboundQueue.empty()) return;
-
-            // Move entire queue to local batch
-            batch = std::move(outboundQueue);
-            // outboundQueue is now empty
-        }
-
-        if (!batch.empty()) {
-            toGuestQueue->EnqueueBatch(batch);
-            batch.clear();
-        }
-    }
-}
-
 bool IPCHost::Call(const uint8_t* reqData, size_t reqSize, std::vector<uint8_t>& outResponse) {
     // 1. Prepare Context
     RequestContext ctx;
@@ -124,13 +97,11 @@ bool IPCHost::Call(const uint8_t* reqData, size_t reqSize, std::vector<uint8_t>&
         pendingRequests[reqId] = &ctx;
     }
 
-    // 2. Enqueue to internal queue
+    // 2. Enqueue directly
     {
-        std::lock_guard<std::mutex> lock(outboundMutex);
-        std::vector<uint8_t> data(reqData, reqData + reqSize);
-        outboundQueue.push_back(std::move(data));
+        std::lock_guard<std::mutex> lock(writeMutex);
+        toGuestQueue->Enqueue(reqData, (uint32_t)reqSize);
     }
-    outboundCV.notify_one();
 
     // 3. Wait
     // In a real system, we should have a timeout

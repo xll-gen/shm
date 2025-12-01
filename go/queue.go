@@ -16,11 +16,12 @@ const (
 
 // Corresponds to the C++ layout
 type QueueHeader struct {
-	WritePos uint64   // 8 bytes
-	_pad1    [56]byte // 56 bytes
-	ReadPos  uint64   // 8 bytes
-	Capacity uint64   // 8 bytes
-	_pad2    [48]byte // 48 bytes
+	WritePos        uint64   // 8 bytes
+	_pad1           [56]byte // 56 bytes
+	ReadPos         uint64   // 8 bytes
+	Capacity        uint64   // 8 bytes
+	ConsumerWaiting uint32   // 4 bytes
+	_pad2           [44]byte // 44 bytes
 }
 
 type SPSCQueue struct {
@@ -55,7 +56,6 @@ func (q *SPSCQueue) Recycle(msgs []*[]byte) {
 }
 
 // Enqueue blocks if full.
-// Modified to use relaxed magic stores and write barrier logic (implied by atomic store of WritePos).
 func (q *SPSCQueue) Enqueue(data []byte) {
 	// Align total size to 8 bytes
 	alignedSize := (len(data) + 7) & ^7
@@ -87,10 +87,8 @@ func (q *SPSCQueue) Enqueue(data []byte) {
 				ptr := unsafe.Pointer(&q.Buffer[offset])
 				*(*uint32)(ptr) = uint32(spaceToEnd) - BlockHeaderSize
 				magicPtr := (*uint32)(unsafe.Pointer(uintptr(ptr) + 4))
-				atomic.StoreUint32(magicPtr, BlockMagicPad) // Relaxed in theory, but Go only has atomic.Store
+				atomic.StoreUint32(magicPtr, BlockMagicPad)
 
-				// Ensure magic is visible before WritePos update
-				// Go's atomic.Store implies a release barrier on most architectures (like x86/ARM64).
 				atomic.StoreUint64(&q.Header.WritePos, wPos+spaceToEnd)
 				continue
 			}
@@ -101,15 +99,18 @@ func (q *SPSCQueue) Enqueue(data []byte) {
 		*(*uint32)(ptr) = uint32(len(data))
 
 		magicPtr := (*uint32)(unsafe.Pointer(uintptr(ptr) + 4))
-		atomic.StoreUint32(magicPtr, BlockMagicData) // Relaxed
+		atomic.StoreUint32(magicPtr, BlockMagicData)
 
 		copy(q.Buffer[offset+BlockHeaderSize:], data)
 
-		// Barrier: Ensure data is written before WritePos is updated.
-		// Go atomic.Store serves as release.
 		atomic.StoreUint64(&q.Header.WritePos, wPos+totalSize)
 
-		SignalEvent(q.Event)
+		// Barrier: StoreLoad
+		// Using atomic.AddUint32(&x, 0) as a full barrier/fence on x86/AMD64 which is where this matters most.
+		// It returns the new value, which effectively loads it.
+		if atomic.AddUint32(&q.Header.ConsumerWaiting, 0) == 1 {
+			SignalEvent(q.Event)
+		}
 		return
 	}
 }
@@ -163,7 +164,7 @@ func (q *SPSCQueue) EnqueueBatch(msgs [][]byte) {
 					ptr := unsafe.Pointer(&q.Buffer[offset])
 					*(*uint32)(ptr) = uint32(spaceToEnd) - BlockHeaderSize
 					magicPtr := (*uint32)(unsafe.Pointer(uintptr(ptr) + 4))
-					atomic.StoreUint32(magicPtr, BlockMagicPad) // Relaxed
+					atomic.StoreUint32(magicPtr, BlockMagicPad)
 
 					tempWPos += spaceToEnd
 					currentIdx--
@@ -176,7 +177,7 @@ func (q *SPSCQueue) EnqueueBatch(msgs [][]byte) {
 			*(*uint32)(ptr) = uint32(len(data))
 
 			magicPtr := (*uint32)(unsafe.Pointer(uintptr(ptr) + 4))
-			atomic.StoreUint32(magicPtr, BlockMagicData) // Relaxed
+			atomic.StoreUint32(magicPtr, BlockMagicData)
 
 			copy(q.Buffer[offset+BlockHeaderSize:], data)
 
@@ -185,8 +186,11 @@ func (q *SPSCQueue) EnqueueBatch(msgs [][]byte) {
 		}
 
 		if tempWPos != wPos {
-			atomic.StoreUint64(&q.Header.WritePos, tempWPos) // Release
-			SignalEvent(q.Event)
+			atomic.StoreUint64(&q.Header.WritePos, tempWPos)
+			// Barrier: StoreLoad
+			if atomic.AddUint32(&q.Header.ConsumerWaiting, 0) == 1 {
+				SignalEvent(q.Event)
+			}
 		}
 	}
 }
@@ -203,7 +207,27 @@ func (q *SPSCQueue) Dequeue() []byte {
 				spinCount++
 				continue
 			}
+			atomic.StoreUint32(&q.Header.ConsumerWaiting, 1)
+
+			// Barrier: StoreLoad.
+			// We need to ensure Store(ConsumerWaiting) is visible before Load(WritePos).
+			// We re-read WritePos below.
+			// To force barrier, we can use the same trick or just rely on the fact that we are about to read.
+			// But simple Load isn't enough.
+			// Let's use AddUint32(&dummy, 0) or just atomic.LoadUint64 is NOT a barrier against previous store.
+			// So we use AddUint32 on something.
+			// Ideally we use `runtime.Gosched()`? No.
+			// Let's use the same AddUint32(&q.Header.ConsumerWaiting, 0) but that touches the value we just set.
+			// Actually `atomic.AddUint32(&q.Header.ConsumerWaiting, 0)` is a barrier.
+			atomic.AddUint32(&q.Header.ConsumerWaiting, 0)
+
+			if atomic.LoadUint64(&q.Header.ReadPos) != atomic.LoadUint64(&q.Header.WritePos) {
+				atomic.StoreUint32(&q.Header.ConsumerWaiting, 0)
+				continue
+			}
+
 			WaitForEvent(q.Event, 100)
+			atomic.StoreUint32(&q.Header.ConsumerWaiting, 0)
 			spinCount = 0
 			continue
 		}
@@ -219,13 +243,10 @@ func (q *SPSCQueue) Dequeue() []byte {
 
 		ptr := unsafe.Pointer(&q.Buffer[offset])
 		magicPtr := (*uint32)(unsafe.Pointer(uintptr(ptr) + 4))
-
-		// No spin on magic. Rely on WritePos + Barrier from producer.
 		magic := atomic.LoadUint32(magicPtr)
 
 		if magic == BlockMagicPad {
 			size := *(*uint32)(ptr)
-			// Clear magic not strictly needed
 			atomic.StoreUint64(&q.Header.ReadPos, rPos+uint64(size+BlockHeaderSize))
 			continue
 		}
@@ -264,7 +285,19 @@ func (q *SPSCQueue) DequeueBatch(maxCount int) []*[]byte {
 				spinCount++
 				continue
 			}
+
+			atomic.StoreUint32(&q.Header.ConsumerWaiting, 1)
+
+			// Barrier
+			atomic.AddUint32(&q.Header.ConsumerWaiting, 0)
+
+			if atomic.LoadUint64(&q.Header.ReadPos) != atomic.LoadUint64(&q.Header.WritePos) {
+				atomic.StoreUint32(&q.Header.ConsumerWaiting, 0)
+				continue
+			}
+
 			WaitForEvent(q.Event, 100)
+			atomic.StoreUint32(&q.Header.ConsumerWaiting, 0)
 			spinCount = 0
 			continue
 		}
@@ -282,7 +315,7 @@ func (q *SPSCQueue) DequeueBatch(maxCount int) []*[]byte {
 
 			ptr := unsafe.Pointer(&q.Buffer[offset])
 			magicPtr := (*uint32)(unsafe.Pointer(uintptr(ptr) + 4))
-			magic := atomic.LoadUint32(magicPtr) // Relaxed
+			magic := atomic.LoadUint32(magicPtr)
 
 			if magic == BlockMagicPad {
 				size := *(*uint32)(ptr)
