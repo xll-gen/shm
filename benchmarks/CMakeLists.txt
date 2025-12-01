@@ -20,7 +20,7 @@ include_directories(${CMAKE_SOURCE_DIR}/external)
 # Add source files
 set(SOURCES
     main.cpp
-    ${CMAKE_SOURCE_DIR}/../src/IPC.cpp
+    ${CMAKE_SOURCE_DIR}/../src/IPCHost.cpp
 )
 
 # Executable

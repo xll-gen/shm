@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/binary"
 	"flag"
 	"fmt"
 	"runtime"
@@ -15,45 +14,68 @@ import (
 )
 
 const (
-	QUEUE_SIZE = 1024 * 1024 * 4 // 4MB
+	QUEUE_SIZE = 1024 * 1024 * 32 // 32MB
 )
 
 func main() {
 	workers := flag.Int("w", 1, "Number of worker threads")
 	flag.Parse()
 
-	fmt.Printf("[Go] Starting Server with %d workers...\n", *workers)
+	fmt.Printf("[Go] Starting Guest with %d workers...\n", *workers)
 
-	// 1. Create Events
-	hReq, err := shm.CreateEvent("SimpleIPC_REQ")
-	if err != nil {
-		fmt.Printf("CreateEvent REQ error: %v\n", err)
-	}
-	hResp, err := shm.CreateEvent("SimpleIPC_RESP")
-	if err != nil {
-		fmt.Printf("CreateEvent RESP error: %v\n", err)
-	}
-
-	// 2. Open SHM
+	// 1. Open SHM (Retry loop until Host creates it)
 	qTotalSize := uint64(shm.QueueHeaderSize + QUEUE_SIZE) // Header + Data
 	totalSize := uint64(qTotalSize * 2)
 
-	hMap, addr, err := shm.CreateShm("SimpleIPC", totalSize)
-	if err != nil {
-		panic(err)
+	var hMap shm.ShmHandle
+	var addr uintptr
+	var err error
+
+	fmt.Println("[Go] Waiting for Host to create SHM...")
+	for {
+		hMap, addr, err = shm.OpenShm("SimpleIPC", totalSize)
+		if err == nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	fmt.Println("[Go] Connected to SHM.")
+
+	// 2. Open Events (Retry loop)
+	var hToGuest, hFromGuest shm.EventHandle
+
+	for {
+		hToGuest, err = shm.OpenEvent("SimpleIPC_REQ") // REQ = ToGuest
+		if err == nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 
-	// 3. Init Queues
-	reqQueue := shm.NewMPSCQueue(addr, QUEUE_SIZE, hReq)
-	respQueue := shm.NewMPSCQueue(addr+uintptr(qTotalSize), QUEUE_SIZE, hResp)
+	for {
+		hFromGuest, err = shm.OpenEvent("SimpleIPC_RESP") // RESP = FromGuest
+		if err == nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	fmt.Println("[Go] Connected to Events.")
 
-	fmt.Println("[Go] Waiting for SHM initialization...")
-	for atomic.LoadUint64(&reqQueue.Header.Capacity) == 0 {
+	// 3. Init Queues
+	// Layout: [ToGuestQueue] [FromGuestQueue]
+	// Queue 1: ToGuest (Guest reads from here)
+	// Queue 2: FromGuest (Guest writes to here)
+	toGuestQueue := shm.NewMPSCQueue(addr, QUEUE_SIZE, hToGuest)
+	fromGuestQueue := shm.NewMPSCQueue(addr+uintptr(qTotalSize), QUEUE_SIZE, hFromGuest)
+
+	fmt.Println("[Go] Waiting for Queue initialization...")
+	// Wait for Host to initialize headers
+	for atomic.LoadUint64(&toGuestQueue.Header.Capacity) == 0 {
 		runtime.Gosched()
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	fmt.Println("[Go] Server Ready. Waiting for requests...")
+	fmt.Println("[Go] Guest Ready. Waiting for requests from Host...")
 
 	// 4. Start Workers
 	workChan := make(chan []byte, 1024)
@@ -65,14 +87,14 @@ func main() {
 			defer wg.Done()
 			builder := flatbuffers.NewBuilder(1024)
 			for data := range workChan {
-				handleRequest(data, respQueue, builder)
+				handleRequest(data, fromGuestQueue, builder)
 			}
 		}(i)
 	}
 
-	// 5. Consumer Loop
+	// 5. Consumer Loop (Reading from toGuestQueue)
 	for {
-		data, ok := reqQueue.Dequeue()
+		data, ok := toGuestQueue.Dequeue()
 		if ok {
 			workChan <- data
 			continue
@@ -80,12 +102,12 @@ func main() {
 
 		spinCount := 0
 		for {
-			if atomic.LoadUint64(&reqQueue.Header.WritePos) != atomic.LoadUint64(&reqQueue.Header.ReadPos) {
+			if atomic.LoadUint64(&toGuestQueue.Header.WritePos) != atomic.LoadUint64(&toGuestQueue.Header.ReadPos) {
 				break
 			}
 			spinCount++
 			if spinCount > 4000 {
-				shm.WaitForEvent(hReq, 100)
+				shm.WaitForEvent(hToGuest, 100)
 				break
 			}
 			runtime.Gosched()
@@ -102,14 +124,8 @@ func handleRequest(data []byte, respQ *shm.MPSCQueue, builder *flatbuffers.Build
 		}
 	}()
 
-	if len(data) < 8 {
-		return
-	}
-
-	reqID := binary.LittleEndian.Uint64(data[:8])
-	payload := data[8:]
-
-	msg := ipc.GetRootAsMessage(payload, 0)
+	msg := ipc.GetRootAsMessage(data, 0)
+	reqID := msg.ReqId()
 
 	builder.Reset()
 
@@ -141,7 +157,7 @@ func handleRequest(data []byte, respQ *shm.MPSCQueue, builder *flatbuffers.Build
 	}
 
 	ipc.MessageStart(builder)
-	ipc.MessageAddReqId(builder, 0)
+	ipc.MessageAddReqId(builder, reqID)
 	ipc.MessageAddPayloadType(builder, payloadType)
 	ipc.MessageAddPayload(builder, payloadOffset)
 	resMsg := ipc.MessageEnd(builder)
@@ -149,12 +165,8 @@ func handleRequest(data []byte, respQ *shm.MPSCQueue, builder *flatbuffers.Build
 	builder.Finish(resMsg)
 	resBytes := builder.FinishedBytes()
 
-	respPacket := make([]byte, 8+len(resBytes))
-	binary.LittleEndian.PutUint64(respPacket[:8], reqID)
-	copy(respPacket[8:], resBytes)
-
-	if !respQ.Enqueue(respPacket) {
-		for !respQ.Enqueue(respPacket) {
+	if !respQ.Enqueue(resBytes) {
+		for !respQ.Enqueue(resBytes) {
 			runtime.Gosched()
 		}
 	}

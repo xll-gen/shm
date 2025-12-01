@@ -5,24 +5,24 @@
 #include <atomic>
 #include <iomanip>
 #include <string>
-#include "../../src/IPC.h"
+#include "../../src/IPCHost.h"
 #include "ipc_generated.h"
 
 using namespace shm;
 
-void worker(IPCClient* client, int id, int iterations) {
+void worker(IPCHost* host, int id, int iterations) {
     flatbuffers::FlatBufferBuilder builder(1024);
 
     for (int i = 0; i < iterations; ++i) {
         builder.Clear();
 
         auto addReq = ipc::CreateAddRequest(builder, 1.0 * i, 2.0 * i);
-        auto msg = ipc::CreateMessage(builder, 0, ipc::Payload_AddRequest, addReq.Union());
+        auto msg = ipc::CreateMessage(builder, host->GenerateReqId(), ipc::Payload_AddRequest, addReq.Union());
         builder.Finish(msg);
 
         std::vector<uint8_t> resp;
         // Call now takes (payload, size, outResp)
-        if (!client->Call(builder.GetBufferPointer(), builder.GetSize(), resp)) {
+        if (!host->Call(builder.GetBufferPointer(), builder.GetSize(), resp)) {
             std::cerr << "Call failed!" << std::endl;
             return;
         }
@@ -42,8 +42,8 @@ void worker(IPCClient* client, int id, int iterations) {
 }
 
 void run_benchmark(int numThreads, int iterations) {
-    IPCClient client;
-    if (!client.Init("SimpleIPC", 4 * 1024 * 1024)) {
+    IPCHost host;
+    if (!host.Init("SimpleIPC", 32 * 1024 * 1024)) {
         std::cerr << "Failed to init IPC" << std::endl;
         exit(1);
     }
@@ -54,7 +54,7 @@ void run_benchmark(int numThreads, int iterations) {
 
     std::vector<std::thread> threads;
     for (int i = 0; i < numThreads; ++i) {
-        threads.emplace_back(worker, &client, i, iterations);
+        threads.emplace_back(worker, &host, i, iterations);
     }
 
     for (auto& t : threads) t.join();
@@ -73,7 +73,7 @@ void run_benchmark(int numThreads, int iterations) {
     std::cout << "Avg Latency: " << latency << " us" << std::endl;
     std::cout << "------------------------------------------------" << std::endl;
 
-    client.Shutdown();
+    host.Shutdown();
 }
 
 int main(int argc, char* argv[]) {

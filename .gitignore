@@ -48,3 +48,6 @@ CMakeUserPresets.json
 bin/
 *.log
 bin/
+
+# Specific binaries
+benchmarks/go/server
