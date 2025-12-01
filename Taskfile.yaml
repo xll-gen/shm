@@ -20,33 +20,41 @@ tasks:
     deps: [build:cpp, build:go]
 
   run:benchmark:
-    desc: Builds and runs the benchmark suite
+    desc: Builds and runs the full benchmark suite (1, 4, 8 threads)
     deps: [build]
     cmds:
-      - cmd: taskkill /F /IM server.exe || true
-        ignore_error: true
-        platforms: [windows]
-      # Clean up potential stale SHM files on Linux
+      - task: run:case
+        vars: { THREADS: 1 }
+      - task: run:case
+        vars: { THREADS: 4 }
+      - task: run:case
+        vars: { THREADS: 8 }
+
+  run:case:
+    internal: true
+    cmds:
+      # Cleanup before run
+      - task: kill_server
       - cmd: rm -f /dev/shm/SimpleIPC* || true
         ignore_error: true
         platforms: [linux]
 
-      # Start Go Server in background
-      - cmd: './benchmarks/go/server -w 4 > server.log 2>&1 &'
+      # Start Server
+      - cmd: './benchmarks/go/server -w {{.THREADS}} > server_{{.THREADS}}.log 2>&1 &'
         platforms: [linux]
-      - cmd: 'cmd /c "start /B benchmarks\go\server.exe -w 4 > server.log 2>&1"'
+      - cmd: 'cmd /c "start /B benchmarks\go\server.exe -w {{.THREADS}} > server_{{.THREADS}}.log 2>&1"'
         platforms: [windows]
 
-      # Wait a bit for server (though it waits for SHM)
-      - cmd: 'timeout /t 1 /nobreak > nul'
-        platforms: [windows]
+      # Wait for start
       - cmd: sleep 1
         platforms: [linux]
+      - cmd: 'timeout /t 1 /nobreak > nul'
+        platforms: [windows]
 
-      # Run C++ Benchmark (Producer)
-      - cmd: './benchmarks/build/shm_benchmark {{.CLI_ARGS}}'
+      # Run Client
+      - cmd: './benchmarks/build/shm_benchmark -t {{.THREADS}}'
         platforms: [linux]
-      - cmd: 'benchmarks/build/shm_benchmark.exe {{.CLI_ARGS}}'
+      - cmd: 'benchmarks/build/shm_benchmark.exe -t {{.THREADS}}'
         platforms: [windows]
 
       # Cleanup
