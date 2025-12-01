@@ -8,7 +8,7 @@
 #include <thread>
 #include <future>
 #include "../src/Platform.h"
-#include "../include/MPSCQueue.h"
+#include "../include/SPSCQueue.h"
 
 namespace shm {
 
@@ -20,8 +20,8 @@ class IPCHost {
     void* shmBase;
     ShmHandle hMapFile;
 
-    std::unique_ptr<MPSCQueue> toGuestQueue;   // Host -> Guest
-    std::unique_ptr<MPSCQueue> fromGuestQueue; // Guest -> Host
+    std::unique_ptr<SPSCQueue> toGuestQueue;   // Host -> Guest
+    std::unique_ptr<SPSCQueue> fromGuestQueue; // Guest -> Host
 
     EventHandle hToGuestEvent;   // Signaled when Host writes to toGuestQueue
     EventHandle hFromGuestEvent; // Signaled when Guest writes to fromGuestQueue
@@ -33,6 +33,8 @@ class IPCHost {
 
     std::mutex pendingMutex;
     std::unordered_map<uint64_t, RequestContext*> pendingRequests;
+
+    std::mutex sendMutex; // Protects toGuestQueue (Single Producer)
 
 public:
     IPCHost() : shmBase(nullptr), hMapFile(0), running(false) {}

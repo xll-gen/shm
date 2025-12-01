@@ -17,6 +17,9 @@ const (
 	QUEUE_SIZE = 1024 * 1024 * 32 // 32MB
 )
 
+// Mutex to protect SPSCQueue Write
+var respMutex sync.Mutex
+
 func main() {
 	workers := flag.Int("w", 1, "Number of worker threads")
 	flag.Parse()
@@ -65,8 +68,8 @@ func main() {
 	// Layout: [ToGuestQueue] [FromGuestQueue]
 	// Queue 1: ToGuest (Guest reads from here)
 	// Queue 2: FromGuest (Guest writes to here)
-	toGuestQueue := shm.NewMPSCQueue(addr, QUEUE_SIZE, hToGuest)
-	fromGuestQueue := shm.NewMPSCQueue(addr+uintptr(qTotalSize), QUEUE_SIZE, hFromGuest)
+	toGuestQueue := shm.NewSPSCQueue(addr, QUEUE_SIZE, hToGuest)
+	fromGuestQueue := shm.NewSPSCQueue(addr+uintptr(qTotalSize), QUEUE_SIZE, hFromGuest)
 
 	fmt.Println("[Go] Waiting for Queue initialization...")
 	// Wait for Host to initialize headers
@@ -94,30 +97,15 @@ func main() {
 
 	// 5. Consumer Loop (Reading from toGuestQueue)
 	for {
-		data, ok := toGuestQueue.Dequeue()
-		if ok {
-			workChan <- data
-			continue
-		}
-
-		spinCount := 0
-		for {
-			if atomic.LoadUint64(&toGuestQueue.Header.WritePos) != atomic.LoadUint64(&toGuestQueue.Header.ReadPos) {
-				break
-			}
-			spinCount++
-			if spinCount > 4000 {
-				shm.WaitForEvent(hToGuest, 100)
-				break
-			}
-			runtime.Gosched()
-		}
+		// Dequeue blocks now
+		data := toGuestQueue.Dequeue()
+		workChan <- data
 	}
 
 	_ = hMap
 }
 
-func handleRequest(data []byte, respQ *shm.MPSCQueue, builder *flatbuffers.Builder) {
+func handleRequest(data []byte, respQ *shm.SPSCQueue, builder *flatbuffers.Builder) {
 	defer func() {
 		if r := recover(); r != nil {
 			// Recover from potential FlatBuffers panics due to corrupt data
@@ -165,9 +153,9 @@ func handleRequest(data []byte, respQ *shm.MPSCQueue, builder *flatbuffers.Build
 	builder.Finish(resMsg)
 	resBytes := builder.FinishedBytes()
 
-	if !respQ.Enqueue(resBytes) {
-		for !respQ.Enqueue(resBytes) {
-			runtime.Gosched()
-		}
-	}
+	// Enqueue blocks if full
+	// SPSCQueue is Single Producer, so multiple workers must serialize writes
+	respMutex.Lock()
+	respQ.Enqueue(resBytes)
+	respMutex.Unlock()
 }

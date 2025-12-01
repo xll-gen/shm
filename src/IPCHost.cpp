@@ -11,9 +11,6 @@ namespace shm {
 
 bool IPCHost::Init(const std::string& shmName, uint64_t queueSize) {
     // 1. Create/Open Events
-    // Suffixes are added by Platform if needed, but here we add _REQ/_RESP to base name
-    // _REQ -> Host -> Guest (ToGuest)
-    // _RESP -> Guest -> Host (FromGuest)
     std::string toGuestEvName = shmName + "_REQ";
     std::string fromGuestEvName = shmName + "_RESP";
 
@@ -24,7 +21,7 @@ bool IPCHost::Init(const std::string& shmName, uint64_t queueSize) {
 
     // 2. Create SHM
     // Total size = 2 * (Header + Data)
-    uint64_t qTotalSize = MPSCQueue::GetRequiredSize(queueSize);
+    uint64_t qTotalSize = SPSCQueue::GetRequiredSize(queueSize);
     uint64_t totalShmSize = qTotalSize * 2;
 
     bool exists = false;
@@ -36,15 +33,14 @@ bool IPCHost::Init(const std::string& shmName, uint64_t queueSize) {
     uint8_t* reqBase = (uint8_t*)shmBase;
 
     // Init if created new OR if existing but uninitialized (capacity 0)
-    // This handles the case where Go created the file but C++ initializes the headers.
     QueueHeader* hdr = reinterpret_cast<QueueHeader*>(reqBase);
     if (!exists || hdr->capacity == 0) {
-        MPSCQueue::Init(reqBase, queueSize);
-        MPSCQueue::Init(reqBase + qTotalSize, queueSize);
+        SPSCQueue::Init(reqBase, queueSize);
+        SPSCQueue::Init(reqBase + qTotalSize, queueSize);
     }
 
-    toGuestQueue = std::make_unique<MPSCQueue>(reqBase, queueSize, hToGuestEvent);
-    fromGuestQueue = std::make_unique<MPSCQueue>(reqBase + qTotalSize, queueSize, hFromGuestEvent);
+    toGuestQueue = std::make_unique<SPSCQueue>(reqBase, queueSize, hToGuestEvent);
+    fromGuestQueue = std::make_unique<SPSCQueue>(reqBase + qTotalSize, queueSize, hFromGuestEvent);
 
     // 3. Start Reader Thread
     running = true;
@@ -67,43 +63,22 @@ void IPCHost::ReaderLoop() {
     buffer.reserve(4096);
 
     while (running) {
-        // 1. Try Dequeue
-        if (fromGuestQueue->Dequeue(buffer)) {
-            // Got message
-            auto msg = ipc::GetMessage(buffer.data());
-            // Need to verify message validity before accessing req_id, technically
-            if (!msg) continue;
+        // Dequeue blocks until data is available
+        fromGuestQueue->Dequeue(buffer);
 
-            uint64_t reqId = msg->req_id();
+        // Got message
+        auto msg = ipc::GetMessage(buffer.data());
+        if (!msg) continue;
 
-            std::lock_guard<std::mutex> lock(pendingMutex);
-            auto it = pendingRequests.find(reqId);
-            if (it != pendingRequests.end()) {
-                RequestContext* ctx = it->second;
-                ctx->promise.set_value(std::move(buffer));
-                pendingRequests.erase(it);
-            }
-            continue;
+        uint64_t reqId = msg->req_id();
+
+        std::lock_guard<std::mutex> lock(pendingMutex);
+        auto it = pendingRequests.find(reqId);
+        if (it != pendingRequests.end()) {
+            RequestContext* ctx = it->second;
+            ctx->promise.set_value(std::move(buffer));
+            pendingRequests.erase(it);
         }
-
-        // 2. Hybrid Wait
-        // Short Spin
-        for (int i = 0; i < 4000; ++i) {
-            if (fromGuestQueue->header->readPos.load(std::memory_order_relaxed) !=
-                fromGuestQueue->header->writePos.load(std::memory_order_acquire)) { // Acquire matches MPSCQueue.h logic
-                goto NEXT_LOOP; // Data arrived
-            }
-#ifdef _WIN32
-            _mm_pause();
-#else
-            __builtin_ia32_pause();
-#endif
-        }
-
-        // Wait Kernel
-        Platform::WaitEvent(hFromGuestEvent, 100); // 100ms timeout to check 'running'
-
-    NEXT_LOOP:;
     }
 }
 
@@ -122,17 +97,9 @@ bool IPCHost::Call(const uint8_t* reqData, size_t reqSize, std::vector<uint8_t>&
     }
 
     // 2. Enqueue
-    // Retry loop for Enqueue
-    int retries = 0;
-    while (!toGuestQueue->Enqueue(reqData, (uint32_t)reqSize)) {
-        if (retries++ > 10000) { // Approx 1-10ms depending on pause
-            {
-                std::lock_guard<std::mutex> lock(pendingMutex);
-                pendingRequests.erase(reqId);
-            }
-            return false;
-        }
-        std::this_thread::yield();
+    {
+        std::lock_guard<std::mutex> lock(sendMutex);
+        toGuestQueue->Enqueue(reqData, (uint32_t)reqSize);
     }
 
     // 3. Wait
