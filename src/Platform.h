@@ -120,7 +120,7 @@ public:
 #endif
     }
 
-    static void Yield() {
+    static void ThreadYield() {
 #ifdef _WIN32
         SwitchToThread();
 #else

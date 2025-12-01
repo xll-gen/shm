@@ -172,7 +172,7 @@ public:
              __builtin_ia32_pause();
 #endif
             if (++spin > 1000) {
-                 Platform::Yield();
+                 Platform::ThreadYield();
             }
         }
 
