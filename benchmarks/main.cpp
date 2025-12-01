@@ -76,7 +76,43 @@ void run_benchmark(int numThreads, int iterations) {
     host.Shutdown();
 }
 
+void test_control_messages() {
+    std::cout << "Testing Control Messages..." << std::endl;
+    IPCHost host;
+    if (!host.Init("SimpleIPC", 32 * 1024 * 1024)) {
+        std::cerr << "Failed to init IPC for control test" << std::endl;
+        return;
+    }
+
+    // Give Go side some time to connect
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+
+    // Test Heartbeat
+    std::cout << "Sending Heartbeat..." << std::endl;
+    if (host.SendHeartbeat()) {
+        std::cout << "Heartbeat SUCCESS" << std::endl;
+    } else {
+        std::cerr << "Heartbeat FAILED (Timeout)" << std::endl;
+    }
+
+    // Test Shutdown
+    std::cout << "Sending Shutdown..." << std::endl;
+    host.SendShutdown();
+    std::cout << "Shutdown Sent." << std::endl;
+
+    host.Shutdown();
+    std::cout << "Test Complete." << std::endl;
+    std::cout << "------------------------------------------------" << std::endl;
+}
+
+
 int main(int argc, char* argv[]) {
+    // 1. Test Control Messages first (to ensure logic is correct)
+    test_control_messages();
+
+    // Wait a bit for the previous Go process to exit and SHM to be cleaned up
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+
     int iterations = 10000;
     int specificThreadCount = 0;
 

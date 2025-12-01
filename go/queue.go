@@ -10,7 +10,7 @@ import (
 const (
 	BlockMagicData  = 0xDA7A0001
 	BlockMagicPad   = 0xDA7A0002
-	BlockHeaderSize = 8
+	BlockHeaderSize = 16
 	QueueHeaderSize = 128
 )
 
@@ -56,7 +56,7 @@ func (q *SPSCQueue) Recycle(msgs []*[]byte) {
 }
 
 // Enqueue blocks if full.
-func (q *SPSCQueue) Enqueue(data []byte) {
+func (q *SPSCQueue) Enqueue(data []byte, msgId uint32) {
 	// Align total size to 8 bytes
 	alignedSize := (len(data) + 7) & ^7
 	totalSize := uint64(alignedSize + BlockHeaderSize)
@@ -86,7 +86,10 @@ func (q *SPSCQueue) Enqueue(data []byte) {
 				// Write Padding Header
 				ptr := unsafe.Pointer(&q.Buffer[offset])
 				*(*uint32)(ptr) = uint32(spaceToEnd) - BlockHeaderSize
-				magicPtr := (*uint32)(unsafe.Pointer(uintptr(ptr) + 4))
+				// msgId=0, padding
+				*(*uint32)(unsafe.Pointer(uintptr(ptr) + 4)) = 0
+
+				magicPtr := (*uint32)(unsafe.Pointer(uintptr(ptr) + 8))
 				atomic.StoreUint32(magicPtr, BlockMagicPad)
 
 				atomic.StoreUint64(&q.Header.WritePos, wPos+spaceToEnd)
@@ -96,18 +99,21 @@ func (q *SPSCQueue) Enqueue(data []byte) {
 
 		// Fits
 		ptr := unsafe.Pointer(&q.Buffer[offset])
+		// size
 		*(*uint32)(ptr) = uint32(len(data))
+		// msgId
+		*(*uint32)(unsafe.Pointer(uintptr(ptr) + 4)) = msgId
 
-		magicPtr := (*uint32)(unsafe.Pointer(uintptr(ptr) + 4))
+		if len(data) > 0 {
+			copy(q.Buffer[offset+BlockHeaderSize:], data)
+		}
+
+		magicPtr := (*uint32)(unsafe.Pointer(uintptr(ptr) + 8))
 		atomic.StoreUint32(magicPtr, BlockMagicData)
-
-		copy(q.Buffer[offset+BlockHeaderSize:], data)
 
 		atomic.StoreUint64(&q.Header.WritePos, wPos+totalSize)
 
 		// Barrier: StoreLoad
-		// Using atomic.AddUint32(&x, 0) as a full barrier/fence on x86/AMD64 which is where this matters most.
-		// It returns the new value, which effectively loads it.
 		if atomic.AddUint32(&q.Header.ConsumerWaiting, 0) == 1 {
 			SignalEvent(q.Event)
 		}
@@ -116,6 +122,7 @@ func (q *SPSCQueue) Enqueue(data []byte) {
 }
 
 // EnqueueBatch writes multiple messages.
+// Assumes MsgId = 0 (Normal).
 func (q *SPSCQueue) EnqueueBatch(msgs [][]byte) {
 	if len(msgs) == 0 {
 		return
@@ -163,7 +170,9 @@ func (q *SPSCQueue) EnqueueBatch(msgs [][]byte) {
 					// Padding
 					ptr := unsafe.Pointer(&q.Buffer[offset])
 					*(*uint32)(ptr) = uint32(spaceToEnd) - BlockHeaderSize
-					magicPtr := (*uint32)(unsafe.Pointer(uintptr(ptr) + 4))
+					*(*uint32)(unsafe.Pointer(uintptr(ptr) + 4)) = 0 // msgId=0
+
+					magicPtr := (*uint32)(unsafe.Pointer(uintptr(ptr) + 8))
 					atomic.StoreUint32(magicPtr, BlockMagicPad)
 
 					tempWPos += spaceToEnd
@@ -175,8 +184,9 @@ func (q *SPSCQueue) EnqueueBatch(msgs [][]byte) {
 			// Write Data
 			ptr := unsafe.Pointer(&q.Buffer[offset])
 			*(*uint32)(ptr) = uint32(len(data))
+			*(*uint32)(unsafe.Pointer(uintptr(ptr) + 4)) = 0 // msgId=0
 
-			magicPtr := (*uint32)(unsafe.Pointer(uintptr(ptr) + 4))
+			magicPtr := (*uint32)(unsafe.Pointer(uintptr(ptr) + 8))
 			atomic.StoreUint32(magicPtr, BlockMagicData)
 
 			copy(q.Buffer[offset+BlockHeaderSize:], data)
@@ -196,7 +206,8 @@ func (q *SPSCQueue) EnqueueBatch(msgs [][]byte) {
 }
 
 // Dequeue blocks if empty
-func (q *SPSCQueue) Dequeue() []byte {
+// Returns (data, msgId)
+func (q *SPSCQueue) Dequeue() ([]byte, uint32) {
 	spinCount := 0
 	for {
 		rPos := atomic.LoadUint64(&q.Header.ReadPos)
@@ -209,16 +220,7 @@ func (q *SPSCQueue) Dequeue() []byte {
 			}
 			atomic.StoreUint32(&q.Header.ConsumerWaiting, 1)
 
-			// Barrier: StoreLoad.
-			// We need to ensure Store(ConsumerWaiting) is visible before Load(WritePos).
-			// We re-read WritePos below.
-			// To force barrier, we can use the same trick or just rely on the fact that we are about to read.
-			// But simple Load isn't enough.
-			// Let's use AddUint32(&dummy, 0) or just atomic.LoadUint64 is NOT a barrier against previous store.
-			// So we use AddUint32 on something.
-			// Ideally we use `runtime.Gosched()`? No.
-			// Let's use the same AddUint32(&q.Header.ConsumerWaiting, 0) but that touches the value we just set.
-			// Actually `atomic.AddUint32(&q.Header.ConsumerWaiting, 0)` is a barrier.
+			// Barrier
 			atomic.AddUint32(&q.Header.ConsumerWaiting, 0)
 
 			if atomic.LoadUint64(&q.Header.ReadPos) != atomic.LoadUint64(&q.Header.WritePos) {
@@ -242,7 +244,7 @@ func (q *SPSCQueue) Dequeue() []byte {
 		}
 
 		ptr := unsafe.Pointer(&q.Buffer[offset])
-		magicPtr := (*uint32)(unsafe.Pointer(uintptr(ptr) + 4))
+		magicPtr := (*uint32)(unsafe.Pointer(uintptr(ptr) + 8))
 		magic := atomic.LoadUint32(magicPtr)
 
 		if magic == BlockMagicPad {
@@ -253,18 +255,23 @@ func (q *SPSCQueue) Dequeue() []byte {
 
 		// Data
 		size := *(*uint32)(ptr)
+		msgId := *(*uint32)(unsafe.Pointer(uintptr(ptr) + 4))
+
 		alignedSize := (size + 7) & ^uint32(7)
 		nextRPosDiff := uint64(alignedSize + BlockHeaderSize)
 
 		data := make([]byte, size)
-		copy(data, q.Buffer[offset+BlockHeaderSize:offset+BlockHeaderSize+uint64(size)])
+		if size > 0 {
+			copy(data, q.Buffer[offset+BlockHeaderSize:offset+BlockHeaderSize+uint64(size)])
+		}
 
 		atomic.StoreUint64(&q.Header.ReadPos, rPos+nextRPosDiff)
-		return data
+		return data, msgId
 	}
 }
 
 // DequeueBatch reads multiple messages using pooled buffers.
+// Only returns data. Ignores msgId (assumes normal data).
 func (q *SPSCQueue) DequeueBatch(maxCount int) []*[]byte {
 	if maxCount == 0 {
 		return nil
@@ -314,7 +321,7 @@ func (q *SPSCQueue) DequeueBatch(maxCount int) []*[]byte {
 			}
 
 			ptr := unsafe.Pointer(&q.Buffer[offset])
-			magicPtr := (*uint32)(unsafe.Pointer(uintptr(ptr) + 4))
+			magicPtr := (*uint32)(unsafe.Pointer(uintptr(ptr) + 8))
 			magic := atomic.LoadUint32(magicPtr)
 
 			if magic == BlockMagicPad {
@@ -325,6 +332,7 @@ func (q *SPSCQueue) DequeueBatch(maxCount int) []*[]byte {
 
 			// Data
 			size := *(*uint32)(ptr)
+			// msgId is ignored for batch
 			alignedSize := (size + 7) & ^uint32(7)
 			nextRPosDiff := uint64(alignedSize + BlockHeaderSize)
 
