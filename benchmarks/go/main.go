@@ -17,9 +17,6 @@ const (
 	QUEUE_SIZE = 1024 * 1024 * 32 // 32MB
 )
 
-// Mutex to protect SPSCQueue Write
-var respMutex sync.Mutex
-
 func main() {
 	workers := flag.Int("w", 1, "Number of worker threads")
 	flag.Parse()
@@ -78,9 +75,14 @@ func main() {
 		time.Sleep(10 * time.Millisecond)
 	}
 
+	// 4. Init IPC Client
+	client := shm.NewIPCClient(toGuestQueue, fromGuestQueue)
+	client.Start()
+	defer client.Stop()
+
 	fmt.Println("[Go] Guest Ready. Waiting for requests from Host...")
 
-	// 4. Start Workers
+	// 5. Start Workers
 	workChan := make(chan []byte, 1024)
 
 	var wg sync.WaitGroup
@@ -90,14 +92,23 @@ func main() {
 			defer wg.Done()
 			builder := flatbuffers.NewBuilder(1024)
 			for data := range workChan {
-				handleRequest(data, fromGuestQueue, builder)
+				handleRequest(data, client, builder)
 			}
 		}(i)
 	}
 
-	// 5. Consumer Loop (Reading from toGuestQueue)
+	// 6. Consumer Loop (Reading from toGuestQueue)
+	// We can use client.StartReader if we refactor, but strict loop here is fine too.
+	// But `client.StartReader` runs in background.
+	// To keep `main` blocking, we can use `StartReader` and then wait?
+	// Or just loop here manually calling Dequeue (as Client is mainly for Sending).
+	// Let's loop manually to read from toGuestQueue and push to workers.
+
+	// Actually, if we use Client.StartReader, we need to pass a callback.
+	// client.StartReader(func(data []byte) { workChan <- data })
+	// select {}
+
 	for {
-		// Dequeue blocks now
 		data := toGuestQueue.Dequeue()
 		workChan <- data
 	}
@@ -105,10 +116,10 @@ func main() {
 	_ = hMap
 }
 
-func handleRequest(data []byte, respQ *shm.SPSCQueue, builder *flatbuffers.Builder) {
+func handleRequest(data []byte, client *shm.IPCClient, builder *flatbuffers.Builder) {
 	defer func() {
 		if r := recover(); r != nil {
-			// Recover from potential FlatBuffers panics due to corrupt data
+			// Recover
 		}
 	}()
 
@@ -153,9 +164,20 @@ func handleRequest(data []byte, respQ *shm.SPSCQueue, builder *flatbuffers.Build
 	builder.Finish(resMsg)
 	resBytes := builder.FinishedBytes()
 
-	// Enqueue blocks if full
-	// SPSCQueue is Single Producer, so multiple workers must serialize writes
-	respMutex.Lock()
-	respQ.Enqueue(resBytes)
-	respMutex.Unlock()
+	// Get buffer from pool and copy
+	// Because FlatBuffers builder reuses its internal buffer, we must copy out.
+	// `resBytes` is a slice of builder's buffer.
+
+	bufPtr := client.GetBuffer()
+
+	// Resize bufPtr if needed
+	if cap(*bufPtr) < len(resBytes) {
+		*bufPtr = make([]byte, len(resBytes))
+	} else {
+		*bufPtr = (*bufPtr)[:len(resBytes)]
+	}
+	copy(*bufPtr, resBytes)
+
+	// Send (Client takes ownership and returns to pool)
+	client.Send(bufPtr)
 }
