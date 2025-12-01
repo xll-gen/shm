@@ -1,0 +1,56 @@
+version: '3'
+
+tasks:
+  default:
+    cmds:
+      - task: run:benchmark
+
+  build:cpp:
+    dir: benchmarks/build
+    cmds:
+      - cmd: cmake .. -DCMAKE_BUILD_TYPE=Release
+      - cmd: '{{if eq OS "windows"}}cmake --build . --config Release{{else}}make -j$(nproc){{end}}'
+
+  build:go:
+    dir: benchmarks/go
+    cmds:
+      - go build -o {{if eq OS "windows"}}server.exe{{else}}server{{end}} main.go
+
+  build:
+    deps: [build:cpp, build:go]
+
+  run:benchmark:
+    desc: Builds and runs the benchmark suite
+    deps: [build]
+    cmds:
+      - cmd: pkill -f "server -w" || true
+        ignore_error: true
+      # Clean up potential stale SHM files on Linux
+      - cmd: rm -f /dev/shm/SimpleIPC* || true
+        ignore_error: true
+        platforms: [linux]
+
+      # Start Go Server in background
+      - cmd: './benchmarks/go/server -w 4 > server.log 2>&1 &'
+        platforms: [linux]
+      - cmd: 'start /B benchmarks\go\server.exe -w 4 > server.log 2>&1'
+        platforms: [windows]
+
+      # Wait a bit for server (though it waits for SHM)
+      - sleep 1
+
+      # Run C++ Benchmark (Producer)
+      - cmd: './benchmarks/build/shm_benchmark {{.CLI_ARGS}}'
+        platforms: [linux]
+      - cmd: 'benchmarks\build\Release\shm_benchmark.exe {{.CLI_ARGS}}'
+        platforms: [windows]
+
+      # Cleanup
+      - defer: { task: kill_server }
+
+  kill_server:
+    cmds:
+      - cmd: pkill -f "server -w" || true
+        platforms: [linux]
+      - cmd: taskkill /F /IM server.exe || true
+        platforms: [windows]
