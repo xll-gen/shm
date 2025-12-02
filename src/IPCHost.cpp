@@ -58,8 +58,13 @@ void IPCHost::ReaderLoop() {
     buffer.reserve(1024);
 
     while (running) {
-        // Dequeue blocks until data is available
-        uint32_t msgId = fromGuestQueue->Dequeue(buffer);
+        // Dequeue blocks until data is available, or running becomes false
+        uint32_t msgId = fromGuestQueue->Dequeue(buffer, &running);
+
+        if (msgId == 0xFFFFFFFF) {
+            // Shutdown or Interrupted
+            break;
+        }
 
         if (msgId == MSG_ID_HEARTBEAT_RESP) {
             std::lock_guard<std::mutex> lock(heartbeatMutex);
