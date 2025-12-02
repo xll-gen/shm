@@ -3,190 +3,72 @@ package main
 import (
 	"flag"
 	"fmt"
-	"log"
 	"os"
-	"runtime"
 	"runtime/pprof"
-	"sync"
-	"sync/atomic"
-	"time"
 
-	flatbuffers "github.com/google/flatbuffers/go"
-	"benchmark/ipc" // Using local generated code
-	"github.com/xll-gen/shm/go" // Changed import path to match module
+	"github.com/xll-gen/shm/go"
 )
 
-const (
-	QUEUE_SIZE = 1024 * 1024 * 32 // 32MB
+var (
+	workers    = flag.Int("w", 1, "Number of worker threads (ignored for single reactor)")
+	shmName    = flag.String("name", "SimpleIPC", "Shared memory name")
+	cpuprofile = flag.String("cpuprofile", "", "write cpu profile to file")
+	memprofile = flag.String("memprofile", "", "write memory profile to file")
 )
 
 func main() {
-	workers := flag.Int("w", 1, "Number of worker threads")
-	cpuprofile := flag.String("cpuprofile", "", "write cpu profile to file")
-	memprofile := flag.String("memprofile", "", "write memory profile to file")
 	flag.Parse()
 
+	// 1. Profiling Setup
 	if *cpuprofile != "" {
 		f, err := os.Create(*cpuprofile)
 		if err != nil {
-			log.Fatal(err)
+			panic(err)
 		}
 		pprof.StartCPUProfile(f)
 		defer pprof.StopCPUProfile()
 	}
 
-	fmt.Printf("[Go] Starting Guest with %d workers...\n", *workers)
-
-	// 1. Open SHM (Retry loop until Host creates it)
-	qTotalSize := uint64(shm.QueueHeaderSize + QUEUE_SIZE) // Header + Data
-	totalSize := uint64(qTotalSize * 2)
-
-	var hMap shm.ShmHandle
-	var addr uintptr
-	var err error
-
-	fmt.Println("[Go] Waiting for Host to create SHM...")
-	for {
-		hMap, addr, err = shm.OpenShm("SimpleIPC", totalSize)
-		if err == nil {
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	fmt.Println("[Go] Connected to SHM.")
-
-	// 2. Open Events (Retry loop)
-	var hToGuest, hFromGuest shm.EventHandle
-
-	for {
-		hToGuest, err = shm.OpenEvent("SimpleIPC_event_req") // REQ = ToGuest
-		if err == nil {
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
+	// 2. Open SHM
+	queueSize := uint64(32 * 1024 * 1024)
+	reqQ, respQ, err := shm.OpenSHM(*shmName, queueSize)
+	if err != nil {
+		fmt.Printf("Failed to open SHM: %v\n", err)
+		return
 	}
 
-	for {
-		hFromGuest, err = shm.OpenEvent("SimpleIPC_event_resp") // RESP = FromGuest
-		if err == nil {
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	fmt.Println("[Go] Connected to Events.")
+	// 3. Start Guest
+	guest := shm.NewIPCGuest(reqQ, respQ)
+	guest.Start()
 
-	// 3. Init Queues
-	// Layout: [ToGuestQueue] [FromGuestQueue]
-	// Queue 1: ToGuest (Guest reads from here)
-	// Queue 2: FromGuest (Guest writes to here)
-	toGuestQueue := shm.NewSPSCQueue(addr, QUEUE_SIZE, hToGuest)
-	fromGuestQueue := shm.NewSPSCQueue(addr+uintptr(qTotalSize), QUEUE_SIZE, hFromGuest)
+	fmt.Println("Go Server Started")
 
-	fmt.Println("[Go] Waiting for Queue initialization...")
-	// Wait for Host to initialize headers
-	for atomic.LoadUint64(&toGuestQueue.Header.Capacity) == 0 {
-		runtime.Gosched()
-		time.Sleep(10 * time.Millisecond)
-	}
+	// 4. Register Handler (Fiber-like)
+	guest.StartReader(func(c *shm.Context) error {
+		// Zero-allocation Echo:
+		// 1. Get Request (no alloc, points to pooled buffer)
+		req := c.Request()
 
-	fmt.Println("[Go] Guest Ready. Waiting for requests from Host...")
+		// 2. Get Response Buffer (pooled) and Append
+		c.Response().Append(req)
 
-	// Init IPCGuest
-	client := shm.NewIPCGuest(toGuestQueue, fromGuestQueue)
-
-	// 4. Start Workers
-	workChan := make(chan []byte, 1024)
-
-	var wg sync.WaitGroup
-	for i := 0; i < *workers; i++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			builder := flatbuffers.NewBuilder(1024)
-			for data := range workChan {
-				handleRequest(data, client, builder)
-			}
-		}(i)
-	}
-
-	// 5. Start Reader (handles normal, heartbeat, shutdown)
-	client.StartReader(func(data []byte) {
-		// Copy data because IPCGuest reuses/frees buffer?
-		// SPSCQueue Dequeue returns allocated buffer.
-		// IPCGuest.StartReader just passes it.
-		// So it's safe to pass to channel.
-		workChan <- data
+		// 3. Send (returns buffer to pool)
+		return c.Response().Send()
 	})
 
-	// Wait for Shutdown
-	client.Wait()
+	// 5. Wait for shutdown
+	guest.Wait()
 
-	fmt.Println("[Go] Received Shutdown. Exiting...")
-	close(workChan)
-	wg.Wait()
-	_ = hMap
-
+	// Write Memory Profile
 	if *memprofile != "" {
 		f, err := os.Create(*memprofile)
 		if err != nil {
-			log.Fatal("could not create memory profile: ", err)
+			fmt.Printf("could not create memory profile: %v\n", err)
 		}
-		defer f.Close() // error handling omitted for example
-		runtime.GC()    // get up-to-date statistics
+		defer f.Close()
+		runtime.GC() // get up-to-date statistics
 		if err := pprof.WriteHeapProfile(f); err != nil {
-			log.Fatal("could not write memory profile: ", err)
+			fmt.Printf("could not write memory profile: %v\n", err)
 		}
 	}
-}
-
-func handleRequest(data []byte, client *shm.IPCGuest, builder *flatbuffers.Builder) {
-	defer func() {
-		if r := recover(); r != nil {
-			// Recover from potential FlatBuffers panics due to corrupt data
-		}
-	}()
-
-	msg := ipc.GetRootAsMessage(data, 0)
-	reqID := msg.ReqId()
-
-	builder.Reset()
-
-	var payloadOffset flatbuffers.UOffsetT
-	var payloadType ipc.Payload
-
-	// This access might panic if payload is corrupt
-	pt := msg.PayloadType()
-
-	switch pt {
-	case ipc.PayloadAddRequest:
-		req := new(ipc.AddRequest)
-		var t flatbuffers.Table
-		if msg.Payload(&t) {
-			req.Init(t.Bytes, t.Pos)
-			res := req.X() + req.Y()
-
-			ipc.AddResponseStart(builder)
-			ipc.AddResponseAddResult(builder, res)
-			payloadOffset = ipc.AddResponseEnd(builder)
-			payloadType = ipc.PayloadAddResponse
-		}
-
-	case ipc.PayloadMyRandRequest:
-		ipc.MyRandResponseStart(builder)
-		ipc.MyRandResponseAddResult(builder, 0.12345)
-		payloadOffset = ipc.MyRandResponseEnd(builder)
-		payloadType = ipc.PayloadMyRandResponse
-	}
-
-	ipc.MessageStart(builder)
-	ipc.MessageAddReqId(builder, reqID)
-	ipc.MessageAddPayloadType(builder, payloadType)
-	ipc.MessageAddPayload(builder, payloadOffset)
-	resMsg := ipc.MessageEnd(builder)
-
-	builder.Finish(resMsg)
-	resBytes := builder.FinishedBytes()
-
-	// Use IPCGuest to send (uses spinlock and signal-before-lock opt)
-	client.SendBytes(resBytes)
 }

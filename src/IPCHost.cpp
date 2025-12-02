@@ -53,12 +53,33 @@ void IPCHost::Shutdown() {
     Platform::CloseEvent(hFromGuestEvent);
 }
 
+std::vector<uint8_t> IPCHost::GetBuffer() {
+    std::lock_guard<std::mutex> lock(poolMutex);
+    if (!bufferPool.empty()) {
+        std::vector<uint8_t> buf = std::move(bufferPool.top());
+        bufferPool.pop();
+        return buf;
+    }
+    // Return a new buffer with some initial capacity
+    std::vector<uint8_t> buf;
+    buf.reserve(1024);
+    return buf;
+}
+
+void IPCHost::ReturnBuffer(std::vector<uint8_t>&& buf) {
+    // Clear the buffer but keep capacity
+    buf.clear();
+    std::lock_guard<std::mutex> lock(poolMutex);
+    bufferPool.push(std::move(buf));
+}
+
 void IPCHost::ReaderLoop() {
-    std::vector<uint8_t> buffer;
-    buffer.reserve(1024);
+    // Initial buffer
+    std::vector<uint8_t> buffer = GetBuffer();
 
     while (running) {
         // Dequeue blocks until data is available, or running becomes false
+        // Dequeue might resize buffer if data > capacity
         uint32_t msgId = fromGuestQueue->Dequeue(buffer, &running);
 
         if (msgId == 0xFFFFFFFF) {
@@ -78,11 +99,12 @@ void IPCHost::ReaderLoop() {
         if (msgId == MSG_ID_NORMAL) {
             // Got message
             auto msg = ipc::GetMessage(buffer.data());
-            // Verify verifier?
-            // flatbuffers::Verifier verifier(buffer.data(), buffer.size());
-            // if (!msg->Verify(verifier)) continue;
 
-            if (!msg) continue;
+            // Basic verification
+            if (!msg) {
+                // Should not happen with trusted peer, but safe to ignore
+                continue;
+            }
 
             uint64_t reqId = msg->req_id();
 
@@ -90,8 +112,12 @@ void IPCHost::ReaderLoop() {
             auto it = pendingRequests.find(reqId);
             if (it != pendingRequests.end()) {
                 RequestContext* ctx = it->second;
+                // Move the filled buffer to the promise
                 ctx->promise.set_value(std::move(buffer));
                 pendingRequests.erase(it);
+
+                // Get a fresh buffer (reused or new) for the next iteration
+                buffer = GetBuffer();
             }
         }
     }
