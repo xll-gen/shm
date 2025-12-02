@@ -13,29 +13,43 @@ const (
 	MsgIdShutdown      = 3
 )
 
-// Context wraps a request buffer and provides methods to send a response.
+// ResponseBuffer wraps a pooled response buffer and provides methods to append/send.
+type ResponseBuffer struct {
+	guest *IPCGuest
+	buf   *[]byte
+}
+
+// Append appends data to the underlying buffer.
+func (rb *ResponseBuffer) Append(data []byte) {
+	*rb.buf = append(*rb.buf, data...)
+}
+
+// Send sends the accumulated data.
+func (rb *ResponseBuffer) Send() error {
+	err := rb.guest.Send(rb.buf)
+	rb.buf = nil // Mark as consumed
+	return err
+}
+
+// Context wraps a request buffer and a response buffer provider.
 // It is designed to be pooled.
 type Context struct {
 	guest *IPCGuest
-	req   *[]byte // The pooled request buffer
+	req   *[]byte          // The pooled request buffer
+	resp  *ResponseBuffer  // The pooled response buffer wrapper
 }
 
-// Body returns the request data.
-func (c *Context) Body() []byte {
+// Request returns the request data.
+func (c *Context) Request() []byte {
 	if c.req == nil {
 		return nil
 	}
 	return *c.req
 }
 
-// Send sends the response data.
-func (c *Context) Send(data []byte) error {
-	return c.guest.SendBytes(data)
-}
-
-// SendString sends a string as response.
-func (c *Context) SendString(s string) error {
-	return c.guest.SendBytes([]byte(s))
+// Response returns the ResponseBuffer.
+func (c *Context) Response() *ResponseBuffer {
+	return c.resp
 }
 
 // IPCGuest manages the Go-side Guest connection.
@@ -44,6 +58,7 @@ type IPCGuest struct {
 	RespQueue *SPSCQueue // Write to here (Guest->Host)
 
 	contextPool *sync.Pool
+	bufferPool  *sync.Pool // Pool for response buffers
 
 	running int32
 	wg      sync.WaitGroup
@@ -58,11 +73,21 @@ func NewIPCGuest(reqQ *SPSCQueue, respQ *SPSCQueue) *IPCGuest {
 		RespQueue: respQ,
 		running:   1,
 	}
+	c.bufferPool = &sync.Pool{
+		New: func() any {
+			b := make([]byte, 0, 1024)
+			return &b
+		},
+	}
 	c.contextPool = &sync.Pool{
 		New: func() any {
 			return &Context{
 				guest: c,
 				req:   nil,
+				resp: &ResponseBuffer{
+					guest: c,
+					buf:   nil,
+				},
 			}
 		},
 	}
@@ -88,16 +113,13 @@ func (c *IPCGuest) StartReader(handler func(*Context) error) {
 			dataPtr, msgId := c.ReqQueue.Dequeue()
 
 			if msgId == MsgIdHeartbeatReq {
-				// Recycle request buffer immediately as we don't need it
 				c.ReqQueue.RecycleBuffer(dataPtr)
-				// Respond immediately
 				c.SendControl(MsgIdHeartbeatResp)
 				continue
 			}
 
 			if msgId == MsgIdShutdown {
 				c.ReqQueue.RecycleBuffer(dataPtr)
-				// Stop
 				atomic.StoreInt32(&c.running, 0)
 				return
 			}
@@ -107,15 +129,30 @@ func (c *IPCGuest) StartReader(handler func(*Context) error) {
 				ctx := c.contextPool.Get().(*Context)
 				ctx.req = dataPtr
 
+				// Prepare Response Buffer
+				respBufPtr := c.bufferPool.Get().(*[]byte)
+				*respBufPtr = (*respBufPtr)[:0] // Reset
+				ctx.resp.buf = respBufPtr
+
 				// Execute Handler
 				err := handler(ctx)
 				if err != nil {
-					// Handle error? For now, we assume user handled response or didn't care.
+					// Handle error?
 				}
 
-				// Recycle Context and Request Buffer
+				// Lifecycle management:
+				// 1. Recycle Request Buffer
 				c.ReqQueue.RecycleBuffer(ctx.req)
 				ctx.req = nil
+
+				// 2. Recycle Response Buffer if not sent
+				// Send() sets buf to nil. If not nil, user didn't send.
+				if ctx.resp.buf != nil {
+					*respBufPtr = (*respBufPtr)[:0]
+					c.bufferPool.Put(respBufPtr)
+					ctx.resp.buf = nil
+				}
+
 				c.contextPool.Put(ctx)
 			}
 		}
@@ -128,7 +165,27 @@ func (c *IPCGuest) SendControl(msgId uint32) {
 	c.mu.Unlock()
 }
 
-// SendBytes sends a raw byte slice.
+// Send sends a pooled message buffer and recycles it.
+func (c *IPCGuest) Send(msg *[]byte) error {
+	if atomic.LoadInt32(&c.running) == 0 {
+		return errors.New("server stopped")
+	}
+
+	if atomic.LoadUint32(&c.RespQueue.Header.ConsumerActive) == 0 {
+		SignalEvent(c.RespQueue.Event)
+	}
+
+	c.mu.Lock()
+	c.RespQueue.Enqueue(*msg, MsgIdNormal)
+	c.mu.Unlock()
+
+	// Recycle buffer
+	*msg = (*msg)[:0]
+	c.bufferPool.Put(msg)
+	return nil
+}
+
+// SendBytes sends a raw byte slice (copies it).
 func (c *IPCGuest) SendBytes(data []byte) error {
 	if atomic.LoadInt32(&c.running) == 0 {
 		return errors.New("server stopped")

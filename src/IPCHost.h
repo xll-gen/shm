@@ -1,68 +1,92 @@
 #pragma once
+
 #include <string>
 #include <vector>
-#include <future>
-#include <map>
+#include <memory>
+#include <thread>
+#include <atomic>
 #include <mutex>
 #include <unordered_map>
+#include <future>
+#include <stack>
+
 #include "SPSCQueue.h"
 #include "Platform.h"
 
 namespace shm {
 
-// Message ID Constants
-const uint32_t MSG_ID_NORMAL = 0;
-const uint32_t MSG_ID_HEARTBEAT_REQ = 1;
-const uint32_t MSG_ID_HEARTBEAT_RESP = 2;
-const uint32_t MSG_ID_SHUTDOWN = 3;
+// Standard IPC Messages
+// msgId=0: Normal (handled by user callback/promise)
+// msgId=1: Heartbeat Req
+// msgId=2: Heartbeat Resp
+// msgId=3: Shutdown
+
+static const uint32_t MSG_ID_NORMAL = 0;
+static const uint32_t MSG_ID_HEARTBEAT_REQ = 1;
+static const uint32_t MSG_ID_HEARTBEAT_RESP = 2;
+static const uint32_t MSG_ID_SHUTDOWN = 3;
+
+struct RequestContext {
+    std::promise<std::vector<uint8_t>> promise;
+};
 
 class IPCHost {
-    struct RequestContext {
-        std::promise<std::vector<uint8_t>> promise;
-    };
-
-    void* shmBase;
-    std::string shmName;
-    uint64_t queueSize;
-    ShmHandle hMapFile;
-
-    std::unique_ptr<SPSCQueue> toGuestQueue;
-    std::unique_ptr<SPSCQueue> fromGuestQueue;
-    EventHandle hToGuestEvent;
-    EventHandle hFromGuestEvent;
-
-    std::thread readerThread;
-    std::atomic<bool> running;
-
-    std::mutex pendingMutex;
-    std::unordered_map<uint64_t, RequestContext*> pendingRequests;
-
-    // Mutex for direct writing to SPSCQueue (since multiple threads might call Call)
-    std::mutex sendMutex;
-
-    // For Heartbeat
-    std::mutex heartbeatMutex;
-    std::unique_ptr<std::promise<void>> heartbeatPromise;
-
-    std::atomic<uint32_t> reqIdCounter{0};
-
 public:
-    IPCHost() : shmBase(nullptr), hMapFile(0), running(false) {}
+    IPCHost() : running(false), shmBase(nullptr) {}
     ~IPCHost() { Shutdown(); }
-
-    uint32_t GenerateReqId() { return ++reqIdCounter; }
 
     bool Init(const std::string& shmName, uint64_t queueSize);
     void Shutdown();
 
-    // For manual FlatBuffer construction
+    // Call sends a request and waits for a response.
+    // The response data is placed in outResponse.
     bool Call(const uint8_t* reqData, size_t reqSize, std::vector<uint8_t>& outResponse);
 
-    // Control Messages
+    // Helper to recycle buffers to reduce allocations
+    std::vector<uint8_t> GetBuffer();
+    void ReturnBuffer(std::vector<uint8_t>&& buf);
+
+    // Sends a heartbeat request and waits for a response.
+    // Returns true if pong received.
     bool SendHeartbeat();
+
+    // Sends a shutdown signal (fire and forget)
     void SendShutdown();
 
+    // Generates a unique Request ID (simple counter)
+    uint64_t GenerateReqId() {
+        return ++reqIdCounter;
+    }
+
 private:
+    std::string shmName;
+    uint64_t queueSize;
+    void* shmBase;
+    ShmHandle hMapFile;
+
+    std::unique_ptr<SPSCQueue> toGuestQueue;
+    std::unique_ptr<SPSCQueue> fromGuestQueue;
+
+    EventHandle hToGuestEvent;
+    EventHandle hFromGuestEvent;
+
+    std::atomic<bool> running;
+    std::thread readerThread;
+
+    std::mutex pendingMutex;
+    std::unordered_map<uint64_t, RequestContext*> pendingRequests;
+
+    std::mutex sendMutex;
+    std::atomic<uint64_t> reqIdCounter{0};
+
+    // Heartbeat handling
+    std::mutex heartbeatMutex;
+    std::unique_ptr<std::promise<void>> heartbeatPromise;
+
+    // Buffer Pool
+    std::mutex poolMutex;
+    std::stack<std::vector<uint8_t>> bufferPool;
+
     void ReaderLoop();
 };
 
