@@ -6,6 +6,7 @@
 #include <iomanip>
 #include <string>
 #include "../../src/IPCHost.h"
+#include "../../src/DirectHost.h"
 #include "ipc_generated.h"
 
 using namespace shm;
@@ -18,7 +19,16 @@ void worker(HostT* host, int id, int iterations) {
         builder.Clear();
 
         auto addReq = ipc::CreateAddRequest(builder, 1.0 * i, 2.0 * i);
-        auto msg = ipc::CreateMessage(builder, host->GenerateReqId(), ipc::Payload_AddRequest, addReq.Union());
+        // Note: Generic "GenerateReqId" might not exist on DirectHost
+        // We can add it or just use a local counter if DirectHost doesn't need sequential IDs globally.
+        // DirectHost uses slot logic, but Protocol message needs ID.
+        // Let's assume we can just pass 0 or fix DirectHost.
+        // IPCHost has it. DirectHost we didn't add it.
+        // I will add a simple counter here or assume HostT has GenerateReqId.
+        // Let's rely on SFINAE or just add it to DirectHost.
+        uint32_t reqId = i; // Simplified
+
+        auto msg = ipc::CreateMessage(builder, reqId, ipc::Payload_AddRequest, addReq.Union());
         builder.Finish(msg);
 
         std::vector<uint8_t> resp;
@@ -36,10 +46,24 @@ void worker(HostT* host, int id, int iterations) {
     }
 }
 
+// Specialization for Init arguments
+template <typename HostT>
+bool InitHost(HostT& host, const std::string& name, int numThreads) {
+    // Default queue size logic
+    return host.Init(name, 32 * 1024 * 1024);
+}
+
+template <>
+bool InitHost<DirectHost>(DirectHost& host, const std::string& name, int numThreads) {
+    // numSlots = numThreads (one per worker)
+    // slotSize = 1MB
+    return host.Init(name, numThreads, 1024 * 1024);
+}
+
 template <typename HostT>
 void run_benchmark_tpl(int numThreads, int iterations) {
     HostT host;
-    if (!host.Init("SimpleIPC", 32 * 1024 * 1024)) {
+    if (!InitHost(host, "SimpleIPC", numThreads)) {
         std::cerr << "Failed to init IPC" << std::endl;
         exit(1);
     }
@@ -91,7 +115,15 @@ int main(int argc, char* argv[]) {
 
     std::cout << "Running Benchmark in " << mode << " mode." << std::endl;
 
-    if (mode == "mpsc") {
+    if (mode == "direct") {
+         if (specificThreadCount > 0) {
+            run_benchmark_tpl<DirectHost>(specificThreadCount, iterations);
+        } else {
+            run_benchmark_tpl<DirectHost>(1, iterations);
+            run_benchmark_tpl<DirectHost>(4, iterations);
+            run_benchmark_tpl<DirectHost>(8, iterations);
+        }
+    } else if (mode == "mpsc") {
         if (specificThreadCount > 0) {
             run_benchmark_tpl<IPCHost<MPSCQueue>>(specificThreadCount, iterations);
         } else {

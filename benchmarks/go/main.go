@@ -22,7 +22,7 @@ const (
 
 func main() {
 	workers := flag.Int("w", 1, "Number of worker threads")
-	mode := flag.String("mode", "spsc", "Queue mode: spsc or mpsc")
+	mode := flag.String("mode", "spsc", "Queue mode: spsc, mpsc, or direct")
 	cpuprofile := flag.String("cpuprofile", "", "write cpu profile to file")
 	memprofile := flag.String("memprofile", "", "write memory profile to file")
 	flag.Parse()
@@ -38,6 +38,9 @@ func main() {
 
 	fmt.Printf("[Go] Starting Guest with %d workers in %s mode...\n", *workers, *mode)
 
+    if *mode == "direct" {
+        runDirect(*workers)
+    } else {
 	// 1. Open SHM (Retry loop until Host creates it)
 	// We assume Host creates sufficient space.
 	// For MPSC/SPSC, header sizes are same (128 bytes).
@@ -83,8 +86,8 @@ func main() {
 	} else {
 		runSPSC(addr, qTotalSize, hToGuest, hFromGuest, *workers)
 	}
-
-	_ = hMap
+        _ = hMap
+    }
 
 	if *memprofile != "" {
 		f, err := os.Create(*memprofile)
@@ -99,19 +102,82 @@ func main() {
 	}
 }
 
+func runDirect(workers int) {
+    // Retry loop for SHM
+    var guest *shm.DirectGuest
+    var err error
+
+    fmt.Println("[Go] Waiting for Host to create SHM (Direct Mode)...")
+    for {
+        guest, err = shm.NewDirectGuest("SimpleIPC", workers, 1024*1024)
+        if err == nil {
+            break
+        }
+        time.Sleep(100 * time.Millisecond)
+    }
+    fmt.Println("[Go] Connected to Direct Exchange.")
+
+    pool := sync.Pool{
+        New: func() interface{} {
+            return flatbuffers.NewBuilder(1024)
+        },
+    }
+
+    handler := func(reqData []byte) []byte {
+        defer func() {
+            if r := recover(); r != nil {
+                fmt.Printf("[Go] Panic in handler: %v\n", r)
+            }
+        }()
+
+        builder := pool.Get().(*flatbuffers.Builder)
+        builder.Reset()
+        defer pool.Put(builder)
+
+        msg := ipc.GetRootAsMessage(reqData, 0)
+        reqID := msg.ReqId()
+
+        var payloadOffset flatbuffers.UOffsetT
+        var payloadType ipc.Payload
+
+        pt := msg.PayloadType()
+
+        switch pt {
+        case ipc.PayloadAddRequest:
+            req := new(ipc.AddRequest)
+            var t flatbuffers.Table
+            if msg.Payload(&t) {
+                req.Init(t.Bytes, t.Pos)
+                res := req.X() + req.Y()
+
+                ipc.AddResponseStart(builder)
+                ipc.AddResponseAddResult(builder, res)
+                payloadOffset = ipc.AddResponseEnd(builder)
+                payloadType = ipc.PayloadAddResponse
+            }
+        // ... (other cases if needed)
+        }
+
+        ipc.MessageStart(builder)
+        ipc.MessageAddReqId(builder, reqID)
+        ipc.MessageAddPayloadType(builder, payloadType)
+        ipc.MessageAddPayload(builder, payloadOffset)
+        resMsg := ipc.MessageEnd(builder)
+
+        builder.Finish(resMsg)
+        return builder.FinishedBytes()
+    }
+
+    guest.Start(handler)
+
+    // Wait for shutdown
+    guest.Wait()
+    fmt.Println("[Go] Received Shutdown. Exiting...")
+    guest.Close()
+}
+
+
 func runSPSC(addr uintptr, qTotalSize uint64, hToGuest, hFromGuest shm.EventHandle, workers int) {
-	// Queue 1: ToGuest (Guest reads from here)
-	// Queue 2: FromGuest (Guest writes to here)
-	// For SPSC mode in IPCGuest, we need LockedSPSCQueue for writing (FromGuest)
-	// because multiple workers will call Send concurrently.
-	// We can use SPSCQueue for reading (ToGuest) since there's only one reader goroutine.
-
-	// Wait, IPCGuest expects Q to be the same type for Req and Resp?
-	// type IPCGuest[Q IPCQueue] struct { ReqQueue Q; RespQueue Q }
-	// So both must be the same type.
-	// We must use LockedSPSCQueue for both, even if we don't need lock for reading.
-	// LockedSPSCQueue wraps SPSCQueue, so reading is fine (lock is only on Enqueue).
-
 	toGuestQueue := shm.NewLockedSPSCQueue(addr, QUEUE_SIZE, hToGuest)
 	fromGuestQueue := shm.NewLockedSPSCQueue(addr+uintptr(qTotalSize), QUEUE_SIZE, hFromGuest)
 
