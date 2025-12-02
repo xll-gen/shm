@@ -11,15 +11,10 @@
 #include "SPSCQueue.h"
 #include "MPSCQueue.h"
 #include "Platform.h"
+#include "IPCUtils.h"
 #include "../benchmarks/include/ipc_generated.h"
 
 namespace shm {
-
-// Message ID Constants
-const uint32_t MSG_ID_NORMAL = 0;
-const uint32_t MSG_ID_HEARTBEAT_REQ = 1;
-const uint32_t MSG_ID_HEARTBEAT_RESP = 2;
-const uint32_t MSG_ID_SHUTDOWN = 3;
 
 template <typename QueueT>
 class IPCHost {
@@ -45,18 +40,6 @@ class IPCHost {
 
     // Mutex for direct writing to Queue
     // SPSCQueue is NOT thread-safe for multiple producers, so we need a lock.
-    // MPSCQueue IS thread-safe for multiple producers, but having a lock here doesn't hurt correctness,
-    // although it hurts performance.
-    // Ideally, we should specialise or remove this lock for MPSC.
-    // However, MPSC Enqueue spins if full.
-    // For "Extreme Performance", we should avoid std::mutex for MPSC.
-    // We can use SFINAE or 'if constexpr' in C++17.
-    // Assuming C++11/14, we might need a specialization.
-    // But let's check if QueueT has internal synchronization.
-    // MPSCQueue::Enqueue is lock-free multi-producer.
-    // SPSCQueue::Enqueue is single-producer.
-    // So if QueueT == SPSCQueue, we NEED this mutex.
-    // If QueueT == MPSCQueue, we DO NOT NEED this mutex.
     std::mutex sendMutex;
 
     // For Heartbeat
@@ -126,16 +109,7 @@ public:
             pendingRequests[reqId] = &ctx;
         }
 
-        // Send
-        {
-            // Conditional locking for SPSC
-            // Since we can't easily do 'if constexpr' without C++17, and we might be on C++11/14.
-            // We'll use a helper or just lock always for now.
-            // Wait, for MPSC we want performance.
-            // Let's rely on overload resolution.
-            // See EnqueueHelper below.
-            EnqueueHelper(reqData, (uint32_t)reqSize, MSG_ID_NORMAL);
-        }
+        EnqueueHelper(reqData, (uint32_t)reqSize, MSG_ID_NORMAL);
 
         future.wait();
         outResponse = future.get();
