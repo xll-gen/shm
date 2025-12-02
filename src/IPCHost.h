@@ -8,6 +8,7 @@
 #include <memory>
 #include <thread>
 #include <cstring>
+#include <functional> // hash
 #include "SPSCQueue.h"
 #include "MPSCQueue.h"
 #include "Platform.h"
@@ -27,39 +28,31 @@ class IPCHost {
         std::promise<std::vector<uint8_t>> promise;
     };
 
+    struct Lane {
+        std::unique_ptr<QueueT> toGuestQueue;
+        std::unique_ptr<QueueT> fromGuestQueue;
+        EventHandle hToGuestEvent;
+        EventHandle hFromGuestEvent;
+        std::thread readerThread;
+
+        // Per-lane pending requests to avoid global lock
+        std::mutex pendingMutex;
+        std::unordered_map<uint64_t, RequestContext*> pendingRequests;
+
+        // Mutex for direct writing to Queue
+        // Only needed if multiple threads map to the same lane and QueueT is SPSC.
+        std::mutex sendMutex;
+    };
+
     void* shmBase;
     std::string shmName;
     uint64_t queueSize;
     ShmHandle hMapFile;
 
-    std::unique_ptr<QueueT> toGuestQueue;
-    std::unique_ptr<QueueT> fromGuestQueue;
-    EventHandle hToGuestEvent;
-    EventHandle hFromGuestEvent;
-
-    std::thread readerThread;
+    std::vector<std::unique_ptr<Lane>> lanes;
     std::atomic<bool> running;
 
-    std::mutex pendingMutex;
-    std::unordered_map<uint64_t, RequestContext*> pendingRequests;
-
-    // Mutex for direct writing to Queue
-    // SPSCQueue is NOT thread-safe for multiple producers, so we need a lock.
-    // MPSCQueue IS thread-safe for multiple producers, but having a lock here doesn't hurt correctness,
-    // although it hurts performance.
-    // Ideally, we should specialise or remove this lock for MPSC.
-    // However, MPSC Enqueue spins if full.
-    // For "Extreme Performance", we should avoid std::mutex for MPSC.
-    // We can use SFINAE or 'if constexpr' in C++17.
-    // Assuming C++11/14, we might need a specialization.
-    // But let's check if QueueT has internal synchronization.
-    // MPSCQueue::Enqueue is lock-free multi-producer.
-    // SPSCQueue::Enqueue is single-producer.
-    // So if QueueT == SPSCQueue, we NEED this mutex.
-    // If QueueT == MPSCQueue, we DO NOT NEED this mutex.
-    std::mutex sendMutex;
-
-    // For Heartbeat
+    // For Heartbeat - we only use Lane 0
     std::mutex heartbeatMutex;
     std::unique_ptr<std::promise<void>> heartbeatPromise;
 
@@ -71,45 +64,73 @@ public:
 
     uint32_t GenerateReqId() { return ++reqIdCounter; }
 
-    bool Init(const std::string& shmName, uint64_t queueSize) {
+    bool Init(const std::string& shmName, uint64_t queueSize, uint32_t numQueues = 1) {
+        if (numQueues == 0) numQueues = 1;
         this->shmName = shmName;
         this->queueSize = queueSize;
 
-        size_t qTotalSize = QueueT::GetRequiredSize(queueSize);
-        size_t totalShmSize = qTotalSize * 2;
+        size_t qRequiredSize = QueueT::GetRequiredSize(queueSize);
+        // Each lane has 2 queues (req + resp)
+        size_t totalShmSize = numQueues * qRequiredSize * 2;
 
         bool exists = false;
         shmBase = Platform::CreateNamedShm(shmName.c_str(), totalShmSize, hMapFile, exists);
         if (!shmBase) return false;
 
-        memset(shmBase, 0, totalShmSize);
+        if (!exists) {
+            memset(shmBase, 0, totalShmSize);
+        }
 
-        uint8_t* reqBase = (uint8_t*)shmBase;
-        QueueT::Init(reqBase, queueSize);
-
-        uint8_t* respBase = reqBase + qTotalSize;
-        QueueT::Init(respBase, queueSize);
-
-        hToGuestEvent = Platform::CreateNamedEvent((shmName + "_event_req").c_str());
-        hFromGuestEvent = Platform::CreateNamedEvent((shmName + "_event_resp").c_str());
-
-        toGuestQueue = std::unique_ptr<QueueT>(new QueueT(reqBase, queueSize, hToGuestEvent));
-        fromGuestQueue = std::unique_ptr<QueueT>(new QueueT(respBase, queueSize, hFromGuestEvent));
-
+        uint8_t* ptr = (uint8_t*)shmBase;
         running = true;
-        readerThread = std::thread(&IPCHost::ReaderLoop, this);
+
+        for (uint32_t i = 0; i < numQueues; ++i) {
+            auto lane = std::unique_ptr<Lane>(new Lane());
+
+            // Initialize Request Queue
+            uint8_t* reqBase = ptr;
+            if (!exists) QueueT::Init(reqBase, queueSize);
+            ptr += qRequiredSize;
+
+            // Initialize Response Queue
+            uint8_t* respBase = ptr;
+            if (!exists) QueueT::Init(respBase, queueSize);
+            ptr += qRequiredSize;
+
+            std::string suffix = "_" + std::to_string(i);
+            lane->hToGuestEvent = Platform::CreateNamedEvent((shmName + "_req" + suffix).c_str());
+            lane->hFromGuestEvent = Platform::CreateNamedEvent((shmName + "_resp" + suffix).c_str());
+
+            lane->toGuestQueue = std::unique_ptr<QueueT>(new QueueT(reqBase, queueSize, lane->hToGuestEvent));
+            lane->fromGuestQueue = std::unique_ptr<QueueT>(new QueueT(respBase, queueSize, lane->hFromGuestEvent));
+
+            lane->readerThread = std::thread(&IPCHost::ReaderLoop, this, i);
+
+            lanes.push_back(std::move(lane));
+        }
 
         return true;
     }
 
     void Shutdown() {
-        running = false;
+        bool expected = true;
+        if (!running.compare_exchange_strong(expected, false)) return;
 
-        if (readerThread.joinable()) readerThread.join();
+        // Wake up readers if stuck?
+        // We rely on host.SendShutdown() called before this to signal guest.
+        // Guest shutdown should trigger response or closure?
+        // Actually, our Dequeue returns if 'running' flag is false, but we need to signal events maybe?
+        // But Dequeue checks running in loop.
+
+        for (auto& lane : lanes) {
+            if (lane->readerThread.joinable()) lane->readerThread.join();
+            Platform::CloseEvent(lane->hToGuestEvent);
+            Platform::CloseEvent(lane->hFromGuestEvent);
+        }
+        lanes.clear();
 
         if (shmBase) Platform::CloseShm(hMapFile, shmBase);
-        Platform::CloseEvent(hToGuestEvent);
-        Platform::CloseEvent(hFromGuestEvent);
+        shmBase = nullptr;
     }
 
     // Call sends a request and waits for response.
@@ -118,24 +139,20 @@ public:
         auto msg = ipc::GetMessage(reqData);
         reqId = msg->req_id();
 
+        // Pick Lane based on Thread ID to reduce contention
+        size_t laneIdx = std::hash<std::thread::id>{}(std::this_thread::get_id()) % lanes.size();
+        Lane& lane = *lanes[laneIdx];
+
         RequestContext ctx;
         auto future = ctx.promise.get_future();
 
         {
-            std::lock_guard<std::mutex> lock(pendingMutex);
-            pendingRequests[reqId] = &ctx;
+            std::lock_guard<std::mutex> lock(lane.pendingMutex);
+            lane.pendingRequests[reqId] = &ctx;
         }
 
         // Send
-        {
-            // Conditional locking for SPSC
-            // Since we can't easily do 'if constexpr' without C++17, and we might be on C++11/14.
-            // We'll use a helper or just lock always for now.
-            // Wait, for MPSC we want performance.
-            // Let's rely on overload resolution.
-            // See EnqueueHelper below.
-            EnqueueHelper(reqData, (uint32_t)reqSize, MSG_ID_NORMAL);
-        }
+        EnqueueHelper(lane, reqData, (uint32_t)reqSize, MSG_ID_NORMAL);
 
         future.wait();
         outResponse = future.get();
@@ -144,6 +161,10 @@ public:
     }
 
     bool SendHeartbeat() {
+        // Use Lane 0
+        if (lanes.empty()) return false;
+        Lane& lane = *lanes[0];
+
         std::future<void> future;
         {
             std::lock_guard<std::mutex> lock(heartbeatMutex);
@@ -151,7 +172,7 @@ public:
             future = heartbeatPromise->get_future();
         }
 
-        EnqueueHelper(nullptr, 0, MSG_ID_HEARTBEAT_REQ);
+        EnqueueHelper(lane, nullptr, 0, MSG_ID_HEARTBEAT_REQ);
 
         if (future.wait_for(std::chrono::seconds(1)) == std::future_status::timeout) {
             return false;
@@ -160,32 +181,35 @@ public:
     }
 
     void SendShutdown() {
-        EnqueueHelper(nullptr, 0, MSG_ID_SHUTDOWN);
+        // Broadcast to all lanes to ensure all guest workers exit
+        for (auto& lane : lanes) {
+             EnqueueHelper(*lane, nullptr, 0, MSG_ID_SHUTDOWN);
+        }
     }
 
 private:
     // Helper to lock only for SPSCQueue
-    // Overload for SPSCQueue
-    void EnqueueHelper(const uint8_t* data, uint32_t size, uint32_t msgId) {
-        EnqueueImpl(data, size, msgId, std::is_same<QueueT, SPSCQueue>());
+    void EnqueueHelper(Lane& lane, const uint8_t* data, uint32_t size, uint32_t msgId) {
+        EnqueueImpl(lane, data, size, msgId, std::is_same<QueueT, SPSCQueue>());
     }
 
-    void EnqueueImpl(const uint8_t* data, uint32_t size, uint32_t msgId, std::true_type /* is_spsc */) {
-        std::lock_guard<std::mutex> lock(sendMutex);
-        toGuestQueue->Enqueue(data, size, msgId);
+    void EnqueueImpl(Lane& lane, const uint8_t* data, uint32_t size, uint32_t msgId, std::true_type /* is_spsc */) {
+        std::lock_guard<std::mutex> lock(lane.sendMutex);
+        lane.toGuestQueue->Enqueue(data, size, msgId);
     }
 
-    void EnqueueImpl(const uint8_t* data, uint32_t size, uint32_t msgId, std::false_type /* is_mpsc */) {
+    void EnqueueImpl(Lane& lane, const uint8_t* data, uint32_t size, uint32_t msgId, std::false_type /* is_mpsc */) {
         // No lock needed for MPSC
-        toGuestQueue->Enqueue(data, size, msgId);
+        lane.toGuestQueue->Enqueue(data, size, msgId);
     }
 
-    void ReaderLoop() {
+    void ReaderLoop(int laneIdx) {
+        Lane& lane = *lanes[laneIdx];
         std::vector<uint8_t> buffer;
         buffer.reserve(1024);
 
         while (running) {
-            uint32_t msgId = fromGuestQueue->Dequeue(buffer, &running);
+            uint32_t msgId = lane.fromGuestQueue->Dequeue(buffer, &running);
 
             if (msgId == 0xFFFFFFFF) break;
 
@@ -204,12 +228,12 @@ private:
 
                 uint64_t reqId = msg->req_id();
 
-                std::lock_guard<std::mutex> lock(pendingMutex);
-                auto it = pendingRequests.find(reqId);
-                if (it != pendingRequests.end()) {
+                std::lock_guard<std::mutex> lock(lane.pendingMutex);
+                auto it = lane.pendingRequests.find(reqId);
+                if (it != lane.pendingRequests.end()) {
                     RequestContext* ctx = it->second;
                     ctx->promise.set_value(std::move(buffer));
-                    pendingRequests.erase(it);
+                    lane.pendingRequests.erase(it);
                 }
             }
         }

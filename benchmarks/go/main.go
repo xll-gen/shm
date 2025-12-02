@@ -21,7 +21,7 @@ const (
 )
 
 func main() {
-	workers := flag.Int("w", 1, "Number of worker threads")
+	workers := flag.Int("w", 1, "Number of worker threads (lanes)")
 	mode := flag.String("mode", "spsc", "Queue mode: spsc or mpsc")
 	cpuprofile := flag.String("cpuprofile", "", "write cpu profile to file")
 	memprofile := flag.String("memprofile", "", "write memory profile to file")
@@ -36,13 +36,12 @@ func main() {
 		defer pprof.StopCPUProfile()
 	}
 
-	fmt.Printf("[Go] Starting Guest with %d workers in %s mode...\n", *workers, *mode)
+	fmt.Printf("[Go] Starting Guest with %d lanes in %s mode...\n", *workers, *mode)
 
-	// 1. Open SHM (Retry loop until Host creates it)
-	// We assume Host creates sufficient space.
-	// For MPSC/SPSC, header sizes are same (128 bytes).
-	qTotalSize := uint64(shm.QueueHeaderSize + QUEUE_SIZE)
-	totalSize := uint64(qTotalSize * 2)
+	// 1. Calculate SHM size
+	// Each lane: ReqQ + RespQ
+	qRequiredSize := uint64(shm.QueueHeaderSize + QUEUE_SIZE)
+	totalSize := uint64(*workers) * qRequiredSize * 2
 
 	var hMap shm.ShmHandle
 	var addr uintptr
@@ -58,30 +57,11 @@ func main() {
 	}
 	fmt.Println("[Go] Connected to SHM.")
 
-	// 2. Open Events (Retry loop)
-	var hToGuest, hFromGuest shm.EventHandle
-
-	for {
-		hToGuest, err = shm.OpenEvent("SimpleIPC_event_req") // REQ = ToGuest
-		if err == nil {
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-
-	for {
-		hFromGuest, err = shm.OpenEvent("SimpleIPC_event_resp") // RESP = FromGuest
-		if err == nil {
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	fmt.Println("[Go] Connected to Events.")
-
+	// 2. Initialize Queues and run Guest
 	if *mode == "mpsc" {
-		runMPSC(addr, qTotalSize, hToGuest, hFromGuest, *workers)
+		runMPSC(addr, *workers)
 	} else {
-		runSPSC(addr, qTotalSize, hToGuest, hFromGuest, *workers)
+		runSPSC(addr, *workers)
 	}
 
 	_ = hMap
@@ -99,75 +79,95 @@ func main() {
 	}
 }
 
-func runSPSC(addr uintptr, qTotalSize uint64, hToGuest, hFromGuest shm.EventHandle, workers int) {
-	// Queue 1: ToGuest (Guest reads from here)
-	// Queue 2: FromGuest (Guest writes to here)
-	// For SPSC mode in IPCGuest, we need LockedSPSCQueue for writing (FromGuest)
-	// because multiple workers will call Send concurrently.
-	// We can use SPSCQueue for reading (ToGuest) since there's only one reader goroutine.
+func runSPSC(addr uintptr, lanes int) {
+	// Wait for events and init queues
+	// Retry loop for events
+	var reqQs, respQs []*shm.LockedSPSCQueue
 
-	// Wait, IPCGuest expects Q to be the same type for Req and Resp?
-	// type IPCGuest[Q IPCQueue] struct { ReqQueue Q; RespQueue Q }
-	// So both must be the same type.
-	// We must use LockedSPSCQueue for both, even if we don't need lock for reading.
-	// LockedSPSCQueue wraps SPSCQueue, so reading is fine (lock is only on Enqueue).
+	for {
+		// Try to open all lanes
+		rQs, wQs, err := shm.OpenLanes("SimpleIPC", lanes, QUEUE_SIZE, addr, 0,
+			func(base uintptr, size uint64, h shm.EventHandle) *shm.LockedSPSCQueue {
+				return shm.NewLockedSPSCQueue(base, size, h)
+			},
+		)
+		if err == nil {
+			reqQs = rQs
+			respQs = wQs
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 
-	toGuestQueue := shm.NewLockedSPSCQueue(addr, QUEUE_SIZE, hToGuest)
-	fromGuestQueue := shm.NewLockedSPSCQueue(addr+uintptr(qTotalSize), QUEUE_SIZE, hFromGuest)
+	fmt.Println("[Go] Connected to Events and Queues.")
 
+	// Wait for Host to init memory (check capacity of first queue)
+	// Actually OpenLanes just wraps pointers. Capacity check needed.
 	fmt.Println("[Go] Waiting for Queue initialization...")
-	for atomic.LoadUint64(&toGuestQueue.Header.Capacity) == 0 {
+	for atomic.LoadUint64(&reqQs[0].Header.Capacity) == 0 {
 		runtime.Gosched()
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	client := shm.NewIPCGuest[*shm.LockedSPSCQueue](toGuestQueue, fromGuestQueue)
-	runGuest(client, workers)
+	client := shm.NewIPCGuest[*shm.LockedSPSCQueue](reqQs, respQs)
+	runGuest(client)
 }
 
-func runMPSC(addr uintptr, qTotalSize uint64, hToGuest, hFromGuest shm.EventHandle, workers int) {
-	toGuestQueue := shm.NewMPSCQueue(addr, QUEUE_SIZE, hToGuest)
-	fromGuestQueue := shm.NewMPSCQueue(addr+uintptr(qTotalSize), QUEUE_SIZE, hFromGuest)
+func runMPSC(addr uintptr, lanes int) {
+	var reqQs, respQs []*shm.MPSCQueue
+
+	for {
+		rQs, wQs, err := shm.OpenLanes("SimpleIPC", lanes, QUEUE_SIZE, addr, 0,
+			func(base uintptr, size uint64, h shm.EventHandle) *shm.MPSCQueue {
+				return shm.NewMPSCQueue(base, size, h)
+			},
+		)
+		if err == nil {
+			reqQs = rQs
+			respQs = wQs
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	fmt.Println("[Go] Connected to Events and Queues.")
 
 	fmt.Println("[Go] Waiting for Queue initialization...")
-	for atomic.LoadUint64(&toGuestQueue.Header.Capacity) == 0 {
+	for atomic.LoadUint64(&reqQs[0].Header.Capacity) == 0 {
 		runtime.Gosched()
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	client := shm.NewIPCGuest[*shm.MPSCQueue](toGuestQueue, fromGuestQueue)
-	runGuest(client, workers)
+	client := shm.NewIPCGuest[*shm.MPSCQueue](reqQs, respQs)
+	runGuest(client)
 }
 
 // runGuest is generic
-func runGuest[Q shm.IPCQueue](client *shm.IPCGuest[Q], workers int) {
+func runGuest[Q shm.IPCQueue](client *shm.IPCGuest[Q]) {
 	fmt.Println("[Go] Guest Ready. Waiting for requests from Host...")
 
-	workChan := make(chan []byte, 1024)
-	var wg sync.WaitGroup
+	// Create a pool of builders to avoid allocation?
+	// Or just one builder per lane?
+	// StartWorkers spawns one goroutine per lane.
+	// We can use a sync.Pool for builders.
 
-	for i := 0; i < workers; i++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			builder := flatbuffers.NewBuilder(1024)
-			for data := range workChan {
-				handleRequest(data, client, builder)
-			}
-		}(i)
+	builderPool := sync.Pool{
+		New: func() any {
+			return flatbuffers.NewBuilder(1024)
+		},
 	}
 
-	client.StartReader(func(data []byte) {
-		workChan <- data
+	client.StartWorkers(func(data []byte, laneID int) {
+		builder := builderPool.Get().(*flatbuffers.Builder)
+		handleRequest(data, client, builder, laneID)
+		builderPool.Put(builder)
 	})
 
 	client.Wait()
 	fmt.Println("[Go] Received Shutdown. Exiting...")
-	close(workChan)
-	wg.Wait()
 }
 
-func handleRequest[Q shm.IPCQueue](data []byte, client *shm.IPCGuest[Q], builder *flatbuffers.Builder) {
+func handleRequest[Q shm.IPCQueue](data []byte, client *shm.IPCGuest[Q], builder *flatbuffers.Builder, laneID int) {
 	defer func() {
 		if r := recover(); r != nil {
 			// Recover
@@ -214,5 +214,5 @@ func handleRequest[Q shm.IPCQueue](data []byte, client *shm.IPCGuest[Q], builder
 	builder.Finish(resMsg)
 	resBytes := builder.FinishedBytes()
 
-	client.SendBytes(resBytes)
+	client.SendToLane(resBytes, laneID)
 }

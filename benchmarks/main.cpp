@@ -39,12 +39,14 @@ void worker(HostT* host, int id, int iterations) {
 template <typename HostT>
 void run_benchmark_tpl(int numThreads, int iterations) {
     HostT host;
-    if (!host.Init("SimpleIPC", 32 * 1024 * 1024)) {
+    // For MPMC, we ideally want 1 lane per thread to minimize contention.
+    // We pass numThreads as numQueues.
+    if (!host.Init("SimpleIPC", 32 * 1024 * 1024, numThreads)) {
         std::cerr << "Failed to init IPC" << std::endl;
         exit(1);
     }
 
-    std::cout << "Starting Benchmark with " << numThreads << " threads..." << std::endl;
+    std::cout << "Starting Benchmark with " << numThreads << " threads (Lanes: " << numThreads << ")..." << std::endl;
 
     auto start = std::chrono::high_resolution_clock::now();
 
