@@ -55,26 +55,34 @@ func (q *SPSCQueue) Recycle(msgs []*[]byte) {
 	}
 }
 
+// RecycleBuffer returns a single byte buffer to the pool.
+func (q *SPSCQueue) RecycleBuffer(m *[]byte) {
+	if m != nil {
+		*m = (*m)[:0]
+		q.Pool.Put(m)
+	}
+}
+
 // Enqueue blocks if full.
 func (q *SPSCQueue) Enqueue(data []byte, msgId uint32) {
 	// Align total size to 8 bytes
 	alignedSize := (len(data) + 7) & ^7
 	totalSize := uint64(alignedSize + BlockHeaderSize)
-	cap := atomic.LoadUint64(&q.Header.Capacity)
+	capacity := atomic.LoadUint64(&q.Header.Capacity)
 
 	for {
 		wPos := atomic.LoadUint64(&q.Header.WritePos)
 		rPos := atomic.LoadUint64(&q.Header.ReadPos)
 
 		used := wPos - rPos
-		if used+totalSize > cap {
+		if used+totalSize > capacity {
 			// Full - Spin/Yield
 			runtime.Gosched()
 			continue
 		}
 
-		offset := wPos % cap
-		spaceToEnd := cap - offset
+		offset := wPos % capacity
+		spaceToEnd := capacity - offset
 
 		// Check wrapping
 		if spaceToEnd < totalSize {
@@ -128,7 +136,7 @@ func (q *SPSCQueue) EnqueueBatch(msgs [][]byte) {
 		return
 	}
 
-	cap := atomic.LoadUint64(&q.Header.Capacity)
+	capacity := atomic.LoadUint64(&q.Header.Capacity)
 	currentIdx := 0
 
 	for currentIdx < len(msgs) {
@@ -144,7 +152,7 @@ func (q *SPSCQueue) EnqueueBatch(msgs [][]byte) {
 			totalSize := uint64(alignedSize + BlockHeaderSize)
 
 			// Check capacity
-			if (tempWPos-rPos)+totalSize > cap {
+			if (tempWPos-rPos)+totalSize > capacity {
 				if !writtenAny {
 					// Full
 					runtime.Gosched()
@@ -157,8 +165,8 @@ func (q *SPSCQueue) EnqueueBatch(msgs [][]byte) {
 				}
 			}
 
-			offset := tempWPos % cap
-			spaceToEnd := cap - offset
+			offset := tempWPos % capacity
+			spaceToEnd := capacity - offset
 
 			// Check wrapping
 			if spaceToEnd < totalSize {
@@ -206,8 +214,8 @@ func (q *SPSCQueue) EnqueueBatch(msgs [][]byte) {
 }
 
 // Dequeue blocks if empty
-// Returns (data, msgId)
-func (q *SPSCQueue) Dequeue() ([]byte, uint32) {
+// Returns (data, msgId). data is a pooled buffer pointer.
+func (q *SPSCQueue) Dequeue() (*[]byte, uint32) {
 	// Active = 1
 	atomic.StoreUint32(&q.Header.ConsumerActive, 1)
 	spinCount := 0
@@ -237,9 +245,9 @@ func (q *SPSCQueue) Dequeue() ([]byte, uint32) {
 			continue
 		}
 
-		cap := atomic.LoadUint64(&q.Header.Capacity)
-		offset := rPos % cap
-		spaceToEnd := cap - offset
+		capacity := atomic.LoadUint64(&q.Header.Capacity)
+		offset := rPos % capacity
+		spaceToEnd := capacity - offset
 
 		if spaceToEnd < BlockHeaderSize {
 			atomic.StoreUint64(&q.Header.ReadPos, rPos+spaceToEnd)
@@ -263,13 +271,23 @@ func (q *SPSCQueue) Dequeue() ([]byte, uint32) {
 		alignedSize := (size + 7) & ^uint32(7)
 		nextRPosDiff := uint64(alignedSize + BlockHeaderSize)
 
-		data := make([]byte, size)
+		// Get buffer from pool
+		bufPtr := q.Pool.Get().(*[]byte)
+		// Ensure capacity
+		if uint32(cap(*bufPtr)) < size {
+			// Create a new larger slice if needed
+			newBuf := make([]byte, size)
+			*bufPtr = newBuf
+		} else {
+			*bufPtr = (*bufPtr)[:size]
+		}
+
 		if size > 0 {
-			copy(data, q.Buffer[offset+BlockHeaderSize:offset+BlockHeaderSize+uint64(size)])
+			copy(*bufPtr, q.Buffer[offset+BlockHeaderSize:offset+BlockHeaderSize+uint64(size)])
 		}
 
 		atomic.StoreUint64(&q.Header.ReadPos, rPos+nextRPosDiff)
-		return data, msgId
+		return bufPtr, msgId
 	}
 }
 
@@ -346,8 +364,10 @@ func (q *SPSCQueue) DequeueBatch(maxCount int) []*[]byte {
 			// Get buffer from pool
 			bufPtr := q.Pool.Get().(*[]byte)
 			// Ensure capacity
-			if c := cap(*bufPtr); uint32(c) < size {
-				*bufPtr = make([]byte, size)
+			if uint32(cap(*bufPtr)) < size {
+				// Create a new larger slice if needed
+				newBuf := make([]byte, size)
+				*bufPtr = newBuf
 			} else {
 				*bufPtr = (*bufPtr)[:size]
 			}

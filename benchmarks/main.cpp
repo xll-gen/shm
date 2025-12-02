@@ -38,6 +38,9 @@ void worker(IPCHost* host, int id, int iterations) {
         } else {
             // std::cerr << "Unexpected payload type" << std::endl;
         }
+
+        // Recycle buffer
+        host->ReturnBuffer(std::move(resp));
     }
 }
 
