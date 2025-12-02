@@ -130,9 +130,7 @@ public:
             // Ensure Store(WritePos) is visible before Load(ConsumerWaiting)
             std::atomic_thread_fence(std::memory_order_seq_cst);
 
-            if (header->consumerWaiting.load(std::memory_order_relaxed) == 1) {
-                Platform::SignalEvent(hEvent);
-            }
+            Platform::SignalEvent(hEvent);
             return;
         }
     }
@@ -217,9 +215,7 @@ public:
                  // Ensure Store(WritePos) is visible before Load(ConsumerWaiting)
                  std::atomic_thread_fence(std::memory_order_seq_cst);
 
-                 if (header->consumerWaiting.load(std::memory_order_relaxed) == 1) {
-                     Platform::SignalEvent(hEvent);
-                 }
+                 Platform::SignalEvent(hEvent);
             }
         }
     }

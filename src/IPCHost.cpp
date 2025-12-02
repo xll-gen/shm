@@ -110,9 +110,6 @@ bool IPCHost::Call(const uint8_t* reqData, size_t reqSize, std::vector<uint8_t>&
 
     // 2. Enqueue
     {
-        if (toGuestQueue->header->consumerWaiting.load(std::memory_order_relaxed) == 1) {
-            Platform::SignalEvent(hToGuestEvent);
-        }
         std::lock_guard<std::mutex> lock(sendMutex);
         toGuestQueue->Enqueue(reqData, (uint32_t)reqSize, MSG_ID_NORMAL);
     }

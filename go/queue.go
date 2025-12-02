@@ -113,10 +113,7 @@ func (q *SPSCQueue) Enqueue(data []byte, msgId uint32) {
 
 		atomic.StoreUint64(&q.Header.WritePos, wPos+totalSize)
 
-		// Barrier: StoreLoad
-		if atomic.AddUint32(&q.Header.ConsumerWaiting, 0) == 1 {
-			SignalEvent(q.Event)
-		}
+		SignalEvent(q.Event)
 		return
 	}
 }
@@ -197,10 +194,7 @@ func (q *SPSCQueue) EnqueueBatch(msgs [][]byte) {
 
 		if tempWPos != wPos {
 			atomic.StoreUint64(&q.Header.WritePos, tempWPos)
-			// Barrier: StoreLoad
-			if atomic.AddUint32(&q.Header.ConsumerWaiting, 0) == 1 {
-				SignalEvent(q.Event)
-			}
+			SignalEvent(q.Event)
 		}
 	}
 }

@@ -59,10 +59,6 @@ func (c *IPCGuest) Send(msg *[]byte) {
 		return
 	}
 
-	if atomic.LoadUint32(&c.RespQueue.Header.ConsumerWaiting) == 1 {
-		SignalEvent(c.RespQueue.Event)
-	}
-
 	c.mu.Lock()
 	c.RespQueue.Enqueue(*msg, MsgIdNormal)
 	c.mu.Unlock()
@@ -112,10 +108,6 @@ func (c *IPCGuest) SendControl(msgId uint32) {
 func (c *IPCGuest) SendBytes(data []byte) {
 	if atomic.LoadInt32(&c.running) == 0 {
 		return
-	}
-
-	if atomic.LoadUint32(&c.RespQueue.Header.ConsumerWaiting) == 1 {
-		SignalEvent(c.RespQueue.Event)
 	}
 
 	c.mu.Lock()
