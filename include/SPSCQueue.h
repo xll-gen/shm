@@ -32,20 +32,7 @@ struct QueueHeader {
     std::atomic<uint64_t> capacity;
     // Added for signal optimization: 1 if consumer is running, 0 if waiting/sleeping.
     std::atomic<uint32_t> consumerActive;
-    uint8_t padding[44]; // Reduced padding by 4 bytes to keep 128 byte alignment if needed, or 48?
-    // originally 56 bytes pad1, then 44 bytes pad2.
-    // wait, let's calculate:
-    // wPos (8), rPos (8), cap (8), consumerActive (4) = 28 bytes.
-    // 128 bytes total size.
-    // 128 - 28 = 100 bytes padding.
-    // The struct has explicit alignment on wPos and rPos though.
-    // wPos @ 0.
-    // rPos @ 64.
-    // So wPos (8) + pad1 (56) = 64.
-    // rPos (8) + cap (8) + consumerActive (4) + pad2 (?) = 64.
-    // 8 + 8 + 4 = 20.
-    // 64 - 20 = 44.
-    // So padding is 44 bytes. Correct.
+    uint8_t padding[44];
 };
 
 class SPSCQueue {
@@ -138,8 +125,6 @@ public:
     }
 
     // Producer: Enqueue Batch
-    // Only supports normal messages (msgId=0) implicitly for now, or we need to change signature.
-    // Assuming batch is for data payload.
     void EnqueueBatch(const std::vector<std::vector<uint8_t>>& msgs) {
         if (msgs.empty()) return;
 
@@ -227,7 +212,8 @@ public:
     // Consumer: Dequeue data
     // Blocks if empty.
     // Returns msgId.
-    uint32_t Dequeue(std::vector<uint8_t>& outBuffer) {
+    // If running is provided and becomes false, returns 0xFFFFFFFF.
+    uint32_t Dequeue(std::vector<uint8_t>& outBuffer, std::atomic<bool>* running = nullptr) {
         // Set Active = 1 when running
         header->consumerActive.store(1, std::memory_order_relaxed);
         int spinCount = 0;
@@ -246,6 +232,8 @@ public:
 #endif
                     continue;
                 } else {
+                    if (running && !running->load(std::memory_order_relaxed)) return 0xFFFFFFFF;
+
                     header->consumerActive.store(0, std::memory_order_relaxed); // Waiting
                     // Double check
                     std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -255,6 +243,9 @@ public:
                     }
 
                     Platform::WaitEvent(hEvent, 100);
+
+                    if (running && !running->load(std::memory_order_relaxed)) return 0xFFFFFFFF;
+
                     header->consumerActive.store(1, std::memory_order_relaxed); // Active
                     spinCount = 0;
                     continue;
@@ -277,9 +268,6 @@ public:
             if (magic == BLOCK_MAGIC_PAD) {
                 uint32_t size = bh->size;
                 uint64_t nextRPosDiff = size + BLOCK_HEADER_SIZE;
-
-                // Optional: Clear magic? Not needed for protocol, but maybe for debugging?
-                // bh->magic.store(0, std::memory_order_relaxed);
 
                 header->readPos.store(rPos + nextRPosDiff, std::memory_order_release);
                 continue;
