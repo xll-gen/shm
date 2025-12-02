@@ -44,7 +44,7 @@ public:
         size_t totalSize = headerSize + (perSlotSize * numSlots);
 
         bool exists = false;
-        shmBase = Platform::CreateNamedShm(shmName.c_str(), totalShmSize, hMapFile, exists);
+        shmBase = Platform::CreateNamedShm(shmName.c_str(), totalSize, hMapFile, exists);
         if (!shmBase) return false;
 
         memset(shmBase, 0, totalSize);
