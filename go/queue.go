@@ -20,7 +20,7 @@ type QueueHeader struct {
 	_pad1           [56]byte // 56 bytes
 	ReadPos         uint64   // 8 bytes
 	Capacity        uint64   // 8 bytes
-	ConsumerWaiting uint32   // 4 bytes
+	ConsumerActive  uint32   // 4 bytes
 	_pad2           [44]byte // 44 bytes
 }
 
@@ -114,7 +114,7 @@ func (q *SPSCQueue) Enqueue(data []byte, msgId uint32) {
 		atomic.StoreUint64(&q.Header.WritePos, wPos+totalSize)
 
 		// Barrier: StoreLoad
-		if atomic.AddUint32(&q.Header.ConsumerWaiting, 0) == 1 {
+		if atomic.AddUint32(&q.Header.ConsumerActive, 0) == 0 {
 			SignalEvent(q.Event)
 		}
 		return
@@ -198,7 +198,7 @@ func (q *SPSCQueue) EnqueueBatch(msgs [][]byte) {
 		if tempWPos != wPos {
 			atomic.StoreUint64(&q.Header.WritePos, tempWPos)
 			// Barrier: StoreLoad
-			if atomic.AddUint32(&q.Header.ConsumerWaiting, 0) == 1 {
+			if atomic.AddUint32(&q.Header.ConsumerActive, 0) == 0 {
 				SignalEvent(q.Event)
 			}
 		}
@@ -208,6 +208,8 @@ func (q *SPSCQueue) EnqueueBatch(msgs [][]byte) {
 // Dequeue blocks if empty
 // Returns (data, msgId)
 func (q *SPSCQueue) Dequeue() ([]byte, uint32) {
+	// Active = 1
+	atomic.StoreUint32(&q.Header.ConsumerActive, 1)
 	spinCount := 0
 	for {
 		rPos := atomic.LoadUint64(&q.Header.ReadPos)
@@ -218,18 +220,19 @@ func (q *SPSCQueue) Dequeue() ([]byte, uint32) {
 				spinCount++
 				continue
 			}
-			atomic.StoreUint32(&q.Header.ConsumerWaiting, 1)
+			// Waiting = 0
+			atomic.StoreUint32(&q.Header.ConsumerActive, 0)
 
 			// Barrier
-			atomic.AddUint32(&q.Header.ConsumerWaiting, 0)
+			atomic.AddUint32(&q.Header.ConsumerActive, 0)
 
 			if atomic.LoadUint64(&q.Header.ReadPos) != atomic.LoadUint64(&q.Header.WritePos) {
-				atomic.StoreUint32(&q.Header.ConsumerWaiting, 0)
+				atomic.StoreUint32(&q.Header.ConsumerActive, 1)
 				continue
 			}
 
 			WaitForEvent(q.Event, 100)
-			atomic.StoreUint32(&q.Header.ConsumerWaiting, 0)
+			atomic.StoreUint32(&q.Header.ConsumerActive, 1)
 			spinCount = 0
 			continue
 		}
@@ -277,6 +280,9 @@ func (q *SPSCQueue) DequeueBatch(maxCount int) []*[]byte {
 		return nil
 	}
 
+	// Active = 1
+	atomic.StoreUint32(&q.Header.ConsumerActive, 1)
+
 	var outMsgs []*[]byte
 	spinCount := 0
 
@@ -293,18 +299,19 @@ func (q *SPSCQueue) DequeueBatch(maxCount int) []*[]byte {
 				continue
 			}
 
-			atomic.StoreUint32(&q.Header.ConsumerWaiting, 1)
+			// Waiting = 0
+			atomic.StoreUint32(&q.Header.ConsumerActive, 0)
 
 			// Barrier
-			atomic.AddUint32(&q.Header.ConsumerWaiting, 0)
+			atomic.AddUint32(&q.Header.ConsumerActive, 0)
 
 			if atomic.LoadUint64(&q.Header.ReadPos) != atomic.LoadUint64(&q.Header.WritePos) {
-				atomic.StoreUint32(&q.Header.ConsumerWaiting, 0)
+				atomic.StoreUint32(&q.Header.ConsumerActive, 1)
 				continue
 			}
 
 			WaitForEvent(q.Event, 100)
-			atomic.StoreUint32(&q.Header.ConsumerWaiting, 0)
+			atomic.StoreUint32(&q.Header.ConsumerActive, 1)
 			spinCount = 0
 			continue
 		}
