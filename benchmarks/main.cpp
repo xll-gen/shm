@@ -73,6 +73,7 @@ void run_benchmark(int numThreads, int iterations) {
     std::cout << "Avg Latency: " << latency << " us" << std::endl;
     std::cout << "------------------------------------------------" << std::endl;
 
+    host.SendShutdown();
     host.Shutdown();
 }
 
