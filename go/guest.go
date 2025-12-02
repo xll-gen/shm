@@ -59,7 +59,7 @@ func (c *IPCGuest) Send(msg *[]byte) {
 		return
 	}
 
-	if atomic.LoadUint32(&c.RespQueue.Header.ConsumerWaiting) == 1 {
+	if atomic.LoadUint32(&c.RespQueue.Header.ConsumerActive) == 0 {
 		SignalEvent(c.RespQueue.Event)
 	}
 
@@ -114,7 +114,7 @@ func (c *IPCGuest) SendBytes(data []byte) {
 		return
 	}
 
-	if atomic.LoadUint32(&c.RespQueue.Header.ConsumerWaiting) == 1 {
+	if atomic.LoadUint32(&c.RespQueue.Header.ConsumerActive) == 0 {
 		SignalEvent(c.RespQueue.Event)
 	}
 

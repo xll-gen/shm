@@ -30,19 +30,19 @@ struct QueueHeader {
     alignas(64) std::atomic<uint64_t> writePos;
     alignas(64) std::atomic<uint64_t> readPos;
     std::atomic<uint64_t> capacity;
-    // Added for signal optimization: 1 if consumer is waiting/sleeping, 0 otherwise
-    std::atomic<uint32_t> consumerWaiting;
+    // Added for signal optimization: 1 if consumer is running, 0 if waiting/sleeping.
+    std::atomic<uint32_t> consumerActive;
     uint8_t padding[44]; // Reduced padding by 4 bytes to keep 128 byte alignment if needed, or 48?
     // originally 56 bytes pad1, then 44 bytes pad2.
     // wait, let's calculate:
-    // wPos (8), rPos (8), cap (8), consumerWaiting (4) = 28 bytes.
+    // wPos (8), rPos (8), cap (8), consumerActive (4) = 28 bytes.
     // 128 bytes total size.
     // 128 - 28 = 100 bytes padding.
     // The struct has explicit alignment on wPos and rPos though.
     // wPos @ 0.
     // rPos @ 64.
     // So wPos (8) + pad1 (56) = 64.
-    // rPos (8) + cap (8) + consumerWaiting (4) + pad2 (?) = 64.
+    // rPos (8) + cap (8) + consumerActive (4) + pad2 (?) = 64.
     // 8 + 8 + 4 = 20.
     // 64 - 20 = 44.
     // So padding is 44 bytes. Correct.
@@ -69,7 +69,7 @@ public:
         h->writePos = 0;
         h->readPos = 0;
         h->capacity = capacity;
-        h->consumerWaiting = 0;
+        h->consumerActive = 0; // Default to Waiting (0)
     }
 
     // Producer: Enqueue data
@@ -127,10 +127,10 @@ public:
 
             header->writePos.store(wPos + totalSize, std::memory_order_release);
 
-            // Ensure Store(WritePos) is visible before Load(ConsumerWaiting)
+            // Ensure Store(WritePos) is visible before Load(ConsumerActive)
             std::atomic_thread_fence(std::memory_order_seq_cst);
 
-            if (header->consumerWaiting.load(std::memory_order_relaxed) == 1) {
+            if (header->consumerActive.load(std::memory_order_relaxed) == 0) {
                 Platform::SignalEvent(hEvent);
             }
             return;
@@ -214,10 +214,10 @@ public:
             if (tempWPos != wPos) {
                  header->writePos.store(tempWPos, std::memory_order_release);
 
-                 // Ensure Store(WritePos) is visible before Load(ConsumerWaiting)
+                 // Ensure Store(WritePos) is visible before Load(ConsumerActive)
                  std::atomic_thread_fence(std::memory_order_seq_cst);
 
-                 if (header->consumerWaiting.load(std::memory_order_relaxed) == 1) {
+                 if (header->consumerActive.load(std::memory_order_relaxed) == 0) {
                      Platform::SignalEvent(hEvent);
                  }
             }
@@ -228,6 +228,8 @@ public:
     // Blocks if empty.
     // Returns msgId.
     uint32_t Dequeue(std::vector<uint8_t>& outBuffer) {
+        // Set Active = 1 when running
+        header->consumerActive.store(1, std::memory_order_relaxed);
         int spinCount = 0;
         while (true) {
             uint64_t rPos = header->readPos.load(std::memory_order_relaxed);
@@ -244,16 +246,16 @@ public:
 #endif
                     continue;
                 } else {
-                    header->consumerWaiting.store(1, std::memory_order_relaxed);
+                    header->consumerActive.store(0, std::memory_order_relaxed); // Waiting
                     // Double check
                     std::atomic_thread_fence(std::memory_order_seq_cst);
                     if (header->readPos.load(std::memory_order_relaxed) != header->writePos.load(std::memory_order_acquire)) {
-                        header->consumerWaiting.store(0, std::memory_order_relaxed);
+                        header->consumerActive.store(1, std::memory_order_relaxed); // Active
                         continue;
                     }
 
                     Platform::WaitEvent(hEvent, 100);
-                    header->consumerWaiting.store(0, std::memory_order_relaxed);
+                    header->consumerActive.store(1, std::memory_order_relaxed); // Active
                     spinCount = 0;
                     continue;
                 }
@@ -303,6 +305,8 @@ public:
     void DequeueBatch(std::vector<std::vector<uint8_t>>& outMsgs, size_t maxCount) {
         if (maxCount == 0) return;
 
+        // Set Active = 1 when running
+        header->consumerActive.store(1, std::memory_order_relaxed);
         int spinCount = 0;
 
         while (true) {
@@ -321,15 +325,15 @@ public:
 #endif
                     continue;
                 } else {
-                    header->consumerWaiting.store(1, std::memory_order_relaxed);
+                    header->consumerActive.store(0, std::memory_order_relaxed); // Waiting
                     std::atomic_thread_fence(std::memory_order_seq_cst);
                     if (header->readPos.load(std::memory_order_relaxed) != header->writePos.load(std::memory_order_acquire)) {
-                        header->consumerWaiting.store(0, std::memory_order_relaxed);
+                        header->consumerActive.store(1, std::memory_order_relaxed); // Active
                         continue;
                     }
 
                     Platform::WaitEvent(hEvent, 100);
-                    header->consumerWaiting.store(0, std::memory_order_relaxed);
+                    header->consumerActive.store(1, std::memory_order_relaxed); // Active
                     spinCount = 0;
                     continue;
                 }
