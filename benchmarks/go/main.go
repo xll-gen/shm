@@ -6,6 +6,7 @@ import (
 	"os"
 	"runtime"
 	"runtime/pprof"
+	"time"
 
 	"github.com/xll-gen/shm/go"
 )
@@ -63,11 +64,23 @@ func main() {
 		defer pprof.StopCPUProfile()
 	}
 
-	// 2. Open SHM
+	// 2. Open SHM (Retry loop)
 	queueSize := uint64(32 * 1024 * 1024)
-	shmHandle, shmAddr, reqQ, respQ, err := OpenSHM(*shmName, queueSize)
+	var shmHandle shm.ShmHandle
+	var shmAddr uintptr
+	var reqQ, respQ *shm.SPSCQueue
+	var err error
+
+	for i := 0; i < 50; i++ {
+		shmHandle, shmAddr, reqQ, respQ, err = OpenSHM(*shmName, queueSize)
+		if err == nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
 	if err != nil {
-		fmt.Printf("Failed to open SHM: %v\n", err)
+		fmt.Printf("Failed to open SHM after retries: %v\n", err)
 		return
 	}
 	// Defer closing the shared memory handle and address

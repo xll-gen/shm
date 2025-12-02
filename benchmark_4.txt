@@ -1,0 +1,7 @@
+Starting Benchmark with 4 threads...
+Threads: 4
+Total Ops: 40000
+Time: 0.946528 s
+Throughput: 42259.70 ops/s
+Avg Latency: 23.66 us
+------------------------------------------------

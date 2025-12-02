@@ -1,0 +1,7 @@
+Starting Benchmark with 8 threads...
+Threads: 8
+Total Ops: 80000
+Time: 1.32489 s
+Throughput: 60382.57 ops/s
+Avg Latency: 16.56 us
+------------------------------------------------
