@@ -123,14 +123,6 @@ int main(int argc, char* argv[]) {
             run_benchmark_tpl<DirectHost>(4, iterations);
             run_benchmark_tpl<DirectHost>(8, iterations);
         }
-    } else if (mode == "mpsc") {
-        if (specificThreadCount > 0) {
-            run_benchmark_tpl<IPCHost<MPSCQueue>>(specificThreadCount, iterations);
-        } else {
-            run_benchmark_tpl<IPCHost<MPSCQueue>>(1, iterations);
-            run_benchmark_tpl<IPCHost<MPSCQueue>>(4, iterations);
-            run_benchmark_tpl<IPCHost<MPSCQueue>>(8, iterations);
-        }
     } else {
         if (specificThreadCount > 0) {
             run_benchmark_tpl<IPCHost<SPSCQueue>>(specificThreadCount, iterations);

@@ -9,7 +9,6 @@
 #include <thread>
 #include <cstring>
 #include "SPSCQueue.h"
-#include "MPSCQueue.h"
 #include "Platform.h"
 #include "IPCUtils.h"
 #include "../benchmarks/include/ipc_generated.h"
