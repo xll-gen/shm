@@ -13,22 +13,18 @@ const (
 )
 
 // IPCGuest manages the Go-side Guest connection.
-type IPCGuest struct {
-	ReqQueue  *SPSCQueue // Read from here (Host->Guest)
-	RespQueue *SPSCQueue // Write to here (Guest->Host)
+type IPCGuest[Q IPCQueue] struct {
+	ReqQueue  Q // Read from here (Host->Guest)
+	RespQueue Q // Write to here (Guest->Host)
 
 	pool *sync.Pool
 
 	running int32
 	wg      sync.WaitGroup
-
-	// Mutex for writing.
-	// Previously used spinlock, but sync.Mutex proved more stable in benchmarks.
-	mu sync.Mutex
 }
 
-func NewIPCGuest(reqQ *SPSCQueue, respQ *SPSCQueue) *IPCGuest {
-	c := &IPCGuest{
+func NewIPCGuest[Q IPCQueue](reqQ Q, respQ Q) *IPCGuest[Q] {
+	c := &IPCGuest[Q]{
 		ReqQueue:  reqQ,
 		RespQueue: respQ,
 		pool: &sync.Pool{
@@ -42,41 +38,35 @@ func NewIPCGuest(reqQ *SPSCQueue, respQ *SPSCQueue) *IPCGuest {
 	return c
 }
 
-func (c *IPCGuest) Start() {
+func (c *IPCGuest[Q]) Start() {
 	// No background threads needed for writing anymore
 }
 
-func (c *IPCGuest) Stop() {
+func (c *IPCGuest[Q]) Stop() {
 	atomic.StoreInt32(&c.running, 0)
 	c.wg.Wait()
 }
 
 // Send queues a message for sending.
-// The message buffer *must* be one allocated from c.GetBuffer() or compatible.
-// It writes directly to the queue.
-func (c *IPCGuest) Send(msg *[]byte) {
+func (c *IPCGuest[Q]) Send(msg *[]byte) {
 	if atomic.LoadInt32(&c.running) == 0 {
 		return
 	}
 
-	if atomic.LoadUint32(&c.RespQueue.Header.ConsumerActive) == 0 {
-		SignalEvent(c.RespQueue.Event)
-	}
-
-	c.mu.Lock()
 	c.RespQueue.Enqueue(*msg, MsgIdNormal)
-	c.mu.Unlock()
 
 	// Recycle buffer
 	*msg = (*msg)[:0]
 	c.pool.Put(msg)
 }
 
-func (c *IPCGuest) GetBuffer() *[]byte {
+func (c *IPCGuest[Q]) GetBuffer() *[]byte {
 	return c.pool.Get().(*[]byte)
 }
 
-func (c *IPCGuest) StartReader(handler func([]byte)) {
+// StartReader starts the read loop using the provided handler.
+// Handler runs on the reader goroutine, so it should be fast or spawn its own goroutine.
+func (c *IPCGuest[Q]) StartReader(handler func([]byte)) {
 	c.wg.Add(1)
 	go func() {
 		defer c.wg.Done()
@@ -102,27 +92,18 @@ func (c *IPCGuest) StartReader(handler func([]byte)) {
 	}()
 }
 
-func (c *IPCGuest) SendControl(msgId uint32) {
-	c.mu.Lock()
+func (c *IPCGuest[Q]) SendControl(msgId uint32) {
 	c.RespQueue.Enqueue(nil, msgId)
-	c.mu.Unlock()
 }
 
 // SendBytes sends a raw byte slice without pooling.
-func (c *IPCGuest) SendBytes(data []byte) {
+func (c *IPCGuest[Q]) SendBytes(data []byte) {
 	if atomic.LoadInt32(&c.running) == 0 {
 		return
 	}
-
-	if atomic.LoadUint32(&c.RespQueue.Header.ConsumerActive) == 0 {
-		SignalEvent(c.RespQueue.Event)
-	}
-
-	c.mu.Lock()
 	c.RespQueue.Enqueue(data, MsgIdNormal)
-	c.mu.Unlock()
 }
 
-func (c *IPCGuest) Wait() {
+func (c *IPCGuest[Q]) Wait() {
 	c.wg.Wait()
 }

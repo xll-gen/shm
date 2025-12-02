@@ -10,7 +10,8 @@
 
 using namespace shm;
 
-void worker(IPCHost* host, int id, int iterations) {
+template <typename HostT>
+void worker(HostT* host, int id, int iterations) {
     flatbuffers::FlatBufferBuilder builder(1024);
 
     for (int i = 0; i < iterations; ++i) {
@@ -21,28 +22,23 @@ void worker(IPCHost* host, int id, int iterations) {
         builder.Finish(msg);
 
         std::vector<uint8_t> resp;
-        // Call now takes (payload, size, outResp)
         if (!host->Call(builder.GetBufferPointer(), builder.GetSize(), resp)) {
             std::cerr << "Call failed!" << std::endl;
             return;
         }
 
-        if (resp.empty()) {
-             // std::cerr << "Empty response" << std::endl;
-             continue;
-        }
+        if (resp.empty()) continue;
 
         auto respMsg = ipc::GetMessage(resp.data());
         if (respMsg->payload_type() == ipc::Payload_AddResponse) {
             // Success
-        } else {
-            // std::cerr << "Unexpected payload type" << std::endl;
         }
     }
 }
 
-void run_benchmark(int numThreads, int iterations) {
-    IPCHost host;
+template <typename HostT>
+void run_benchmark_tpl(int numThreads, int iterations) {
+    HostT host;
     if (!host.Init("SimpleIPC", 32 * 1024 * 1024)) {
         std::cerr << "Failed to init IPC" << std::endl;
         exit(1);
@@ -54,7 +50,7 @@ void run_benchmark(int numThreads, int iterations) {
 
     std::vector<std::thread> threads;
     for (int i = 0; i < numThreads; ++i) {
-        threads.emplace_back(worker, &host, i, iterations);
+        threads.emplace_back(worker<HostT>, &host, i, iterations);
     }
 
     for (auto& t : threads) t.join();
@@ -77,45 +73,10 @@ void run_benchmark(int numThreads, int iterations) {
     host.Shutdown();
 }
 
-void test_control_messages() {
-    std::cout << "Testing Control Messages..." << std::endl;
-    IPCHost host;
-    if (!host.Init("SimpleIPC", 32 * 1024 * 1024)) {
-        std::cerr << "Failed to init IPC for control test" << std::endl;
-        return;
-    }
-
-    // Give Go side some time to connect
-    std::this_thread::sleep_for(std::chrono::seconds(1));
-
-    // Test Heartbeat
-    std::cout << "Sending Heartbeat..." << std::endl;
-    if (host.SendHeartbeat()) {
-        std::cout << "Heartbeat SUCCESS" << std::endl;
-    } else {
-        std::cerr << "Heartbeat FAILED (Timeout)" << std::endl;
-    }
-
-    // Test Shutdown
-    std::cout << "Sending Shutdown..." << std::endl;
-    host.SendShutdown();
-    std::cout << "Shutdown Sent." << std::endl;
-
-    host.Shutdown();
-    std::cout << "Test Complete." << std::endl;
-    std::cout << "------------------------------------------------" << std::endl;
-}
-
-
 int main(int argc, char* argv[]) {
-    // 1. Test Control Messages first (to ensure logic is correct)
-    // test_control_messages();
-
-    // Wait a bit for the previous Go process to exit and SHM to be cleaned up
-    // std::this_thread::sleep_for(std::chrono::seconds(2));
-
     int iterations = 10000;
     int specificThreadCount = 0;
+    std::string mode = "spsc"; // Default
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -123,15 +84,29 @@ int main(int argc, char* argv[]) {
             specificThreadCount = std::stoi(argv[++i]);
         } else if (arg == "-i" && i + 1 < argc) {
             iterations = std::stoi(argv[++i]);
+        } else if (arg == "-mode" && i + 1 < argc) {
+            mode = argv[++i];
         }
     }
 
-    if (specificThreadCount > 0) {
-        run_benchmark(specificThreadCount, iterations);
+    std::cout << "Running Benchmark in " << mode << " mode." << std::endl;
+
+    if (mode == "mpsc") {
+        if (specificThreadCount > 0) {
+            run_benchmark_tpl<IPCHost<MPSCQueue>>(specificThreadCount, iterations);
+        } else {
+            run_benchmark_tpl<IPCHost<MPSCQueue>>(1, iterations);
+            run_benchmark_tpl<IPCHost<MPSCQueue>>(4, iterations);
+            run_benchmark_tpl<IPCHost<MPSCQueue>>(8, iterations);
+        }
     } else {
-        run_benchmark(1, iterations);
-        run_benchmark(4, iterations);
-        run_benchmark(8, iterations);
+        if (specificThreadCount > 0) {
+            run_benchmark_tpl<IPCHost<SPSCQueue>>(specificThreadCount, iterations);
+        } else {
+            run_benchmark_tpl<IPCHost<SPSCQueue>>(1, iterations);
+            run_benchmark_tpl<IPCHost<SPSCQueue>>(4, iterations);
+            run_benchmark_tpl<IPCHost<SPSCQueue>>(8, iterations);
+        }
     }
 
     return 0;

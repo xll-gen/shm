@@ -22,6 +22,7 @@ const (
 
 func main() {
 	workers := flag.Int("w", 1, "Number of worker threads")
+	mode := flag.String("mode", "spsc", "Queue mode: spsc or mpsc")
 	cpuprofile := flag.String("cpuprofile", "", "write cpu profile to file")
 	memprofile := flag.String("memprofile", "", "write memory profile to file")
 	flag.Parse()
@@ -35,10 +36,12 @@ func main() {
 		defer pprof.StopCPUProfile()
 	}
 
-	fmt.Printf("[Go] Starting Guest with %d workers...\n", *workers)
+	fmt.Printf("[Go] Starting Guest with %d workers in %s mode...\n", *workers, *mode)
 
 	// 1. Open SHM (Retry loop until Host creates it)
-	qTotalSize := uint64(shm.QueueHeaderSize + QUEUE_SIZE) // Header + Data
+	// We assume Host creates sufficient space.
+	// For MPSC/SPSC, header sizes are same (128 bytes).
+	qTotalSize := uint64(shm.QueueHeaderSize + QUEUE_SIZE)
 	totalSize := uint64(qTotalSize * 2)
 
 	var hMap shm.ShmHandle
@@ -75,30 +78,75 @@ func main() {
 	}
 	fmt.Println("[Go] Connected to Events.")
 
-	// 3. Init Queues
-	// Layout: [ToGuestQueue] [FromGuestQueue]
+	if *mode == "mpsc" {
+		runMPSC(addr, qTotalSize, hToGuest, hFromGuest, *workers)
+	} else {
+		runSPSC(addr, qTotalSize, hToGuest, hFromGuest, *workers)
+	}
+
+	_ = hMap
+
+	if *memprofile != "" {
+		f, err := os.Create(*memprofile)
+		if err != nil {
+			log.Fatal("could not create memory profile: ", err)
+		}
+		defer f.Close()
+		runtime.GC()
+		if err := pprof.WriteHeapProfile(f); err != nil {
+			log.Fatal("could not write memory profile: ", err)
+		}
+	}
+}
+
+func runSPSC(addr uintptr, qTotalSize uint64, hToGuest, hFromGuest shm.EventHandle, workers int) {
 	// Queue 1: ToGuest (Guest reads from here)
 	// Queue 2: FromGuest (Guest writes to here)
-	toGuestQueue := shm.NewSPSCQueue(addr, QUEUE_SIZE, hToGuest)
-	fromGuestQueue := shm.NewSPSCQueue(addr+uintptr(qTotalSize), QUEUE_SIZE, hFromGuest)
+	// For SPSC mode in IPCGuest, we need LockedSPSCQueue for writing (FromGuest)
+	// because multiple workers will call Send concurrently.
+	// We can use SPSCQueue for reading (ToGuest) since there's only one reader goroutine.
+
+	// Wait, IPCGuest expects Q to be the same type for Req and Resp?
+	// type IPCGuest[Q IPCQueue] struct { ReqQueue Q; RespQueue Q }
+	// So both must be the same type.
+	// We must use LockedSPSCQueue for both, even if we don't need lock for reading.
+	// LockedSPSCQueue wraps SPSCQueue, so reading is fine (lock is only on Enqueue).
+
+	toGuestQueue := shm.NewLockedSPSCQueue(addr, QUEUE_SIZE, hToGuest)
+	fromGuestQueue := shm.NewLockedSPSCQueue(addr+uintptr(qTotalSize), QUEUE_SIZE, hFromGuest)
 
 	fmt.Println("[Go] Waiting for Queue initialization...")
-	// Wait for Host to initialize headers
 	for atomic.LoadUint64(&toGuestQueue.Header.Capacity) == 0 {
 		runtime.Gosched()
 		time.Sleep(10 * time.Millisecond)
 	}
 
+	client := shm.NewIPCGuest[*shm.LockedSPSCQueue](toGuestQueue, fromGuestQueue)
+	runGuest(client, workers)
+}
+
+func runMPSC(addr uintptr, qTotalSize uint64, hToGuest, hFromGuest shm.EventHandle, workers int) {
+	toGuestQueue := shm.NewMPSCQueue(addr, QUEUE_SIZE, hToGuest)
+	fromGuestQueue := shm.NewMPSCQueue(addr+uintptr(qTotalSize), QUEUE_SIZE, hFromGuest)
+
+	fmt.Println("[Go] Waiting for Queue initialization...")
+	for atomic.LoadUint64(&toGuestQueue.Header.Capacity) == 0 {
+		runtime.Gosched()
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	client := shm.NewIPCGuest[*shm.MPSCQueue](toGuestQueue, fromGuestQueue)
+	runGuest(client, workers)
+}
+
+// runGuest is generic
+func runGuest[Q shm.IPCQueue](client *shm.IPCGuest[Q], workers int) {
 	fmt.Println("[Go] Guest Ready. Waiting for requests from Host...")
 
-	// Init IPCGuest
-	client := shm.NewIPCGuest(toGuestQueue, fromGuestQueue)
-
-	// 4. Start Workers
 	workChan := make(chan []byte, 1024)
-
 	var wg sync.WaitGroup
-	for i := 0; i < *workers; i++ {
+
+	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
@@ -109,40 +157,20 @@ func main() {
 		}(i)
 	}
 
-	// 5. Start Reader (handles normal, heartbeat, shutdown)
 	client.StartReader(func(data []byte) {
-		// Copy data because IPCGuest reuses/frees buffer?
-		// SPSCQueue Dequeue returns allocated buffer.
-		// IPCGuest.StartReader just passes it.
-		// So it's safe to pass to channel.
 		workChan <- data
 	})
 
-	// Wait for Shutdown
 	client.Wait()
-
 	fmt.Println("[Go] Received Shutdown. Exiting...")
 	close(workChan)
 	wg.Wait()
-	_ = hMap
-
-	if *memprofile != "" {
-		f, err := os.Create(*memprofile)
-		if err != nil {
-			log.Fatal("could not create memory profile: ", err)
-		}
-		defer f.Close() // error handling omitted for example
-		runtime.GC()    // get up-to-date statistics
-		if err := pprof.WriteHeapProfile(f); err != nil {
-			log.Fatal("could not write memory profile: ", err)
-		}
-	}
 }
 
-func handleRequest(data []byte, client *shm.IPCGuest, builder *flatbuffers.Builder) {
+func handleRequest[Q shm.IPCQueue](data []byte, client *shm.IPCGuest[Q], builder *flatbuffers.Builder) {
 	defer func() {
 		if r := recover(); r != nil {
-			// Recover from potential FlatBuffers panics due to corrupt data
+			// Recover
 		}
 	}()
 
@@ -154,7 +182,6 @@ func handleRequest(data []byte, client *shm.IPCGuest, builder *flatbuffers.Build
 	var payloadOffset flatbuffers.UOffsetT
 	var payloadType ipc.Payload
 
-	// This access might panic if payload is corrupt
 	pt := msg.PayloadType()
 
 	switch pt {
@@ -187,6 +214,5 @@ func handleRequest(data []byte, client *shm.IPCGuest, builder *flatbuffers.Build
 	builder.Finish(resMsg)
 	resBytes := builder.FinishedBytes()
 
-	// Use IPCGuest to send (uses spinlock and signal-before-lock opt)
 	client.SendBytes(resBytes)
 }

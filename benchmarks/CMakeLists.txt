@@ -12,22 +12,15 @@ if(ENABLE_PROFILING)
 endif()
 
 # Include directories
-# We need to reach the root src/include from benchmarks/build
-# benchmarks/main.cpp includes "../../src/IPC.h" which is relative to source file
-# But we should add include paths properly.
-
 include_directories(${CMAKE_SOURCE_DIR}/../include) # shm/include
 include_directories(${CMAKE_SOURCE_DIR}/../src)     # shm/src
 include_directories(${CMAKE_SOURCE_DIR}/include)    # benchmarks/include (generated headers)
-
-# Flatbuffers usually expects <flatbuffers/flatbuffers.h>
-# So we include the parent of 'flatbuffers' directory.
 include_directories(${CMAKE_SOURCE_DIR}/external)
 
 # Add source files
+# IPCHost.cpp is removed, now header-only (templated)
 set(SOURCES
     main.cpp
-    ${CMAKE_SOURCE_DIR}/../src/IPCHost.cpp
 )
 
 # Executable
