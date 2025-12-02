@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"runtime"
 	"runtime/pprof"
 
 	"github.com/xll-gen/shm/go"
@@ -15,6 +16,39 @@ var (
 	cpuprofile = flag.String("cpuprofile", "", "write cpu profile to file")
 	memprofile = flag.String("memprofile", "", "write memory profile to file")
 )
+
+// Helper for opening SHM
+func OpenSHM(name string, size uint64) (shm.ShmHandle, uintptr, *shm.SPSCQueue, *shm.SPSCQueue, error) {
+	// 1. Open Shared Memory
+	shmHandle, shmAddr, err := shm.OpenShm(name, size*2)
+	if err != nil {
+		return 0, 0, nil, nil, err
+	}
+
+	// 2. Open Events
+	reqEvent, err := shm.OpenEvent(name + "_event_req")
+	if err != nil {
+		shm.CloseShm(shmHandle, shmAddr) // Close SHM if event creation fails
+		return 0, 0, nil, nil, err
+	}
+	respEvent, err := shm.OpenEvent(name + "_event_resp")
+	if err != nil {
+		shm.CloseEvent(reqEvent)         // Close reqEvent if respEvent creation fails
+		shm.CloseShm(shmHandle, shmAddr) // Close SHM
+		return 0, 0, nil, nil, err
+	}
+
+	// 3. Create Queues
+	// Req: Read from 0
+	reqQ := shm.NewSPSCQueue(shmAddr, size, reqEvent)
+
+	// Resp: Write to size
+	// 128 + size
+	reqSize := uint64(128) + size
+	respQ := shm.NewSPSCQueue(shmAddr+uintptr(reqSize), size, respEvent)
+
+	return shmHandle, shmAddr, reqQ, respQ, nil
+}
 
 func main() {
 	flag.Parse()
@@ -31,11 +65,16 @@ func main() {
 
 	// 2. Open SHM
 	queueSize := uint64(32 * 1024 * 1024)
-	reqQ, respQ, err := shm.OpenSHM(*shmName, queueSize)
+	shmHandle, shmAddr, reqQ, respQ, err := OpenSHM(*shmName, queueSize)
 	if err != nil {
 		fmt.Printf("Failed to open SHM: %v\n", err)
 		return
 	}
+	// Defer closing the shared memory handle and address
+	defer shm.CloseShm(shmHandle, shmAddr)
+	defer shm.CloseEvent(reqQ.Event)
+	defer shm.CloseEvent(respQ.Event)
+
 
 	// 3. Start Guest
 	guest := shm.NewIPCGuest(reqQ, respQ)

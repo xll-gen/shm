@@ -13,12 +13,12 @@ func TestBatch(t *testing.T) {
 	buffer := make([]byte, shmSize)
 	base := uintptr(unsafe.Pointer(&buffer[0]))
 
-    // Create real event
-    hEvent, err := CreateEvent("test_go_batch")
-    if err != nil {
-        t.Fatalf("Failed to create event: %v", err)
-    }
-    defer CloseEvent(hEvent)
+	// Create real event
+	hEvent, err := CreateEvent("test_go_batch")
+	if err != nil {
+		t.Fatalf("Failed to create event: %v", err)
+	}
+	defer CloseEvent(hEvent)
 
 	q := NewSPSCQueue(base, capacity, hEvent)
 	q.Header.Capacity = capacity
@@ -57,12 +57,12 @@ func TestWrapping(t *testing.T) {
 	buffer := make([]byte, shmSize)
 	base := uintptr(unsafe.Pointer(&buffer[0]))
 
-    // Create real event
-    hEvent, err := CreateEvent("test_go_wrapping")
-    if err != nil {
-        t.Fatalf("Failed to create event: %v", err)
-    }
-    defer CloseEvent(hEvent)
+	// Create real event
+	hEvent, err := CreateEvent("test_go_wrapping")
+	if err != nil {
+		t.Fatalf("Failed to create event: %v", err)
+	}
+	defer CloseEvent(hEvent)
 
 	q := NewSPSCQueue(base, capacity, hEvent)
 	q.Header.Capacity = capacity
@@ -74,9 +74,10 @@ func TestWrapping(t *testing.T) {
 
 	// 2. Read 50
 	out, _ := q.Dequeue()
-	if len(out) != 50 {
+	if len(*out) != 50 {
 		t.Fatal("Read mismatch")
 	}
+	q.RecycleBuffer(out)
 
 	// wPos=66, rPos=66. Cap=200.
 
@@ -95,9 +96,10 @@ func TestWrapping(t *testing.T) {
 
 	// Read d2
 	out2, _ := q.Dequeue()
-	if !bytes.Equal(out2, d2) {
+	if !bytes.Equal(*out2, d2) {
 		t.Fatal("d2 mismatch")
 	}
+	q.RecycleBuffer(out2)
 
 	// Read batch
 	batchOut := q.DequeueBatch(10)
@@ -107,6 +109,7 @@ func TestWrapping(t *testing.T) {
 	if !bytes.Equal(*batchOut[0], batch[0]) {
 		t.Fatal("Batch content mismatch")
 	}
+	q.Recycle(batchOut)
 }
 
 func TestMsgId(t *testing.T) {
@@ -115,12 +118,12 @@ func TestMsgId(t *testing.T) {
 	buffer := make([]byte, shmSize)
 	base := uintptr(unsafe.Pointer(&buffer[0]))
 
-    // Create real event
-    hEvent, err := CreateEvent("test_go_msgid")
-    if err != nil {
-        t.Fatalf("Failed to create event: %v", err)
-    }
-    defer CloseEvent(hEvent)
+	// Create real event
+	hEvent, err := CreateEvent("test_go_msgid")
+	if err != nil {
+		t.Fatalf("Failed to create event: %v", err)
+	}
+	defer CloseEvent(hEvent)
 
 	q := NewSPSCQueue(base, capacity, hEvent)
 	q.Header.Capacity = capacity
@@ -143,25 +146,28 @@ func TestMsgId(t *testing.T) {
 	if msgId != MsgIdNormal {
 		t.Errorf("Expected MsgIdNormal, got %d", msgId)
 	}
-	if len(out) != 10 || out[0] != 1 {
+	if len(*out) != 10 || (*out)[0] != 1 {
 		t.Errorf("Data 1 mismatch")
 	}
+	q.RecycleBuffer(out)
 
 	// Read 2
 	out, msgId = q.Dequeue()
 	if msgId != MsgIdHeartbeatReq {
 		t.Errorf("Expected MsgIdHeartbeatReq, got %d", msgId)
 	}
-	if len(out) != 0 {
+	if len(*out) != 0 {
 		t.Errorf("Expected empty payload for heartbeat")
 	}
+	q.RecycleBuffer(out)
 
 	// Read 3
 	out, msgId = q.Dequeue()
 	if msgId != 2 {
 		t.Errorf("Expected MsgId 2, got %d", msgId)
 	}
-	if len(out) != 10 || out[0] != 2 {
+	if len(*out) != 10 || (*out)[0] != 2 {
 		t.Errorf("Data 2 mismatch")
 	}
+	q.RecycleBuffer(out)
 }
