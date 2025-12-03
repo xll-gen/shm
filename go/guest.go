@@ -38,35 +38,10 @@ func NewIPCGuest[Q IPCQueue](reqQ Q, respQ Q) *IPCGuest[Q] {
 	return c
 }
 
-func (c *IPCGuest[Q]) Start() {
-	// No background threads needed for writing anymore
-}
+// Implement Transport Interface
 
-func (c *IPCGuest[Q]) Stop() {
-	atomic.StoreInt32(&c.running, 0)
-	c.wg.Wait()
-}
-
-// Send queues a message for sending.
-func (c *IPCGuest[Q]) Send(msg *[]byte) {
-	if atomic.LoadInt32(&c.running) == 0 {
-		return
-	}
-
-	c.RespQueue.Enqueue(*msg, MsgIdNormal)
-
-	// Recycle buffer
-	*msg = (*msg)[:0]
-	c.pool.Put(msg)
-}
-
-func (c *IPCGuest[Q]) GetBuffer() *[]byte {
-	return c.pool.Get().(*[]byte)
-}
-
-// StartReader starts the read loop using the provided handler.
-// Handler runs on the reader goroutine, so it should be fast or spawn its own goroutine.
-func (c *IPCGuest[Q]) StartReader(handler func([]byte)) {
+// Start listens for requests, calls handler, and sends back response.
+func (c *IPCGuest[Q]) Start(handler func([]byte) []byte) {
 	c.wg.Add(1)
 	go func() {
 		defer c.wg.Done()
@@ -86,24 +61,23 @@ func (c *IPCGuest[Q]) StartReader(handler func([]byte)) {
 			}
 
 			if msgId == MsgIdNormal {
-				handler(data)
+				resp := handler(data)
+                if resp != nil {
+				    c.RespQueue.Enqueue(resp, MsgIdNormal)
+                }
 			}
 		}
 	}()
 }
 
-func (c *IPCGuest[Q]) SendControl(msgId uint32) {
-	c.RespQueue.Enqueue(nil, msgId)
-}
-
-// SendBytes sends a raw byte slice without pooling.
-func (c *IPCGuest[Q]) SendBytes(data []byte) {
-	if atomic.LoadInt32(&c.running) == 0 {
-		return
-	}
-	c.RespQueue.Enqueue(data, MsgIdNormal)
+func (c *IPCGuest[Q]) Close() {
+	atomic.StoreInt32(&c.running, 0)
 }
 
 func (c *IPCGuest[Q]) Wait() {
 	c.wg.Wait()
+}
+
+func (c *IPCGuest[Q]) SendControl(msgId uint32) {
+	c.RespQueue.Enqueue(nil, msgId)
 }

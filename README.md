@@ -1,89 +1,88 @@
-# IPC Library & Benchmarks
+# SimpleIPC Library
 
-This repository contains a high-performance IPC (Inter-Process Communication) library using Shared Memory and Lock-Free SPSC (Single Producer Single Consumer) Queues. It supports bidirectional communication between C++ and Go.
+SimpleIPC is a low-latency, shared-memory IPC library for C++ (Host) and Go (Guest). It supports two modes: **Queue** (SPSC/MPSC) and **Direct Exchange** (Slot-based), unified under a single API.
+
+## Features
+
+*   **Unified API:** Write code once, switch between Queue and Direct modes easily.
+*   **Low Latency:** Uses shared memory and lock-free/wait-free structures (SPSC Queue or CAS Slots).
+*   **Protocol Agnostic:** Transmits raw bytes. Includes a minimal 8-byte `TransportHeader` for request matching.
+*   **Cross-Language:** C++ Host and Go Guest.
+
+## C++ Host Usage
+
+```cpp
+#include "IPCHost.h"
+
+// 1. Initialize Host
+shm::IPCHost host;
+bool success = host.Init("MyIPC", shm::IPCMode::Queue, 32 * 1024 * 1024); // 32MB Queue
+
+// 2. Call Guest
+std::vector<uint8_t> req = { ... };
+std::vector<uint8_t> resp;
+if (host.Call(req.data(), req.size(), resp)) {
+    // Handle response
+}
+
+// 3. Shutdown
+host.SendShutdown();
+host.Shutdown();
+```
+
+### Direct Mode
+To use Direct Mode (optimized for 1:1 worker mapping):
+```cpp
+host.Init("MyIPC", shm::IPCMode::Direct, 4); // 4 Lanes
+```
+
+## Go Guest Usage
+
+```go
+package main
+
+import "github.com/xll-gen/shm/go"
+
+func main() {
+    // 1. Connect to Host (Auto-retry)
+    client, err := shm.Connect("MyIPC", shm.ModeQueue)
+    if err != nil {
+        panic(err)
+    }
+
+    // 2. Register Handler
+    client.Handle(func(req []byte) []byte {
+        // Process request
+        return []byte("response")
+    })
+
+    // 3. Start
+    go client.Start()
+
+    // 4. Wait for Shutdown
+    client.Wait()
+    client.Close()
+}
+```
 
 ## Architecture
 
-- **Core Library**: `shm/go` (Go) and `src/`/`include/` (C++).
-- **Transport**: Shared Memory with Ring Buffers (SPSC).
-- **Signaling**:
-  - **Windows**: Named Events (`CreateEvent`, `SetEvent`).
-  - **Linux**: Named Semaphores (`sem_open`, `sem_post`).
-- **Protocol**:
-  - **Wire Format**: FlatBuffers Payload (Request ID embedded).
-  - **Serialization**: FlatBuffers (Google).
-- **Threading Model**:
-  - **Dedicated I/O Threads**: To maintain high throughput and SPSC strictness, both the C++ Host and Go Guest use dedicated background threads for writing to the queue.
-  - **Batching**: Writes are batched to minimize atomic operations and system calls (signaling).
+*   **Queue Mode:** Uses a ring buffer in shared memory. Good for streaming or variable-sized messages.
+*   **Direct Mode:** Uses fixed-size slots mapped to threads. Lowest latency for request-response patterns.
+*   **Transport Header:** An 8-byte header containing the `req_id` is prepended to all messages to match responses to requests asynchronously.
 
-## Benchmark Results
-
-Environment: Linux (WSL2/Native), Ryzen 5 5600X (example spec), Release Build.
-
-| Threads | Throughput (ops/s) | Avg Latency (us) |
-|---------|--------------------|------------------|
-| 1       | ~7,083             | ~141.18          |
-| 4       | ~30,732            | ~32.54           |
-| 8       | ~48,562            | ~20.59           |
-
-*Note: Results vary based on hardware and OS scheduling.*
-
-## Directory Structure
-
-- `go/`: Go library code (`shm` package).
-  - `client.go`: High-level IPC Client with dedicated I/O threads.
-  - `queue.go`: SPSC Queue implementation.
-- `src/`: C++ library implementation (`IPCHost.cpp`, `Platform.cpp`).
-- `include/`: C++ library headers.
-- `benchmarks/`: Benchmark applications.
-  - `main.cpp`: C++ Benchmark (Host).
-  - `go/main.go`: Go Benchmark (Guest).
-
-## License
-
-This project includes external code in the `external/` directory which is subject to its own license terms (e.g., FlatBuffers, ExcelSDK). Please refer to the respective licenses in those directories.
-The core library code is provided under the terms found in `LICENSE`.
-
-## Building & Running
-
-### Requirements
-
-- **C++**: GCC (Linux) or MinGW/MSVC (Windows), CMake.
-- **Go**: Go 1.18+.
-- **Task**: (Optional) Taskfile is provided for automation.
-
-### Build & Run via Taskfile
+## Building Benchmarks
 
 ```bash
-task run:benchmark
-```
+# Generate FlatBuffers
+flatc --cpp --go -o benchmarks/include benchmarks/ipc.fbs
 
-### Manual Build
+# Build C++
+mkdir build && cd build
+cmake ..
+make
 
-#### C++ Benchmark
-
-```bash
-cd benchmarks/build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j$(nproc)
-```
-
-#### Go Benchmark
-
-```bash
+# Build Go
 cd benchmarks/go
-go build -o server main.go
+go build
 ```
-
-### Running Benchmarks
-
-1. Start the Go Server (Guest):
-   ```bash
-   ./server -w 4
-   ```
-   (Runs with 4 worker threads, but uses a single dedicated writer thread for IPC).
-
-2. Run the C++ Benchmark (Host):
-   ```bash
-   ./shm_benchmark
-   ```
