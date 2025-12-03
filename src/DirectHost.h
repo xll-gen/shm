@@ -1,308 +1,183 @@
 #pragma once
 #include <string>
 #include <vector>
+#include <mutex>
 #include <memory>
 #include <thread>
-#include <mutex>
-#include <atomic>
 #include <cstring>
-#include <chrono>
 #include <iostream>
-#include "IPCUtils.h"
+#include <functional>
 #include "Platform.h"
-#include "../benchmarks/include/ipc_generated.h"
+#include "IPCUtils.h"
 
 namespace shm {
 
 class DirectHost {
     void* shmBase;
     std::string shmName;
-    uint32_t numSlots;
-    uint32_t slotSize;
+    uint32_t numQueues;
     ShmHandle hMapFile;
+    bool running;
 
-    struct SlotContext {
-        SlotHeader* header;
-        uint8_t* data;
-        EventHandle hEvent;
-        EventHandle hRespEvent;
+    struct Lane {
+        SlotHeader* slots;
+        uint32_t slotCount;
+        EventHandle hReqEvent;
     };
 
-    std::vector<SlotContext> slots;
-    std::atomic<bool> running;
+    std::vector<Lane> lanes;
+    std::atomic<uint32_t> nextLane{0};
 
-    std::atomic<int32_t> targetPollers;
-    std::atomic<int32_t> activePollers;
+    // Reader threads (one per lane)
+    std::vector<std::thread> readerThreads;
+
+    std::function<void(std::vector<uint8_t>&&, uint32_t)> onMessage;
+
+    // Config
+    uint32_t slotDataSize;
+    size_t perSlotTotal;
 
 public:
-    DirectHost() : shmBase(nullptr), hMapFile(0), running(false) {
-        activePollers = 0;
-        int cpus = std::thread::hardware_concurrency();
-        if (cpus < 1) cpus = 1;
-        int target = cpus / 4;
-        if (target < 1) target = 1;
-        targetPollers = target;
-    }
+    DirectHost() : shmBase(nullptr), hMapFile(0), running(false) {}
     ~DirectHost() { Shutdown(); }
 
-    bool Init(const std::string& shmName, uint32_t numSlots, uint32_t slotSize) {
+    bool Init(const std::string& shmName, uint32_t numQueues,
+              std::function<void(std::vector<uint8_t>&&, uint32_t)> msgHandler) {
         this->shmName = shmName;
-        this->numSlots = numSlots;
-        this->slotSize = slotSize;
+        this->numQueues = numQueues;
+        this->onMessage = msgHandler;
 
-        // Ensure alignment
-        size_t headerSize = sizeof(ExchangeHeader);
-        if (headerSize < 64) headerSize = 64;
+        uint32_t slotsPerLane = 1024;
+        this->slotDataSize = 1024 * 1024; // 1MB
+        this->perSlotTotal = sizeof(SlotHeader) + slotDataSize;
 
-        size_t slotHeaderSize = sizeof(SlotHeader);
-        if (slotHeaderSize < 128) slotHeaderSize = 128; // Pad SlotHeader to 128
-
-        size_t perSlotSize = slotHeaderSize + slotSize;
-        size_t totalSize = headerSize + (perSlotSize * numSlots);
+        size_t laneSize = slotsPerLane * perSlotTotal;
+        size_t totalSize = laneSize * numQueues;
 
         bool exists = false;
         shmBase = Platform::CreateNamedShm(shmName.c_str(), totalSize, hMapFile, exists);
         if (!shmBase) return false;
 
+        // Zero out memory if new
         memset(shmBase, 0, totalSize);
 
-        ExchangeHeader* exHead = (ExchangeHeader*)shmBase;
-        exHead->numSlots = numSlots;
-        exHead->slotSize = slotSize;
+        lanes.resize(numQueues);
+        uint8_t* ptr = (uint8_t*)shmBase;
 
-        uint8_t* ptr = (uint8_t*)shmBase + headerSize;
+        for (uint32_t i = 0; i < numQueues; ++i) {
+            lanes[i].slots = (SlotHeader*)ptr;
+            lanes[i].slotCount = slotsPerLane;
 
-        for (uint32_t i = 0; i < numSlots; i++) {
-            SlotContext ctx;
-            ctx.header = (SlotHeader*)ptr;
-            ctx.data = ptr + slotHeaderSize;
+            // Event name per lane
+            std::string evtName = shmName + "_slot_" + std::to_string(i);
+            lanes[i].hReqEvent = Platform::CreateNamedEvent(evtName.c_str());
 
-            std::string evName = shmName + "_slot_" + std::to_string(i);
-            ctx.hEvent = Platform::CreateNamedEvent(evName.c_str());
+            // Initialize slots
+            uint8_t* slotPtr = ptr;
+            for (uint32_t j = 0; j < slotsPerLane; ++j) {
+                SlotHeader* header = (SlotHeader*)slotPtr;
+                header->state.store(SLOT_FREE, std::memory_order_relaxed);
+                slotPtr += perSlotTotal;
+            }
 
-            std::string respEvName = shmName + "_slot_" + std::to_string(i) + "_resp";
-            ctx.hRespEvent = Platform::CreateNamedEvent(respEvName.c_str());
-
-            slots.push_back(ctx);
-            ptr += perSlotSize;
+            ptr += laneSize;
         }
 
         running = true;
+        // Start reader threads
+        for (uint32_t i = 0; i < numQueues; ++i) {
+            readerThreads.emplace_back(&DirectHost::ReaderLoop, this, i);
+        }
+
         return true;
     }
 
     void Shutdown() {
+        if (!running) return;
         running = false;
+        // Wait for threads
+        for (auto& t : readerThreads) {
+            if (t.joinable()) t.join();
+        }
+
         if (shmBase) Platform::CloseShm(hMapFile, shmBase);
-        for (auto& s : slots) {
-            Platform::CloseEvent(s.hEvent);
-            Platform::CloseEvent(s.hRespEvent);
+        for (auto& lane : lanes) {
+            Platform::CloseEvent(lane.hReqEvent);
         }
-        slots.clear();
     }
 
-    bool Call(const uint8_t* reqData, size_t reqSize, std::vector<uint8_t>& outResponse) {
-        return CallWithId(reqData, reqSize, MSG_ID_NORMAL, outResponse);
+    // Returns true if sent
+    bool Send(const uint8_t* data, uint32_t size, uint32_t msgId) {
+        // Round robin
+        uint32_t laneIdx = nextLane++ % numQueues;
+        Lane& lane = lanes[laneIdx];
+
+        return SendToLane(lane, data, size, msgId);
     }
 
-    bool CallWithId(const uint8_t* reqData, size_t reqSize, uint32_t msgId, std::vector<uint8_t>& outResponse) {
-        int slotIdx = -1;
-        bool wasSleeping = false;
-
-        while (running) {
-            // Pass 1: Look for POLLING (Priority)
-            for (int i = 0; i < (int)numSlots; i++) {
-                uint32_t expected = SLOT_POLLING;
-                if (slots[i].header->state.compare_exchange_strong(expected, SLOT_BUSY)) {
-                     slotIdx = i; wasSleeping = false; goto Found;
-                }
-            }
-            // Pass 2: Look for FREE (Worker waiting)
-            for (int i = 0; i < (int)numSlots; i++) {
+private:
+    bool SendToLane(Lane& lane, const uint8_t* data, uint32_t size, uint32_t msgId) {
+        // Find a free slot
+        for (int retry=0; retry<3; retry++) {
+            uint8_t* ptr = (uint8_t*)lane.slots;
+            for (uint32_t i = 0; i < lane.slotCount; ++i) {
+                SlotHeader* slot = (SlotHeader*)ptr;
                 uint32_t expected = SLOT_FREE;
-                if (slots[i].header->state.compare_exchange_strong(expected, SLOT_BUSY)) {
-                     slotIdx = i; wasSleeping = true; goto Found;
+                if (slot->state.compare_exchange_strong(expected, SLOT_BUSY, std::memory_order_acquire)) {
+                    // Found slot
+                    if (size > slotDataSize) return false;
+
+                    slot->msgId = msgId;
+                    slot->reqSize = size;
+
+                    if (data && size > 0) {
+                        uint8_t* dataPtr = ptr + sizeof(SlotHeader);
+                        memcpy(dataPtr, data, size);
+                    }
+
+                    slot->state.store(SLOT_REQ_READY, std::memory_order_release);
+                    Platform::SignalEvent(lane.hReqEvent);
+                    return true;
                 }
+                ptr += perSlotTotal;
             }
-            std::this_thread::yield();
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
         return false;
-
-    Found:
-        SlotContext& slot = slots[slotIdx];
-        if (reqSize > slotSize) {
-             slot.header->state.store(wasSleeping ? SLOT_FREE : SLOT_POLLING);
-             return false;
-        }
-
-        if (reqData && reqSize > 0) memcpy(slot.data, reqData, reqSize);
-        slot.header->reqSize = (uint32_t)reqSize;
-        slot.header->msgId = msgId;
-
-        slot.header->state.store(SLOT_REQ_READY, std::memory_order_release);
-        if (wasSleeping) Platform::SignalEvent(slot.hEvent);
-
-        if (msgId == MSG_ID_SHUTDOWN) {
-             return true;
-        }
-
-        // Wait for Response (Adaptive)
-        bool success = false;
-        bool canSpin = false;
-        int currentActive = activePollers.load(std::memory_order_relaxed);
-        int currentTarget = targetPollers.load(std::memory_order_relaxed);
-
-        if (currentActive < currentTarget) {
-            activePollers.fetch_add(1, std::memory_order_relaxed);
-            canSpin = true;
-        }
-
-        if (canSpin) {
-            int spins = 0;
-            const int SpinLimit = 5000; // Tuned for single-core/yielding environment
-            while (running && spins < SpinLimit) {
-                uint32_t s = slot.header->state.load(std::memory_order_acquire);
-                if (s == SLOT_RESP_READY) {
-                    success = true;
-                    break;
-                }
-                spins++;
-                if (spins % 100 == 0) std::this_thread::yield();
-            }
-            activePollers.fetch_sub(1, std::memory_order_relaxed);
-
-            if (!success) {
-                // Spin failed (timeout) -> Decrease target
-                int t = targetPollers.load(std::memory_order_relaxed);
-                if (t > 1) targetPollers.fetch_sub(1, std::memory_order_relaxed);
-            }
-        }
-
-        if (!success) {
-            WaitForResponse(slot);
-            success = true;
-        }
-
-        if (!running) return false;
-
-        uint32_t respSize = slot.header->respSize;
-        if (respSize > slotSize) respSize = slotSize;
-        outResponse.resize(respSize);
-        memcpy(outResponse.data(), slot.data, respSize);
-
-        slot.header->state.store(SLOT_HOST_DONE, std::memory_order_release);
-        return true;
     }
 
-    void SendShutdown() {
-         std::vector<uint8_t> dummy;
-         for (int i = 0; i < (int)numSlots; i++) {
-             CallSlot(i, nullptr, 0, MSG_ID_SHUTDOWN, dummy);
-         }
-    }
-
-    void WaitForResponse(SlotContext& slot) {
-        // Must wait loop to handle spurious wakeups (stray signals)
+    void ReaderLoop(uint32_t laneIdx) {
+        Lane& lane = lanes[laneIdx];
         while (running) {
-            slot.header->hostState.store(HOST_STATE_WAITING, std::memory_order_seq_cst);
+            bool worked = false;
+            uint8_t* ptr = (uint8_t*)lane.slots;
+            for (uint32_t i = 0; i < lane.slotCount; ++i) {
+                SlotHeader* slot = (SlotHeader*)ptr;
+                if (slot->state.load(std::memory_order_acquire) == SLOT_RESP_READY) {
+                    // Process response
+                    std::vector<uint8_t> resp;
+                    uint32_t respLen = slot->respSize;
+                    if (respLen > 0) {
+                        if (respLen > slotDataSize) respLen = slotDataSize;
+                        uint8_t* dataPtr = ptr + sizeof(SlotHeader);
+                        resp.assign(dataPtr, dataPtr + respLen);
+                    }
 
-            // Double check to avoid race
-            if (slot.header->state.load(std::memory_order_acquire) == SLOT_RESP_READY) {
-                slot.header->hostState.store(HOST_STATE_ACTIVE, std::memory_order_relaxed);
-                return;
-            }
+                    uint32_t msgId = slot->msgId;
 
-            Platform::WaitEvent(slot.hRespEvent);
+                    slot->state.store(SLOT_FREE, std::memory_order_release);
+                    worked = true;
 
-            // We woke up. Check state again.
-            slot.header->hostState.store(HOST_STATE_ACTIVE, std::memory_order_relaxed);
-
-            if (slot.header->state.load(std::memory_order_acquire) == SLOT_RESP_READY) {
-                // We were forced to wait -> Increase target
-                int t = targetPollers.load(std::memory_order_relaxed);
-                if (t < (int)numSlots) targetPollers.fetch_add(1, std::memory_order_relaxed);
-                return;
-            }
-        }
-    }
-
-    bool CallSlot(int slotIdx, const uint8_t* reqData, size_t reqSize, uint32_t msgId, std::vector<uint8_t>& outResponse) {
-        SlotContext& slot = slots[slotIdx];
-        bool wasSleeping = false;
-
-        while (running) {
-             uint32_t s = slot.header->state.load(std::memory_order_relaxed);
-             if (s == SLOT_POLLING) {
-                 if (slot.header->state.compare_exchange_strong(s, SLOT_BUSY)) {
-                     wasSleeping = false;
-                     goto Found;
-                 }
-             } else if (s == SLOT_FREE) {
-                 if (slot.header->state.compare_exchange_strong(s, SLOT_BUSY)) {
-                     wasSleeping = true;
-                     goto Found;
-                 }
-             }
-             std::this_thread::yield();
-        }
-        return false;
-
-    Found:
-        if (reqData && reqSize > 0) memcpy(slot.data, reqData, reqSize);
-        slot.header->reqSize = (uint32_t)reqSize;
-        slot.header->msgId = msgId;
-
-        slot.header->state.store(SLOT_REQ_READY, std::memory_order_release);
-        if (wasSleeping) Platform::SignalEvent(slot.hEvent);
-
-        if (msgId == MSG_ID_SHUTDOWN) return true;
-
-         // Wait for Response (Adaptive) - Duplicated logic for CallSlot?
-         // Ideally refactor, but for now inline.
-        bool success = false;
-        bool canSpin = false;
-        int currentActive = activePollers.load(std::memory_order_relaxed);
-        int currentTarget = targetPollers.load(std::memory_order_relaxed);
-
-        if (currentActive < currentTarget) {
-            activePollers.fetch_add(1, std::memory_order_relaxed);
-            canSpin = true;
-        }
-
-        if (canSpin) {
-            int spins = 0;
-            const int SpinLimit = 100000;
-            while (running && spins < SpinLimit) {
-                uint32_t s = slot.header->state.load(std::memory_order_acquire);
-                if (s == SLOT_RESP_READY) {
-                    success = true;
-                    break;
+                    if (onMessage) {
+                        onMessage(std::move(resp), msgId);
+                    }
                 }
-                spins++;
-                if (spins % 100 == 0) std::atomic_thread_fence(std::memory_order_seq_cst);
+                ptr += perSlotTotal;
             }
-            activePollers.fetch_sub(1, std::memory_order_relaxed);
-
-            if (!success) {
-                int t = targetPollers.load(std::memory_order_relaxed);
-                if (t > 1) targetPollers.fetch_sub(1, std::memory_order_relaxed);
+            if (!worked) {
+                std::this_thread::yield();
             }
         }
-
-        if (!success) {
-            WaitForResponse(slot);
-            success = true;
-        }
-
-        if (!running) return false;
-
-        uint32_t respSize = slot.header->respSize;
-        if (respSize > slotSize) respSize = slotSize;
-        outResponse.resize(respSize);
-        memcpy(outResponse.data(), slot.data, respSize);
-
-        slot.header->state.store(SLOT_HOST_DONE, std::memory_order_release);
-        return true;
     }
 };
 

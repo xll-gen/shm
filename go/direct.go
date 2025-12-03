@@ -121,8 +121,68 @@ func NewDirectGuest(name string, numSlots int, slotSize int) (*DirectGuest, erro
 	return g, nil
 }
 
+// Implement Transport Interface
+
+func (g *DirectGuest) Send(data []byte) {
+	// Direct mode does not support arbitrary 'Send'.
+	// It only sends 'Response' to the current slot being processed.
+	// However, the unified 'Client' expects to call 'Send' with the response data
+	// AFTER the handler returns.
+	// But 'Start' calls the handler.
+	// In 'DirectGuest', the worker loop calls the handler and writes the response IMMEDIATELY to the slot.
+	// This means DirectGuest CANNOT implement generic 'Send' easily unless 'Start' manages the flow differently.
+
+	// FIX: The 'Client' implementation I wrote calls 'Start' with a wrapper handler that calls 'handler' then 'Send'.
+	// This works for Queue mode (read -> handle -> write).
+	// But for Direct mode, the 'workerLoop' handles the write step implicitly.
+	// Therefore, DirectGuest's 'Start' should take the 'handler' and do everything.
+	// BUT, 'Client' is trying to be generic.
+
+	// Solution: 'DirectGuest.Send' is a no-op or panic because DirectGuest.Start() handles the response writing internally?
+	// No, the 'handler' passed to Start returns void in Client's wrapper?
+	// Client.Start passes `func(data)` to Transport.Start.
+	// This function calls user handler, gets result, and calls Transport.Send(result).
+
+	// This flow breaks DirectGuest which expects handler to return []byte.
+
+	// Refactoring Client:
+	// Let Transport.Start take `func([]byte) []byte`?
+	// If Queue mode, it reads, calls handler, sends result.
+	// If Direct mode, it reads, calls handler, writes result to slot.
+	// This is much better for Direct mode efficiency too (no extra buffer copy/Send call).
+
+	// Let's change the plan for Client slightly.
+	// Transport.Start(handler func([]byte) []byte)
+}
+
+// Modified Start for Transport compliance (but we will change Transport definition in next step or assume it changed)
+// I will implement Start assuming it takes `func([]byte) []byte`.
+func (g *DirectGuest) Start(handler func([]byte)) {
+    // This signature assumes 'handler' does not return data.
+    // If Client is fixed to pass `func([]byte) []byte`, we are good.
+    // But Client.go currently passes `func([]byte)`.
+
+    // I need to update Client.go first? Or just fix it here.
+    // I'll update Client.go content in my head. No, I must overwrite it.
+    // Let's implement a 'Start' that matches the 'Transport' interface I defined in Client.go
+    // In Client.go: Start(func([]byte)). And Send([]byte).
+
+    // DirectGuest cannot work this way because it needs to know WHICH slot to write the response to.
+    // 'Send' doesn't know the context (slot index).
+
+    // Therefore, the Transport abstraction in Client.go is flawed for Direct Mode.
+    // It should be: Start(handler func([]byte) []byte).
+    // QueueGuest: Read -> result = handler(data) -> Send(result).
+    // DirectGuest: Read -> result = handler(data) -> WriteToSlot(result).
+
+    // I will rewrite Client.go and then DirectGuest.
+    panic("DirectGuest requires Start(func([]byte) []byte)")
+}
+
+
 // Start spawns workers. Each worker is pinned to a slot index.
-func (g *DirectGuest) Start(handler func([]byte) []byte) {
+// This is the "Real" start.
+func (g *DirectGuest) StartWithResponder(handler func([]byte) []byte) {
 	for i := 0; i < int(g.numSlots); i++ {
         g.wg.Add(1)
 		go g.workerLoop(i, handler)
@@ -132,6 +192,14 @@ func (g *DirectGuest) Start(handler func([]byte) []byte) {
 // Wait blocks until all workers have exited (via Shutdown message).
 func (g *DirectGuest) Wait() {
     g.wg.Wait()
+}
+
+func (g *DirectGuest) Close() {
+	CloseShm(g.handle, g.shmBase)
+	for _, s := range g.slots {
+		CloseEvent(s.event)
+		CloseEvent(s.respEvent)
+	}
 }
 
 func (g *DirectGuest) workerLoop(idx int, handler func([]byte) []byte) {
@@ -192,13 +260,11 @@ func (g *DirectGuest) workerLoop(idx int, handler func([]byte) []byte) {
 
 		if !found {
             // Robust Wait Loop: Keep waiting until State is ReqReady
-            // We use timeout to handle potential signal loss or races
             for {
                 s := atomic.LoadUint32(&header.State)
                 if s == SlotReqReady {
                     break
                 }
-                // Wait with timeout
                 WaitForEvent(slot.event, 100)
             }
 		} else {
@@ -240,13 +306,5 @@ func (g *DirectGuest) workerLoop(idx int, handler func([]byte) []byte) {
 		for atomic.LoadUint32(&header.State) != SlotHostDone {
 			runtime.Gosched()
 		}
-	}
-}
-
-func (g *DirectGuest) Close() {
-	CloseShm(g.handle, g.shmBase)
-	for _, s := range g.slots {
-		CloseEvent(s.event)
-		CloseEvent(s.respEvent)
 	}
 }
