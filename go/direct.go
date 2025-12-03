@@ -8,39 +8,46 @@ import (
 	"unsafe"
 )
 
-// SlotState constants matching C++
+// SlotState constants matching C++ definitions.
 const (
-	SlotFree      = 0
-	SlotPolling   = 1
-	SlotBusy      = 2
-	SlotReqReady  = 3
-	SlotRespReady = 4
-	SlotHostDone  = 5
+	SlotFree      = 0 // Slot is free for use.
+	SlotPolling   = 1 // Guest is polling this slot.
+	SlotBusy      = 2 // Host is writing to this slot.
+	SlotReqReady  = 3 // Request is ready for Guest.
+	SlotRespReady = 4 // Response is ready for Host.
+	SlotHostDone  = 5 // Host has read response.
 )
 
-// SlotHeader matching C++
+// SlotHeader defines the layout of a slot in shared memory.
+// It matches the C++ SlotHeader struct with explicit padding for cache line alignment.
 type SlotHeader struct {
-    _         [64]byte // Pre-padding
-	State     uint32
-	ReqSize   uint32
-	RespSize  uint32
-	MsgId     uint32
-	HostState uint32   // Atomic
-	_         [44]byte // Padding
+    _         [64]byte // Pre-padding to avoid false sharing
+	State     uint32   // Atomic state
+	ReqSize   uint32   // Size of request data
+	RespSize  uint32   // Size of response data
+	MsgId     uint32   // Message ID
+	HostState uint32   // Atomic Host State (0=Active, 1=Waiting)
+	_         [44]byte // Padding to 128 bytes
 }
 
+// HostState constants.
 const (
 	HostStateActive  = 0
 	HostStateWaiting = 1
 )
 
-// ExchangeHeader matching C++
+// ExchangeHeader describes the layout of the direct exchange region.
+// (Legacy/Reserved)
 type ExchangeHeader struct {
 	NumSlots uint32
 	SlotSize uint32
 	_        [56]byte // Padding
 }
 
+// DirectGuest implements the Guest side of the Direct IPC mode.
+//
+// It manages a set of workers, each pinned to a specific slot index ("Lane").
+// This mode provides the lowest latency by eliminating queue overhead.
 type DirectGuest struct {
 	shmBase  uintptr
 	shmSize  uint64
@@ -51,17 +58,28 @@ type DirectGuest struct {
 	slots []slotContext
 	wg    sync.WaitGroup
 
-	targetPollers int32 // atomic
-	activePollers int32 // atomic
+	targetPollers int32 // atomic: Desired number of active spinning pollers
+	activePollers int32 // atomic: Current number of active spinning pollers
 }
 
+// slotContext holds runtime data for a single slot/lane.
 type slotContext struct {
 	header    *SlotHeader
 	data      []byte
-	event     EventHandle // Req Event
-	respEvent EventHandle // Resp Event
+	event     EventHandle // Event to wake Guest (ReqReady)
+	respEvent EventHandle // Event to wake Host (RespReady)
 }
 
+// NewDirectGuest creates a new Direct IPC Guest.
+//
+// Parameters:
+//   - name: Shared memory name.
+//   - numSlots: Number of slots/lanes to support.
+//   - slotSize: Size of data buffer per slot.
+//
+// Returns:
+//   - *DirectGuest: The instance.
+//   - error: If SHM or Events cannot be opened.
 func NewDirectGuest(name string, numSlots int, slotSize int) (*DirectGuest, error) {
 	// Calculate size
 	headerSize := uint64(unsafe.Sizeof(ExchangeHeader{}))
@@ -78,8 +96,8 @@ func NewDirectGuest(name string, numSlots int, slotSize int) (*DirectGuest, erro
 		return nil, err
 	}
 
-	// Initialize target pollers to max(1, NumCPU/4)
-    target := int32(1) // Force 1 for container safety
+	// Initialize target pollers to 1 (container safe default)
+    target := int32(1)
 	if target < 1 {
 		target = 1
 	}
@@ -121,41 +139,18 @@ func NewDirectGuest(name string, numSlots int, slotSize int) (*DirectGuest, erro
 	return g, nil
 }
 
-// Implement Transport Interface
-
+// Send is not supported in DirectGuest in the traditional sense.
+// Responses are sent implicitly by the worker loop.
 func (g *DirectGuest) Send(data []byte) {
-	// Direct mode does not support arbitrary 'Send'.
-	// It only sends 'Response' to the current slot being processed.
-	// However, the unified 'Client' expects to call 'Send' with the response data
-	// AFTER the handler returns.
-	// But 'Start' calls the handler.
-	// In 'DirectGuest', the worker loop calls the handler and writes the response IMMEDIATELY to the slot.
-	// This means DirectGuest CANNOT implement generic 'Send' easily unless 'Start' manages the flow differently.
-
-	// FIX: The 'Client' implementation I wrote calls 'Start' with a wrapper handler that calls 'handler' then 'Send'.
-	// This works for Queue mode (read -> handle -> write).
-	// But for Direct mode, the 'workerLoop' handles the write step implicitly.
-	// Therefore, DirectGuest's 'Start' should take the 'handler' and do everything.
-	// BUT, 'Client' is trying to be generic.
-
-	// Solution: 'DirectGuest.Send' is a no-op or panic because DirectGuest.Start() handles the response writing internally?
-	// No, the 'handler' passed to Start returns void in Client's wrapper?
-	// Client.Start passes `func(data)` to Transport.Start.
-	// This function calls user handler, gets result, and calls Transport.Send(result).
-
-	// This flow breaks DirectGuest which expects handler to return []byte.
-
-	// Refactoring Client:
-	// Let Transport.Start take `func([]byte) []byte`?
-	// If Queue mode, it reads, calls handler, sends result.
-	// If Direct mode, it reads, calls handler, writes result to slot.
-	// This is much better for Direct mode efficiency too (no extra buffer copy/Send call).
-
-	// Let's change the plan for Client slightly.
-	// Transport.Start(handler func([]byte) []byte)
+	// No-op. Logic is handled in workerLoop.
 }
 
-// Start spawns workers. Each worker is pinned to a slot index.
+// Start launches worker goroutines for each slot.
+//
+// Each worker listens for requests on its assigned slot and invokes the handler.
+//
+// Parameters:
+//   - handler: Function to process requests.
 func (g *DirectGuest) Start(handler func([]byte) []byte) {
 	for i := 0; i < int(g.numSlots); i++ {
         g.wg.Add(1)
@@ -163,16 +158,17 @@ func (g *DirectGuest) Start(handler func([]byte) []byte) {
 	}
 }
 
-// StartWithResponder is an alias for Start
+// StartWithResponder is an alias for Start.
 func (g *DirectGuest) StartWithResponder(handler func([]byte) []byte) {
     g.Start(handler)
 }
 
-// Wait blocks until all workers have exited (via Shutdown message).
+// Wait blocks until all workers have finished (received Shutdown).
 func (g *DirectGuest) Wait() {
     g.wg.Wait()
 }
 
+// Close releases shared memory and event handles.
 func (g *DirectGuest) Close() {
 	CloseShm(g.handle, g.shmBase)
 	for _, s := range g.slots {
@@ -181,6 +177,13 @@ func (g *DirectGuest) Close() {
 	}
 }
 
+// workerLoop is the main loop for a single lane.
+//
+// It implements an adaptive spin/wait strategy:
+// 1. Attempts to enter "Polling" state via CAS.
+// 2. If successful, spins for a while checking for requests.
+// 3. If no request arrives, reverts to "Free" and waits on the Event.
+// 4. Processes request, writes response, and signals Host.
 func (g *DirectGuest) workerLoop(idx int, handler func([]byte) []byte) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
@@ -210,7 +213,7 @@ func (g *DirectGuest) workerLoop(idx int, handler func([]byte) []byte) {
 			// Check if already ReqReady before setting Polling
 			// Using CAS from SlotFree to SlotPolling
 			if !atomic.CompareAndSwapUint32(&header.State, SlotFree, SlotPolling) {
-				// Failed CAS
+				// Failed CAS: Check if it was because data arrived
 				s := atomic.LoadUint32(&header.State)
 				if s == SlotReqReady {
 					found = true
@@ -293,7 +296,10 @@ func (g *DirectGuest) workerLoop(idx int, handler func([]byte) []byte) {
 		}
 
 		// 5. Wait for Host Done
-		for atomic.LoadUint32(&header.State) != SlotHostDone {
+		// Host sets state to SlotHostDone (or Free) when it reads the response.
+		// Actually Host sets it to Free.
+		// Wait until state != SlotRespReady
+		for atomic.LoadUint32(&header.State) == SlotRespReady {
 			runtime.Gosched()
 		}
 	}

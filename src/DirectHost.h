@@ -12,6 +12,18 @@
 
 namespace shm {
 
+/**
+ * @brief Host implementation for Direct IPC Mode.
+ *
+ * Manages a set of "Lanes" (Slots), each corresponding to a dedicated worker thread.
+ * Ideal for request-response patterns requiring low latency (1:1 thread mapping).
+ *
+ * Architecture:
+ * - Creates 'N' slots in shared memory.
+ * - Each slot has a Request Event (Host->Guest) and a Response Event (Guest->Host is implied via State, but Host has no event).
+ * - Actually, the `hReqEvent` signals the Guest worker.
+ * - The Host spins/yields on `SlotState::SLOT_RESP_READY`.
+ */
 class DirectHost {
     void* shmBase;
     std::string shmName;
@@ -19,16 +31,19 @@ class DirectHost {
     ShmHandle hMapFile;
     bool running;
 
+    /**
+     * @brief Internal Lane structure managing a single worker's slot.
+     */
     struct Lane {
-        SlotHeader* slots;
-        uint32_t slotCount;
-        EventHandle hReqEvent;
+        SlotHeader* slots;    ///< Pointer to the slot array in SHM.
+        uint32_t slotCount;   ///< Number of slots assigned to this lane (usually 1 or chunk).
+        EventHandle hReqEvent;///< Event to signal the Guest worker for this lane.
     };
 
     std::vector<Lane> lanes;
     std::atomic<uint32_t> nextLane{0};
 
-    // Reader threads (one per lane)
+    // Reader threads (one per lane) to poll for responses
     std::vector<std::thread> readerThreads;
 
     std::function<void(std::vector<uint8_t>&&, uint32_t)> onMessage;
@@ -38,17 +53,39 @@ class DirectHost {
     size_t perSlotTotal;
 
 public:
+    /**
+     * @brief Constructs a DirectHost instance.
+     */
     DirectHost() : shmBase(nullptr), hMapFile(0), running(false) {}
+
+    /**
+     * @brief Destructor. Ensures clean shutdown.
+     */
     ~DirectHost() { Shutdown(); }
 
+    /**
+     * @brief Initializes the Direct Host.
+     *
+     * Creates shared memory and events, and starts reader threads.
+     *
+     * @param shmName Name of the shared memory region.
+     * @param numQueues Number of independent lanes/workers to support.
+     * @param msgHandler Callback function for received messages.
+     * @return true if initialization succeeded, false otherwise.
+     */
     bool Init(const std::string& shmName, uint32_t numQueues,
               std::function<void(std::vector<uint8_t>&&, uint32_t)> msgHandler) {
         this->shmName = shmName;
         this->numQueues = numQueues;
         this->onMessage = msgHandler;
 
-        uint32_t slotsPerLane = 1024;
-        this->slotDataSize = 1024 * 1024; // 1MB
+        uint32_t slotsPerLane = 1024; // Actually, code treats this as capacity PER LANE?
+        // Wait, the logic below: `laneSize = slotsPerLane * perSlotTotal`.
+        // And `lanes[i].slots` points to start of that block.
+        // But `SendToLane` iterates `lane.slotCount`.
+        // So this supports multiple slots per lane (async pipelining on one thread).
+
+        this->slotDataSize = 1024 * 1024; // 1MB per slot
         this->perSlotTotal = sizeof(SlotHeader) + slotDataSize;
 
         size_t laneSize = slotsPerLane * perSlotTotal;
@@ -92,6 +129,9 @@ public:
         return true;
     }
 
+    /**
+     * @brief Shuts down the host, stops threads, and releases resources.
+     */
     void Shutdown() {
         if (!running) return;
         running = false;
@@ -106,7 +146,14 @@ public:
         }
     }
 
-    // Returns true if sent
+    /**
+     * @brief Sends data via a free slot in a round-robin lane.
+     *
+     * @param data Pointer to data.
+     * @param size Size of data.
+     * @param msgId Message ID.
+     * @return true if sent, false if no slots available (after retries).
+     */
     bool Send(const uint8_t* data, uint32_t size, uint32_t msgId) {
         // Round robin
         uint32_t laneIdx = nextLane++ % numQueues;
@@ -116,6 +163,9 @@ public:
     }
 
 private:
+    /**
+     * @brief Attempts to find a free slot in the specific lane and write data.
+     */
     bool SendToLane(Lane& lane, const uint8_t* data, uint32_t size, uint32_t msgId) {
         // Find a free slot
         for (int retry=0; retry<3; retry++) {
@@ -146,6 +196,9 @@ private:
         return false;
     }
 
+    /**
+     * @brief Background loop for reading responses from a specific lane.
+     */
     void ReaderLoop(uint32_t laneIdx) {
         Lane& lane = lanes[laneIdx];
         while (running) {

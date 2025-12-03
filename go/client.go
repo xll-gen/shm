@@ -5,55 +5,75 @@ import (
 	"time"
 )
 
+// Mode represents the IPC operating mode.
 type Mode int
 
 const (
+	// ModeQueue uses SPSC Ring Buffers for streaming data.
 	ModeQueue Mode = iota
+	// ModeDirect uses fixed slots for low-latency request-response.
 	ModeDirect
 )
 
-// Client is the high-level API for Guest.
-// It wraps a Transport (Queue or Direct) and handles connection retries.
+// Client is the high-level API for the Guest (Go).
+//
+// It wraps the underlying transport (Queue or Direct) and handles
+// connection initialization and retries.
+//
+// Usage:
+//
+//	client, _ := shm.Connect("MyIPC", shm.ModeDirect)
+//	client.Handle(func(req []byte) []byte {
+//	    return process(req)
+//	})
+//	client.Start()
+//	client.Wait()
 type Client struct {
 	transport Transport
 	handler   func([]byte) []byte
 }
 
 // Transport interface defines the contract for IPC mechanisms.
+//
+// It abstracts the differences between Queue and Direct modes.
 type Transport interface {
+	// Start begins the worker loop, processing requests using the provided handler.
 	Start(func([]byte) []byte)
+
+	// Close cleans up resources (Shared Memory, Events).
 	Close()
+
+	// Wait blocks until the transport is shut down (e.g., via Shutdown message).
 	Wait()
 }
 
-// Connect creates a connection to the Host.
-// It automatically retries until connection is established.
+// Connect establishes a connection to the Host.
+//
+// It automatically retries for up to 5 seconds if the Host has not yet
+// created the shared memory region.
+//
+// Parameters:
+//   - name: The unique name of the IPC channel (must match Host).
+//   - mode: The operating mode (Queue or Direct).
+//
+// Returns:
+//   - *Client: A new Client instance.
+//   - error: Error if connection fails after retries.
 func Connect(name string, mode Mode) (*Client, error) {
 	var t Transport
 	var err error
 
-	// Retry loop
+	// Retry loop to handle race condition where Host is starting up
 	for i := 0; i < 50; i++ {
 		if mode == ModeDirect {
 			// Direct Mode
-            // We need to guess or know the params.
-            // In benchmark, we use -w for threads. Host uses same count.
-            // But NewDirectGuest needs numSlots.
-            // Client.Connect signature doesn't take numSlots.
-            // We'll assume a default or we need to change Connect signature?
-            // For now, let's assume the user of Connect (Benchmark) might need to use NewDirectGuest directly if they want custom slots.
-            // BUT, the existing code had defaults "4, 1MB".
-            // Let's stick to that for now, or better:
-            // The Host creates the SHM. Guest just opens it.
-            // Actually, Guest needs to know numSlots to Open events (slot_0, slot_1).
-            // This is a limitation of the current Connect API.
-            // We will use 4 slots as a fallback if not specified,
-            // but the benchmark passes -w.
-            // The previous client.go had "4". Let's use 64 to be safe?
-            // Or just 16.
+            // Defaults: 16 slots, 1MB per slot.
+            // Ideally should match Host config, but this is safe for now as long as
+            // Host uses <= 16 slots.
 			t, err = NewDirectGuest(name, 16, 1024*1024)
 		} else {
 			// Queue Mode
+			// Defaults: 32MB Queue Size.
 			qTotalSize := uint64(QueueHeaderSize + 32*1024*1024)
 			totalSize := uint64(qTotalSize * 2)
 
@@ -69,7 +89,7 @@ func Connect(name string, mode Mode) (*Client, error) {
 
 					if toQ.Header.Capacity > 0 {
 						t = NewIPCGuest(toQ, fromQ)
-                        _ = hMap
+                        _ = hMap // Keep handle alive if needed by GC, though not strictly used here
 					} else {
 						err = fmt.Errorf("queue not initialized")
 					}
@@ -87,23 +107,35 @@ func Connect(name string, mode Mode) (*Client, error) {
 	return nil, fmt.Errorf("failed to connect after retries: %v", err)
 }
 
+// Handle registers the callback function for processing requests.
+//
+// The handler receives the raw request payload and must return a response payload.
+//
+// Parameters:
+//   - h: The function to handle requests.
 func (c *Client) Handle(h func([]byte) []byte) {
 	c.handler = h
 }
 
-
+// Start begins the processing loop.
+//
+// It spawns background goroutines to handle incoming requests.
+// Panics if no handler has been set.
 func (c *Client) Start() {
 	if c.handler == nil {
 		panic("Handler not set")
 	}
-    // Pass the handler directly. No extra headers.
 	c.transport.Start(c.handler)
 }
 
+// Wait blocks the current goroutine until the Client shuts down.
+//
+// Shutdown is usually triggered by the Host sending a Shutdown signal.
 func (c *Client) Wait() {
 	c.transport.Wait()
 }
 
+// Close releases all underlying resources.
 func (c *Client) Close() {
 	c.transport.Close()
 }

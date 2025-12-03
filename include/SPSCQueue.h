@@ -15,22 +15,55 @@
 
 namespace shm {
 
+/**
+ * @brief Single Producer Single Consumer (SPSC) Shared Memory Queue.
+ *
+ * Implements a lock-free ring buffer in shared memory.
+ * Uses atomic head/tail pointers and magic numbers for synchronization.
+ * Supports "Signal-If-Waiting" to minimize syscalls when the consumer is active.
+ */
 class SPSCQueue {
 public:
+    /** @brief Pointer to the queue header in shared memory. */
     QueueHeader* header;
-    uint8_t* buffer;
-    EventHandle hEvent; // Signaled when data is written (for Consumer)
 
+    /** @brief Pointer to the data buffer area in shared memory. */
+    uint8_t* buffer;
+
+    /** @brief Event handle used to signal the consumer when data is written. */
+    EventHandle hEvent;
+
+    /**
+     * @brief Constructs an SPSCQueue wrapper around an existing shared memory region.
+     *
+     * @param shmBase Pointer to the base of the shared memory region.
+     * @param capacity Capacity of the queue in bytes.
+     * @param eventHandle Handle to the synchronization event (Semaphore/Event).
+     */
     SPSCQueue(void* shmBase, uint64_t capacity, EventHandle eventHandle)
         : hEvent(eventHandle) {
         header = reinterpret_cast<QueueHeader*>(shmBase);
         buffer = reinterpret_cast<uint8_t*>(header) + sizeof(QueueHeader);
     }
 
+    /**
+     * @brief Calculates the total shared memory size required for a given capacity.
+     *
+     * @param capacity Desired data capacity in bytes.
+     * @return Total size including the QueueHeader.
+     */
     static size_t GetRequiredSize(uint64_t capacity) {
         return sizeof(QueueHeader) + capacity;
     }
 
+    /**
+     * @brief Initializes a new shared memory region as an SPSC Queue.
+     *
+     * Sets up the QueueHeader with initial values.
+     *
+     * @param shmBase Pointer to the base of the shared memory region.
+     * @param capacity Capacity of the queue in bytes.
+     */
     static void Init(void* shmBase, uint64_t capacity) {
         QueueHeader* h = new (shmBase) QueueHeader();
         h->writePos = 0;
@@ -39,8 +72,15 @@ public:
         h->consumerActive = 0; // Default to Waiting (0)
     }
 
-    // Producer: Enqueue data
-    // Blocks/Spins if full.
+    /**
+     * @brief Enqueues a single message into the queue.
+     *
+     * Blocks (spins/yields) if the queue is full.
+     *
+     * @param data Pointer to the data to enqueue.
+     * @param size Size of the data in bytes.
+     * @param msgId Optional message ID (default 0).
+     */
     void Enqueue(const void* data, uint32_t size, uint32_t msgId = 0) {
         uint32_t alignedSize = (size + 7) & ~7;
         uint32_t totalSize = alignedSize + BLOCK_HEADER_SIZE;
@@ -104,7 +144,13 @@ public:
         }
     }
 
-    // Producer: Enqueue Batch
+    /**
+     * @brief Enqueues a batch of messages into the queue.
+     *
+     * Efficiently writes multiple messages, reducing synchronization overhead.
+     *
+     * @param msgs Vector of byte vectors to enqueue.
+     */
     void EnqueueBatch(const std::vector<std::vector<uint8_t>>& msgs) {
         if (msgs.empty()) return;
 
@@ -189,10 +235,15 @@ public:
         }
     }
 
-    // Consumer: Dequeue data
-    // Blocks if empty.
-    // Returns msgId.
-    // If running is provided and becomes false, returns 0xFFFFFFFF.
+    /**
+     * @brief Dequeues a single message from the queue.
+     *
+     * Blocks if the queue is empty. Uses an adaptive strategy (spin -> yield -> sleep).
+     *
+     * @param outBuffer Vector to be populated with the message data. Resized automatically.
+     * @param running Optional atomic boolean pointer. If provided and becomes false, the wait is aborted.
+     * @return The Message ID of the dequeued item, or 0xFFFFFFFF if aborted/shutdown.
+     */
     uint32_t Dequeue(std::vector<uint8_t>& outBuffer, std::atomic<bool>* running = nullptr) {
         // Set Active = 1 when running
         header->consumerActive.store(1, std::memory_order_relaxed);
@@ -269,7 +320,14 @@ public:
         }
     }
 
-    // Consumer: Dequeue Batch
+    /**
+     * @brief Dequeues a batch of messages.
+     *
+     * Reads up to `maxCount` messages into `outMsgs`.
+     *
+     * @param outMsgs Vector of vectors to be populated with messages.
+     * @param maxCount Maximum number of messages to dequeue.
+     */
     void DequeueBatch(std::vector<std::vector<uint8_t>>& outMsgs, size_t maxCount) {
         if (maxCount == 0) return;
 

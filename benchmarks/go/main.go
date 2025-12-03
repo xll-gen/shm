@@ -19,6 +19,9 @@ const (
 	RespSize = 16
 )
 
+// main entry point for the Benchmark Guest.
+//
+// Accepts flags for worker count (-w) and mode (-mode).
 func main() {
 	workers := flag.Int("w", 1, "Number of worker threads")
 	mode := flag.String("mode", "spsc", "Queue mode: spsc, mpsc, or direct")
@@ -53,7 +56,9 @@ func main() {
 	}
 	fmt.Println("[Go] Connected.")
 
-	// Handler - using simple byte slice handler now
+	// Register Handler
+	// The handler expects: [TransportHeader (8b)] + [Request (24b)]
+	// It returns: [TransportHeader (8b)] + [Response (16b)]
 	client.Handle(func(reqData []byte) []byte {
 		// Expect TransportHeader (8 bytes) + ReqSize
 		if len(reqData) != 8+ReqSize {
@@ -85,10 +90,10 @@ func main() {
 		return respData
 	})
 
-	// Start (Blocking)
+	// Start (Non-blocking usually, but client.Start might span goroutines)
 	go client.Start()
 
-	// Wait
+	// Wait for Shutdown signal
 	client.Wait()
 	fmt.Println("[Go] Received Shutdown. Exiting...")
 	client.Close()

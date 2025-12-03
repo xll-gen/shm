@@ -55,6 +55,7 @@ import (
 	"unsafe"
 )
 
+// createEvent implementation for Linux (Named Semaphores).
 func createEvent(name string) (EventHandle, error) {
 	cName := C.CString("/" + name)
 	defer C.free(unsafe.Pointer(cName))
@@ -66,6 +67,7 @@ func createEvent(name string) (EventHandle, error) {
 	return EventHandle(unsafe.Pointer(sem)), nil
 }
 
+// openEvent implementation for Linux.
 func openEvent(name string) (EventHandle, error) {
     cName := C.CString("/" + name)
     defer C.free(unsafe.Pointer(cName))
@@ -77,18 +79,22 @@ func openEvent(name string) (EventHandle, error) {
     return EventHandle(unsafe.Pointer(sem)), nil
 }
 
+// signalEvent implementation for Linux (sem_post).
 func signalEvent(h EventHandle) {
 	C.sem_post((*C.sem_t)(unsafe.Pointer(h)))
 }
 
+// waitForEvent implementation for Linux (sem_timedwait).
 func waitForEvent(h EventHandle, timeoutMs uint32) {
 	C.wait_sem((*C.sem_t)(unsafe.Pointer(h)), C.int(timeoutMs))
 }
 
+// closeEvent implementation for Linux (sem_close).
 func closeEvent(h EventHandle) {
 	C.sem_close((*C.sem_t)(unsafe.Pointer(h)))
 }
 
+// createShm implementation for Linux (shm_open + ftruncate + mmap).
 func createShm(name string, size uint64) (ShmHandle, uintptr, error) {
 	cName := C.CString("/" + name)
 	defer C.free(unsafe.Pointer(cName))
@@ -112,6 +118,7 @@ func createShm(name string, size uint64) (ShmHandle, uintptr, error) {
 	return ShmHandle(uintptr(fd)), uintptr(addr), nil
 }
 
+// openShm implementation for Linux.
 func openShm(name string, size uint64) (ShmHandle, uintptr, error) {
     cName := C.CString("/" + name)
     defer C.free(unsafe.Pointer(cName))
@@ -137,6 +144,7 @@ func openShm(name string, size uint64) (ShmHandle, uintptr, error) {
     return ShmHandle(uintptr(fd)), uintptr(addr), nil
 }
 
+// closeShm implementation for Linux.
 func closeShm(h ShmHandle, addr uintptr) {
 	// Note: We need size to unmap correctly in C, but for now we skip unmap or assume caller handles cleanup.
 	// In a real robust lib, we'd store size.

@@ -7,6 +7,7 @@ import (
 	"unsafe"
 )
 
+// Magic constants for block verification.
 const (
 	BlockMagicData  = 0xAB12CD34
 	BlockMagicPad   = 0xAB12CD35
@@ -14,31 +15,35 @@ const (
 	QueueHeaderSize = 128
 )
 
-// Corresponds to the C++ layout in include/IPCUtils.h
-// struct QueueHeader {
-//     std::atomic<uint64_t> writePos;     // 8 bytes
-//     std::atomic<uint64_t> readPos;      // 8 bytes
-//     std::atomic<uint64_t> capacity;     // 8 bytes
-//     std::atomic<uint32_t> consumerActive; // 4 bytes (0=Sleeping, 1=Active)
-//     uint32_t _pad1;                     // 4 bytes
-//     uint8_t _pad2[96];                  // Padding to 128 bytes
-// };
+// QueueHeader represents the control structure at the start of the shared memory queue.
+//
+// It matches the C++ `QueueHeader` struct, including specific padding to ensure
+// cache line alignment and prevent false sharing between Reader and Writer.
 type QueueHeader struct {
-	WritePos        uint64   // 8 bytes
-	_pad1           [56]byte // 56 bytes
-	ReadPos         uint64   // 8 bytes
-	Capacity        uint64   // 8 bytes
-	ConsumerActive  uint32   // 4 bytes
-	_pad2           [44]byte // 44 bytes
+	WritePos        uint64   // 8 bytes: Current write index.
+	_pad1           [56]byte // 56 bytes: Padding.
+	ReadPos         uint64   // 8 bytes: Current read index.
+	Capacity        uint64   // 8 bytes: Queue capacity.
+	ConsumerActive  uint32   // 4 bytes: 1 = Active/Polling, 0 = Waiting/Sleeping.
+	_pad2           [44]byte // 44 bytes: Padding to 128 bytes.
 }
 
+// SPSCQueue is a Single-Producer Single-Consumer lock-free ring buffer.
+//
+// It operates over a shared memory region defined by Header and Buffer.
 type SPSCQueue struct {
 	Header *QueueHeader
 	Buffer []byte
-	Event  EventHandle
-	Pool   *sync.Pool
+	Event  EventHandle // Event to signal the Consumer.
+	Pool   *sync.Pool  // Pool for reusing byte slices.
 }
 
+// NewSPSCQueue initializes an SPSCQueue from a shared memory address.
+//
+// Parameters:
+//   - shmBase: Pointer to the start of shared memory.
+//   - capacity: Size of the data buffer (excluding header).
+//   - event: Handle to the synchronization event.
 func NewSPSCQueue(shmBase uintptr, capacity uint64, event EventHandle) *SPSCQueue {
 	return &SPSCQueue{
 		Header: (*QueueHeader)(unsafe.Pointer(shmBase)),
@@ -63,7 +68,9 @@ func (q *SPSCQueue) Recycle(msgs []*[]byte) {
 	}
 }
 
-// Enqueue blocks if full.
+// Enqueue writes a single message to the queue.
+//
+// It blocks (spins/yields) if the queue is full.
 func (q *SPSCQueue) Enqueue(data []byte, msgId uint32) {
 	// Align total size to 8 bytes
 	alignedSize := (len(data) + 7) & ^7
@@ -122,6 +129,7 @@ func (q *SPSCQueue) Enqueue(data []byte, msgId uint32) {
 		atomic.StoreUint64(&q.Header.WritePos, wPos+totalSize)
 
 		// Barrier: StoreLoad
+		// Check if consumer is waiting (0) before signaling
 		if atomic.AddUint32(&q.Header.ConsumerActive, 0) == 0 {
 			SignalEvent(q.Event)
 		}
@@ -129,7 +137,8 @@ func (q *SPSCQueue) Enqueue(data []byte, msgId uint32) {
 	}
 }
 
-// EnqueueBatch writes multiple messages.
+// EnqueueBatch writes multiple messages efficiently.
+//
 // Assumes MsgId = 0 (Normal).
 func (q *SPSCQueue) EnqueueBatch(msgs [][]byte) {
 	if len(msgs) == 0 {
@@ -213,10 +222,12 @@ func (q *SPSCQueue) EnqueueBatch(msgs [][]byte) {
 	}
 }
 
-// Dequeue blocks if empty
-// Returns (data, msgId)
+// Dequeue reads a single message from the queue.
+//
+// Blocks if the queue is empty.
+// Returns the data payload and message ID.
 func (q *SPSCQueue) Dequeue() ([]byte, uint32) {
-	// Active = 1
+	// Mark Active = 1
 	atomic.StoreUint32(&q.Header.ConsumerActive, 1)
 	spinCount := 0
 	for {
@@ -228,18 +239,22 @@ func (q *SPSCQueue) Dequeue() ([]byte, uint32) {
 				spinCount++
 				continue
 			}
-			// Waiting = 0
+			// Mark Waiting = 0
 			atomic.StoreUint32(&q.Header.ConsumerActive, 0)
 
-			// Barrier
+			// Barrier: StoreLoad
 			atomic.AddUint32(&q.Header.ConsumerActive, 0)
 
+			// Double check if data arrived while switching state
 			if atomic.LoadUint64(&q.Header.ReadPos) != atomic.LoadUint64(&q.Header.WritePos) {
 				atomic.StoreUint32(&q.Header.ConsumerActive, 1)
 				continue
 			}
 
+			// Sleep
 			WaitForEvent(q.Event, 100)
+
+			// Wake up
 			atomic.StoreUint32(&q.Header.ConsumerActive, 1)
 			spinCount = 0
 			continue
@@ -282,7 +297,10 @@ func (q *SPSCQueue) Dequeue() ([]byte, uint32) {
 }
 
 // DequeueBatch reads multiple messages using pooled buffers.
-// Only returns data. Ignores msgId (assumes normal data).
+//
+// Useful for high-throughput batch processing.
+// Returns a slice of pointers to byte slices (from the internal pool).
+// Caller should return them via Recycle().
 func (q *SPSCQueue) DequeueBatch(maxCount int) []*[]byte {
 	if maxCount == 0 {
 		return nil

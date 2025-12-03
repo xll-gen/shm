@@ -9,18 +9,20 @@ SimpleIPC is a high-performance, low-latency shared-memory IPC library connectin
     *   **Queue Mode:** Lock-free SPSC ring buffers for high-throughput streaming.
     *   **Direct Mode:** Slot-based atomic CAS operations with adaptive spinning for sub-microsecond latency (1:1 thread mapping).
 *   **Protocol Agnostic:** Transmits raw bytes. A minimal 8-byte `TransportHeader` allows for async request/response matching.
-*   **Cross-Language:** seamless integration between C++ and Go.
+*   **Cross-Language:** Seamless integration between C++ and Go.
+*   **Cross-Platform:** Supports Linux (shm_open/named semaphores) and Windows (File Mapping/Events).
 
 ## Architecture
 
 ### Modes
 1.  **Queue Mode (`IPCMode::Queue` / `shm.ModeQueue`)**
     *   Uses two SPSC (Single Producer Single Consumer) ring buffers in shared memory (Request & Response).
-    *   Ideal for streaming data or scenarios with variable message sizes.
+    *   Optimized for high throughput and variable message sizes.
+    *   Uses "Signal-If-Waiting" optimization to reduce system calls.
 
 2.  **Direct Mode (`IPCMode::Direct` / `shm.ModeDirect`)**
-    *   Uses a fixed set of "Slots" in shared memory.
-    *   Each slot corresponds to a worker thread ("Lane").
+    *   Uses a fixed set of "Slots" in shared memory (Lanes).
+    *   Each slot corresponds to a worker thread.
     *   Uses atomic state transitions (`Free` -> `Busy` -> `RespReady`) instead of queues.
     *   Ideal for request-response patterns where latency is critical.
 
@@ -34,7 +36,7 @@ The library operates on two layers:
 2.  **Facade Layer (`IPCHost` / `IPCGuest`):**
     *   When using the `IPCHost` C++ class and `IPCGuest` Go struct, a **Transport Header** (8 bytes) is prepended to the payload.
     *   **Header:** `uint64_t req_id`.
-    *   This ID is used to match asynchronous responses to their original requests.
+    *   This ID is used to match asynchronous responses to their original requests (Promises/Futures).
     *   **Important:** The Guest (Go) must preserve this 8-byte header when sending a response.
 
 ## C++ Host Usage
@@ -43,6 +45,8 @@ The `IPCHost` class acts as a facade, handling mode selection and request matchi
 
 ```cpp
 #include "IPCHost.h"
+#include <vector>
+#include <iostream>
 
 int main() {
     shm::IPCHost host;
@@ -54,7 +58,10 @@ int main() {
     // Mode: Direct (4 Worker Lanes)
     bool success = host.Init("MyIPC", shm::IPCMode::Direct, 4);
 
-    if (!success) return -1;
+    if (!success) {
+        std::cerr << "Failed to initialize IPC" << std::endl;
+        return -1;
+    }
 
     // 2. Call Guest
     // User Payload: { 0x01, 0x02 }
@@ -65,6 +72,7 @@ int main() {
     // Call blocks until response is received or timeout (implicit)
     if (host.Call(req.data(), req.size(), resp)) {
         // resp contains only User Payload (header is stripped)
+        std::cout << "Received response of size: " << resp.size() << std::endl;
     }
 
     // 3. Cleanup
@@ -85,6 +93,7 @@ package main
 
 import (
     "encoding/binary"
+    "fmt"
     "github.com/xll-gen/shm/go"
 )
 
@@ -95,6 +104,7 @@ func main() {
     if err != nil {
         panic(err)
     }
+    defer client.Close()
 
     // 2. Register Handler
     client.Handle(func(req []byte) []byte {
@@ -125,7 +135,11 @@ func main() {
 
     // 4. Wait for Shutdown Signal from Host
     client.Wait()
-    client.Close()
+    fmt.Println("Shutting down...")
+}
+
+func process(data []byte) []byte {
+    return data // Echo
 }
 ```
 
@@ -145,12 +159,14 @@ cd benchmarks/go
 go build -o guest
 cd ../..
 
-# 3. Run Benchmark (e.g., Direct Mode, 4 Threads)
-# This script usually handles starting both Host and Guest
-task run:benchmark
+# 3. Run Benchmark
+# Ensure both 'shm_benchmark' (C++) and 'guest' (Go) are built.
+# You typically run the Host, which waits for the Guest.
+# Or use the Taskfile if available.
 ```
 
 ## Requirements
 *   **Linux:** Kernel 4.x+ (supports `memfd_create` or `/dev/shm`), `pthread`.
+*   **Windows:** Windows 10/Server 2016+ (Named Events, File Mapping).
 *   **Compiler:** GCC 8+ or Clang 10+ (C++17 support).
 *   **Go:** 1.18+ (Generics support).

@@ -12,6 +12,14 @@
 
 namespace shm {
 
+/**
+ * @brief Host implementation for Queue IPC Mode.
+ *
+ * Uses two shared memory ring buffers (SPSC Queues): one for sending requests,
+ * and one for receiving responses.
+ *
+ * @tparam QueueT The queue implementation (usually SPSCQueue).
+ */
 template <typename QueueT>
 class QueueHost {
     void* shmBase;
@@ -27,17 +35,30 @@ class QueueHost {
     std::thread readerThread;
     std::atomic<bool> running;
 
-    // Mutex for direct writing to Queue
-    // SPSCQueue is NOT thread-safe for multiple producers, so we need a lock.
+    /**
+     * @brief Mutex for synchronizing access to the Request Queue.
+     * Required because SPSCQueue is single-producer, but QueueHost might be shared.
+     */
     std::mutex sendMutex;
 
-    // Callback for received messages: (data)
+    /** @brief Callback for processing received messages. */
     std::function<void(std::vector<uint8_t>&&, uint32_t)> onMessage;
 
 public:
+    /** @brief Constructor. */
     QueueHost() : shmBase(nullptr), hMapFile(0), running(false) {}
+
+    /** @brief Destructor. Calls Shutdown. */
     ~QueueHost() { Shutdown(); }
 
+    /**
+     * @brief Initializes the Queue Host.
+     *
+     * @param shmName Name of the shared memory.
+     * @param queueSize Size of each queue (Req/Resp) in bytes.
+     * @param msgHandler Callback for responses.
+     * @return true on success.
+     */
     bool Init(const std::string& shmName, uint64_t queueSize,
               std::function<void(std::vector<uint8_t>&&, uint32_t)> msgHandler) {
         this->shmName = shmName;
@@ -71,6 +92,9 @@ public:
         return true;
     }
 
+    /**
+     * @brief Stops the reader thread and closes resources.
+     */
     void Shutdown() {
         if (!running) return;
         running = false;
@@ -82,6 +106,13 @@ public:
         Platform::CloseEvent(hFromGuestEvent);
     }
 
+    /**
+     * @brief Enqueues a message to the Guest.
+     *
+     * @param data Data pointer.
+     * @param size Data size.
+     * @param msgId Message ID (default NORMAL).
+     */
     void Send(const uint8_t* data, uint32_t size, uint32_t msgId = MSG_ID_NORMAL) {
         EnqueueHelper(data, size, msgId);
     }
@@ -97,7 +128,7 @@ private:
     }
 
     void EnqueueImpl(const uint8_t* data, uint32_t size, uint32_t msgId, std::false_type /* is_mpsc */) {
-        // No lock needed for MPSC
+        // No lock needed for MPSC (if supported in future)
         toGuestQueue->Enqueue(data, size, msgId);
     }
 

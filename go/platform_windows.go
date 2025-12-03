@@ -23,6 +23,7 @@ const (
     EVENT_ALL_ACCESS    = 0x1F0003
 )
 
+// createEvent implementation for Windows (CreateEventW).
 func createEvent(name string) (EventHandle, error) {
 	n, err := syscall.UTF16PtrFromString("Local\\" + name)
 	if err != nil {
@@ -36,6 +37,7 @@ func createEvent(name string) (EventHandle, error) {
 	return EventHandle(r1), nil
 }
 
+// openEvent implementation for Windows (OpenEventW).
 func openEvent(name string) (EventHandle, error) {
     n, err := syscall.UTF16PtrFromString("Local\\" + name)
     if err != nil {
@@ -49,19 +51,23 @@ func openEvent(name string) (EventHandle, error) {
     return EventHandle(r1), nil
 }
 
+// signalEvent implementation for Windows (SetEvent).
 func signalEvent(h EventHandle) {
     // SetEvent is non-blocking, so we use RawSyscall to avoid scheduler overhead.
 	syscall.RawSyscall(procSetEvent.Addr(), 1, uintptr(h), 0, 0)
 }
 
+// waitForEvent implementation for Windows (WaitForSingleObject).
 func waitForEvent(h EventHandle, timeoutMs uint32) {
 	procWaitForSingleObject.Call(uintptr(h), uintptr(timeoutMs))
 }
 
+// closeEvent implementation for Windows (CloseHandle).
 func closeEvent(h EventHandle) {
 	procCloseHandle.Call(uintptr(h))
 }
 
+// createShm implementation for Windows (CreateFileMappingW + MapViewOfFile).
 func createShm(name string, size uint64) (ShmHandle, uintptr, error) {
 	n, err := syscall.UTF16PtrFromString("Local\\" + name)
 	if err != nil {
@@ -98,6 +104,7 @@ func createShm(name string, size uint64) (ShmHandle, uintptr, error) {
 	return ShmHandle(hMap), addr, nil
 }
 
+// openShm implementation for Windows (OpenFileMappingW + MapViewOfFile).
 func openShm(name string, size uint64) (ShmHandle, uintptr, error) {
     n, err := syscall.UTF16PtrFromString("Local\\" + name)
     if err != nil {
@@ -130,6 +137,7 @@ func openShm(name string, size uint64) (ShmHandle, uintptr, error) {
     return ShmHandle(hMap), addr, nil
 }
 
+// closeShm implementation for Windows (UnmapViewOfFile + CloseHandle).
 func closeShm(h ShmHandle, addr uintptr) {
 	if addr != 0 {
 		procUnmapViewOfFile.Call(addr)

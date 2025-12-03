@@ -12,7 +12,10 @@
 
 using namespace shm;
 
-// Define simple POD structures for the benchmark protocol
+/**
+ * @brief Benchmark Request structure (24 bytes).
+ * Layout: [ID (8)][X (8)][Y (8)]
+ */
 #pragma pack(push, 1)
 struct BenchmarkReq {
     int64_t id;
@@ -20,6 +23,10 @@ struct BenchmarkReq {
     double y;
 };
 
+/**
+ * @brief Benchmark Response structure (16 bytes).
+ * Layout: [ID (8)][Result (8)]
+ */
 struct BenchmarkResp {
     int64_t id;
     double result;
@@ -30,6 +37,13 @@ struct BenchmarkResp {
 static_assert(sizeof(BenchmarkReq) == 24, "BenchmarkReq size mismatch");
 static_assert(sizeof(BenchmarkResp) == 16, "BenchmarkResp size mismatch");
 
+/**
+ * @brief Worker function to run benchmark iterations.
+ *
+ * @param host Pointer to the IPCHost instance.
+ * @param id Thread/Worker ID.
+ * @param iterations Number of requests to send.
+ */
 void worker(IPCHost* host, int id, int iterations) {
     // Reusable buffer for response
     std::vector<uint8_t> respBuf;
@@ -50,7 +64,6 @@ void worker(IPCHost* host, int id, int iterations) {
 
         if (respBuf.size() != sizeof(BenchmarkResp)) {
              // In a real app we might handle this error, but for benchmark we might log once or ignore
-             // if (respBuf.size() > 0) std::cerr << "Invalid response size: " << respBuf.size() << std::endl;
              continue;
         }
 
@@ -59,12 +72,16 @@ void worker(IPCHost* host, int id, int iterations) {
         if (resp->id != req.id) {
              std::cerr << "ID mismatch! Sent: " << req.id << ", Recv: " << resp->id << std::endl;
         }
-        // Verification of calculation (x + y)
-        // double expected = req.x + req.y;
-        // if (std::abs(resp->result - expected) > 1e-9) { ... }
     }
 }
 
+/**
+ * @brief Orchestrates a single benchmark run.
+ *
+ * @param numThreads Number of concurrent threads to use.
+ * @param iterations Ops per thread.
+ * @param mode IPC Mode (Queue/Direct).
+ */
 void run_benchmark(int numThreads, int iterations, IPCMode mode) {
     IPCHost host;
 
