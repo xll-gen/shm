@@ -168,6 +168,7 @@ public:
                 }
                 spins++;
                 if (spins % 100 == 0) std::this_thread::yield();
+                else Platform::CpuRelax();
             }
             activePollers.fetch_sub(1, std::memory_order_relaxed);
 
@@ -212,9 +213,13 @@ public:
                 return;
             }
 
-            Platform::WaitEvent(slot.hRespEvent);
+            // Wait with 100ms timeout to prevent hangs
+            Platform::WaitEvent(slot.hRespEvent, 100);
 
-            // We woke up. Check state again.
+            // We woke up (signal or timeout).
+            // Reset HostState to ACTIVE so Guest knows we are polling again.
+            // Even if we timed out and Guest signals later, the semaphore will just increment
+            // and the next WaitEvent will consume it immediately or we catch it in the spin loop.
             slot.header->hostState.store(HOST_STATE_ACTIVE, std::memory_order_relaxed);
 
             if (slot.header->state.load(std::memory_order_acquire) == SLOT_RESP_READY) {
@@ -279,7 +284,12 @@ public:
                     break;
                 }
                 spins++;
-                if (spins % 100 == 0) std::atomic_thread_fence(std::memory_order_seq_cst);
+                if (spins % 100 == 0) {
+                     // Keep yield behavior for longer spins
+                     std::atomic_thread_fence(std::memory_order_seq_cst);
+                } else {
+                     Platform::CpuRelax();
+                }
             }
             activePollers.fetch_sub(1, std::memory_order_relaxed);
 

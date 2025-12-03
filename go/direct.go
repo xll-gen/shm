@@ -177,6 +177,8 @@ func (g *DirectGuest) workerLoop(idx int, handler func([]byte) []byte) {
 				if spins%100 == 0 {
 					runtime.Gosched()
 				}
+                // In Go, we don't have easy access to PAUSE/CpuRelax without asm.
+                // Loop tight is acceptable as long as we yield eventually.
 			}
 
 			atomic.AddInt32(&g.activePollers, -1)
