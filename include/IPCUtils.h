@@ -1,58 +1,72 @@
 #pragma once
+
+#include <stdint.h>
 #include <atomic>
-#include <cstdint>
+
+// Magic number to identify initialized memory
+#define BLOCK_MAGIC 0xAB12CD34
+#define BLOCK_MAGIC_DATA 0xAB12CD34
+#define BLOCK_MAGIC_PAD  0xAB12CD35
+
+// Message IDs for control messages
+#define MSG_ID_NORMAL 0
+#define MSG_ID_HEARTBEAT_REQ 1
+#define MSG_ID_HEARTBEAT_RESP 2
+#define MSG_ID_SHUTDOWN 3
+
+// Alignment for cache lines (usually 64 bytes)
+#define CACHE_LINE_SIZE 64
+#define BLOCK_HEADER_SIZE 16
+
+// Host State constants
+#define HOST_STATE_ACTIVE 0
+#define HOST_STATE_WAITING 1
 
 namespace shm {
 
-static const uint32_t BLOCK_MAGIC_DATA = 0xDA7A0001;
-static const uint32_t BLOCK_MAGIC_PAD  = 0xDA7A0002;
-static const uint32_t BLOCK_HEADER_SIZE = 16;
-
-// Message ID Constants
-static const uint32_t MSG_ID_NORMAL = 0;
-static const uint32_t MSG_ID_HEARTBEAT_REQ = 1;
-static const uint32_t MSG_ID_HEARTBEAT_RESP = 2;
-static const uint32_t MSG_ID_SHUTDOWN = 3;
-
+// Standard Block Header for Queue Mode
 struct BlockHeader {
     uint32_t size;
     uint32_t msgId;
-    alignas(4) std::atomic<uint32_t> magic;
-    uint32_t padding;
+    std::atomic<uint32_t> magic;
+    uint32_t _pad;
 };
 
-// Layout must match Go struct
+// Queue Header (shared memory layout)
 struct QueueHeader {
-    alignas(64) std::atomic<uint64_t> writePos;
-    alignas(64) std::atomic<uint64_t> readPos;
-    std::atomic<uint64_t> capacity;
-    // 1 if consumer is running, 0 if waiting/sleeping.
-    std::atomic<uint32_t> consumerActive;
-    uint8_t padding[44];
+    std::atomic<uint64_t> writePos;     // 8 bytes
+    std::atomic<uint64_t> readPos;      // 8 bytes
+    std::atomic<uint64_t> capacity;     // 8 bytes
+    std::atomic<uint32_t> consumerActive; // 4 bytes (0=Sleeping, 1=Active)
+    uint32_t _pad1;                     // 4 bytes
+    uint8_t _pad2[96];                  // Padding to 128 bytes
 };
 
-// Direct Exchange / Slot based IPC
-enum SlotState : uint32_t {
-    SLOT_FREE = 0,         // Worker is waiting/sleeping
-    SLOT_POLLING = 1,      // Worker is busy-looping checking for work
-    SLOT_BUSY = 2,         // Host claimed slot, writing request
-    SLOT_REQ_READY = 3,    // Request written, Worker can process
-    SLOT_RESP_READY = 4,   // Response written, Host can read
-    SLOT_HOST_DONE = 5     // Host finished reading, Worker can reset
-};
-
-struct ExchangeHeader {
-    uint32_t numSlots;
-    uint32_t slotSize;
-    uint8_t padding[56]; // Pad to 64 bytes
-};
-
+// Direct Mode Slot Header
 struct SlotHeader {
-    alignas(64) std::atomic<uint32_t> state;
+    std::atomic<uint32_t> state;
     uint32_t reqSize;
     uint32_t respSize;
     uint32_t msgId;
-    uint8_t padding[48]; // Pad to 64 bytes
+    std::atomic<uint32_t> hostState; // HOST_STATE_ACTIVE or HOST_STATE_WAITING
+    uint8_t padding[44];             // Padding to make structure 64 bytes
+};
+
+// Slot State Constants
+enum SlotState {
+    SLOT_FREE = 0,
+    SLOT_POLLING = 1,
+    SLOT_BUSY = 2,
+    SLOT_REQ_READY = 3,
+    SLOT_RESP_READY = 4,
+    SLOT_HOST_DONE = 5
+};
+
+// Direct Mode Exchange Header
+struct ExchangeHeader {
+    uint32_t numSlots;
+    uint32_t slotSize;
+    uint8_t padding[56]; // Padding to 64 bytes
 };
 
 }

@@ -81,12 +81,8 @@ func main() {
 	}
 	fmt.Println("[Go] Connected to Events.")
 
-	if *mode == "mpsc" {
-		runMPSC(addr, qTotalSize, hToGuest, hFromGuest, *workers)
-	} else {
-		runSPSC(addr, qTotalSize, hToGuest, hFromGuest, *workers)
-	}
-        _ = hMap
+	runSPSC(addr, qTotalSize, hToGuest, hFromGuest, *workers)
+    _ = hMap
     }
 
 	if *memprofile != "" {
@@ -191,19 +187,6 @@ func runSPSC(addr uintptr, qTotalSize uint64, hToGuest, hFromGuest shm.EventHand
 	runGuest(client, workers)
 }
 
-func runMPSC(addr uintptr, qTotalSize uint64, hToGuest, hFromGuest shm.EventHandle, workers int) {
-	toGuestQueue := shm.NewMPSCQueue(addr, QUEUE_SIZE, hToGuest)
-	fromGuestQueue := shm.NewMPSCQueue(addr+uintptr(qTotalSize), QUEUE_SIZE, hFromGuest)
-
-	fmt.Println("[Go] Waiting for Queue initialization...")
-	for atomic.LoadUint64(&toGuestQueue.Header.Capacity) == 0 {
-		runtime.Gosched()
-		time.Sleep(10 * time.Millisecond)
-	}
-
-	client := shm.NewIPCGuest[*shm.MPSCQueue](toGuestQueue, fromGuestQueue)
-	runGuest(client, workers)
-}
 
 // runGuest is generic
 func runGuest[Q shm.IPCQueue](client *shm.IPCGuest[Q], workers int) {
