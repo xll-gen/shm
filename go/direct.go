@@ -207,45 +207,51 @@ func (g *DirectGuest) workerLoop(idx int, handler func([]byte) []byte) {
 
 		if canPoll {
 			// 1. Enter Polling State
-			atomic.StoreUint32(&header.State, SlotPolling)
-
-			// 2. Spin wait
-			spins := 0
-			// Spin limit: 100k iterations (approx 10-50us depending on machine)
-			const SpinLimit = 100000
-			for spins < SpinLimit {
+			// Check if already ReqReady before setting Polling
+			// Using CAS from SlotFree to SlotPolling
+			if !atomic.CompareAndSwapUint32(&header.State, SlotFree, SlotPolling) {
+				// Failed CAS
 				s := atomic.LoadUint32(&header.State)
 				if s == SlotReqReady {
 					found = true
-					break
 				}
-				spins++
-				// Small pause to be friendly
-				if spins%100 == 0 {
-					runtime.Gosched()
+			} else {
+				// Successfully transitioned to Polling. Now spin.
+				// 2. Spin wait
+				spins := 0
+				const SpinLimit = 100000
+				for spins < SpinLimit {
+					s := atomic.LoadUint32(&header.State)
+					if s == SlotReqReady {
+						found = true
+						break
+					}
+					spins++
+					if spins%100 == 0 {
+						runtime.Gosched()
+					}
+				}
+
+				// If still not found, try to revert to Free
+				if !found {
+					if !atomic.CompareAndSwapUint32(&header.State, SlotPolling, SlotFree) {
+						// Failed means state changed -> ReqReady
+						found = true
+					}
 				}
 			}
-
 			atomic.AddInt32(&g.activePollers, -1)
-
-			if !found {
-				// Transition to Free (Sleeping)
-				if !atomic.CompareAndSwapUint32(&header.State, SlotPolling, SlotFree) {
-					// Failed means state changed -> ReqReady
-					found = true
-				}
-			}
 		}
 
 		if !found {
-            // Robust Wait Loop: Keep waiting until State is ReqReady
-            for {
-                s := atomic.LoadUint32(&header.State)
-                if s == SlotReqReady {
-                    break
-                }
-                WaitForEvent(slot.event, 100)
-            }
+			// Robust Wait Loop: Keep waiting until State is ReqReady
+			for {
+				s := atomic.LoadUint32(&header.State)
+				if s == SlotReqReady {
+					break
+				}
+				WaitForEvent(slot.event, 100)
+			}
 		} else {
              // Found while polling. Just wait for state to be definitely ReqReady
              for atomic.LoadUint32(&header.State) != SlotReqReady {
@@ -257,6 +263,11 @@ func (g *DirectGuest) workerLoop(idx int, handler func([]byte) []byte) {
 		msgId := header.MsgId
 		if msgId == MsgIdShutdown {
 			return
+		}
+
+		// Handle Heartbeat
+		if msgId == MsgIdHeartbeatReq {
+			header.MsgId = MsgIdHeartbeatResp
 		}
 
 		reqSize := header.ReqSize
