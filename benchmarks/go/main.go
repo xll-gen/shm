@@ -55,27 +55,32 @@ func main() {
 
 	// Handler - using simple byte slice handler now
 	client.Handle(func(reqData []byte) []byte {
-		if len(reqData) != ReqSize {
-			// Malformed request - ignore or return empty/error frame
-            // In a benchmark we typically panic or return nil to indicate drop
-            // But let's be robust
+		// Expect TransportHeader (8 bytes) + ReqSize
+		if len(reqData) != 8+ReqSize {
+			fmt.Printf("[Go] Error: Malformed request. Len=%d, Expected=%d\n", len(reqData), 8+ReqSize)
 			return nil
 		}
 
-		// Parse Request (Little Endian)
+		// Extract Transport Header (req_id)
+		reqIdHeader := reqData[0:8]
+
+		// Parse Request (Little Endian) - Skip 8 bytes header
+		payload := reqData[8:]
 		// C++: struct { int64_t id; double x; double y; }
-		id := int64(binary.LittleEndian.Uint64(reqData[0:8]))
-		x := math.Float64frombits(binary.LittleEndian.Uint64(reqData[8:16]))
-		y := math.Float64frombits(binary.LittleEndian.Uint64(reqData[16:24]))
+		id := int64(binary.LittleEndian.Uint64(payload[0:8]))
+		x := math.Float64frombits(binary.LittleEndian.Uint64(payload[8:16]))
+		y := math.Float64frombits(binary.LittleEndian.Uint64(payload[16:24]))
 
 		// Process
 		res := x + y
 
-		// Prepare Response
+		// Prepare Response: Header (8) + Resp (16)
+		respData := make([]byte, 8+16)
+		copy(respData[0:8], reqIdHeader)
+
 		// C++: struct { int64_t id; double result; }
-		respData := make([]byte, 16)
-		binary.LittleEndian.PutUint64(respData[0:8], uint64(id))
-		binary.LittleEndian.PutUint64(respData[8:16], math.Float64bits(res))
+		binary.LittleEndian.PutUint64(respData[8:16], uint64(id))
+		binary.LittleEndian.PutUint64(respData[16:24], math.Float64bits(res))
 
 		return respData
 	})

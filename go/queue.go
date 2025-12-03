@@ -25,11 +25,11 @@ const (
 // };
 type QueueHeader struct {
 	WritePos        uint64   // 8 bytes
+	_pad1           [56]byte // 56 bytes
 	ReadPos         uint64   // 8 bytes
 	Capacity        uint64   // 8 bytes
 	ConsumerActive  uint32   // 4 bytes
-	_pad1           [4]byte  // 4 bytes
-	_pad2           [96]byte // 96 bytes
+	_pad2           [44]byte // 44 bytes
 }
 
 type SPSCQueue struct {
