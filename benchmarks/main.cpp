@@ -5,40 +5,63 @@
 #include <atomic>
 #include <iomanip>
 #include <string>
+#include <cstring>
+#include <cstdint>
+#include <cassert>
 #include "../../src/IPCHost.h"
-#include "ipc_generated.h"
 
 using namespace shm;
 
+// Define simple POD structures for the benchmark protocol
+#pragma pack(push, 1)
+struct BenchmarkReq {
+    int64_t id;
+    double x;
+    double y;
+};
+
+struct BenchmarkResp {
+    int64_t id;
+    double result;
+};
+#pragma pack(pop)
+
+// Sanity check for struct sizes to ensure "header integrity"
+static_assert(sizeof(BenchmarkReq) == 24, "BenchmarkReq size mismatch");
+static_assert(sizeof(BenchmarkResp) == 16, "BenchmarkResp size mismatch");
+
 void worker(IPCHost* host, int id, int iterations) {
-    flatbuffers::FlatBufferBuilder builder(1024);
+    // Reusable buffer for response
+    std::vector<uint8_t> respBuf;
+    respBuf.reserve(128); // Pre-allocate enough space
 
     for (int i = 0; i < iterations; ++i) {
-        builder.Clear();
+        BenchmarkReq req;
+        req.id = i;
+        req.x = 1.0 * i;
+        req.y = 2.0 * i;
 
-        auto addReq = ipc::CreateAddRequest(builder, 1.0 * i, 2.0 * i);
-        // Note: Transport now handles reqId internally.
-        // But our FlatBuffer Schema also has a reqId field.
-        // We can keep using it for application-level ID, or ignore it.
-        // Let's set it to 0 or 'i' for app debugging.
-        uint32_t appReqId = i;
-
-        auto msg = ipc::CreateMessage(builder, appReqId, ipc::Payload_AddRequest, addReq.Union());
-        builder.Finish(msg);
-
-        std::vector<uint8_t> resp;
         // Call handles Header injection/extraction
-        if (!host->Call(builder.GetBufferPointer(), builder.GetSize(), resp)) {
+        // We pass the raw struct as the payload
+        if (!host->Call(reinterpret_cast<const uint8_t*>(&req), sizeof(req), respBuf)) {
             std::cerr << "Call failed!" << std::endl;
             return;
         }
 
-        if (resp.empty()) continue;
-
-        auto respMsg = ipc::GetMessage(resp.data());
-        if (respMsg->payload_type() == ipc::Payload_AddResponse) {
-            // Success
+        if (respBuf.size() != sizeof(BenchmarkResp)) {
+             // In a real app we might handle this error, but for benchmark we might log once or ignore
+             // if (respBuf.size() > 0) std::cerr << "Invalid response size: " << respBuf.size() << std::endl;
+             continue;
         }
+
+        // Verify result
+        const BenchmarkResp* resp = reinterpret_cast<const BenchmarkResp*>(respBuf.data());
+        if (resp->id != req.id) {
+             std::cerr << "ID mismatch! Sent: " << req.id << ", Recv: " << resp->id << std::endl;
+        }
+        // Verification of calculation (x + y)
+        // double expected = req.x + req.y;
+        // if (std::abs(resp->result - expected) > 1e-9) { ... }
     }
 }
 
@@ -106,6 +129,7 @@ int main(int argc, char* argv[]) {
     }
 
     std::cout << "Running Benchmark in " << modeStr << " mode." << std::endl;
+    std::cout << "Protocol: Raw Byte Structs (Req: 24b, Resp: 16b)" << std::endl;
 
     if (specificThreadCount > 0) {
         run_benchmark(specificThreadCount, iterations, mode);
