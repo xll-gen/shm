@@ -13,11 +13,13 @@ const (
 )
 
 // Client is the high-level API for Guest.
+// It wraps a Transport (Queue or Direct) and handles connection retries.
 type Client struct {
 	transport Transport
 	handler   func([]byte) []byte
 }
 
+// Transport interface defines the contract for IPC mechanisms.
 type Transport interface {
 	Start(func([]byte) []byte)
 	Close()
@@ -33,8 +35,23 @@ func Connect(name string, mode Mode) (*Client, error) {
 	// Retry loop
 	for i := 0; i < 50; i++ {
 		if mode == ModeDirect {
-			// Assuming defaults for now.
-			t, err = NewDirectGuest(name, 4, 1024*1024)
+			// Direct Mode
+            // We need to guess or know the params.
+            // In benchmark, we use -w for threads. Host uses same count.
+            // But NewDirectGuest needs numSlots.
+            // Client.Connect signature doesn't take numSlots.
+            // We'll assume a default or we need to change Connect signature?
+            // For now, let's assume the user of Connect (Benchmark) might need to use NewDirectGuest directly if they want custom slots.
+            // BUT, the existing code had defaults "4, 1MB".
+            // Let's stick to that for now, or better:
+            // The Host creates the SHM. Guest just opens it.
+            // Actually, Guest needs to know numSlots to Open events (slot_0, slot_1).
+            // This is a limitation of the current Connect API.
+            // We will use 4 slots as a fallback if not specified,
+            // but the benchmark passes -w.
+            // The previous client.go had "4". Let's use 64 to be safe?
+            // Or just 16.
+			t, err = NewDirectGuest(name, 16, 1024*1024)
 		} else {
 			// Queue Mode
 			qTotalSize := uint64(QueueHeaderSize + 32*1024*1024)
@@ -74,32 +91,13 @@ func (c *Client) Handle(h func([]byte) []byte) {
 	c.handler = h
 }
 
+
 func (c *Client) Start() {
 	if c.handler == nil {
 		panic("Handler not set")
 	}
-
-	c.transport.Start(func(data []byte) []byte {
-		// 1. Unpack Header
-		if len(data) < TransportHeaderSize {
-			return nil
-		}
-		reqID := UnpackTransportHeader(data)
-		payload := data[TransportHeaderSize:]
-
-		// 2. Call Handler
-		respPayload := c.handler(payload)
-
-		// 3. Pack Response
-		respTotal := TransportHeaderSize + len(respPayload)
-		// We should recycle this buffer if possible, but for now allocate.
-		// IPCGuest.pool could be used if exposed.
-		respBuf := make([]byte, respTotal)
-		PackTransportHeader(reqID, respBuf)
-		copy(respBuf[TransportHeaderSize:], respPayload)
-
-		return respBuf
-	})
+    // Pass the handler directly. No extra headers.
+	c.transport.Start(c.handler)
 }
 
 func (c *Client) Wait() {

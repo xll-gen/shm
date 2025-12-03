@@ -155,38 +155,17 @@ func (g *DirectGuest) Send(data []byte) {
 	// Transport.Start(handler func([]byte) []byte)
 }
 
-// Modified Start for Transport compliance (but we will change Transport definition in next step or assume it changed)
-// I will implement Start assuming it takes `func([]byte) []byte`.
-func (g *DirectGuest) Start(handler func([]byte)) {
-    // This signature assumes 'handler' does not return data.
-    // If Client is fixed to pass `func([]byte) []byte`, we are good.
-    // But Client.go currently passes `func([]byte)`.
-
-    // I need to update Client.go first? Or just fix it here.
-    // I'll update Client.go content in my head. No, I must overwrite it.
-    // Let's implement a 'Start' that matches the 'Transport' interface I defined in Client.go
-    // In Client.go: Start(func([]byte)). And Send([]byte).
-
-    // DirectGuest cannot work this way because it needs to know WHICH slot to write the response to.
-    // 'Send' doesn't know the context (slot index).
-
-    // Therefore, the Transport abstraction in Client.go is flawed for Direct Mode.
-    // It should be: Start(handler func([]byte) []byte).
-    // QueueGuest: Read -> result = handler(data) -> Send(result).
-    // DirectGuest: Read -> result = handler(data) -> WriteToSlot(result).
-
-    // I will rewrite Client.go and then DirectGuest.
-    panic("DirectGuest requires Start(func([]byte) []byte)")
-}
-
-
 // Start spawns workers. Each worker is pinned to a slot index.
-// This is the "Real" start.
-func (g *DirectGuest) StartWithResponder(handler func([]byte) []byte) {
+func (g *DirectGuest) Start(handler func([]byte) []byte) {
 	for i := 0; i < int(g.numSlots); i++ {
         g.wg.Add(1)
 		go g.workerLoop(i, handler)
 	}
+}
+
+// StartWithResponder is an alias for Start
+func (g *DirectGuest) StartWithResponder(handler func([]byte) []byte) {
+    g.Start(handler)
 }
 
 // Wait blocks until all workers have exited (via Shutdown message).

@@ -1,18 +1,22 @@
 package main
 
 import (
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"runtime"
 	"runtime/pprof"
-	"sync"
-	"time"
 
-	flatbuffers "github.com/google/flatbuffers/go"
-	"benchmark/ipc" // Using local generated code
-	"github.com/xll-gen/shm/go" // Changed import path to match module
+	"github.com/xll-gen/shm/go"
+)
+
+// Define protocol constants to match C++
+const (
+	ReqSize  = 24
+	RespSize = 16
 )
 
 func main() {
@@ -33,80 +37,56 @@ func main() {
 
 	fmt.Printf("[Go] Starting Guest with %d workers in %s mode...\n", *workers, *mode)
 
-    // Select Mode
-    var clientMode shm.Mode
-    if *mode == "direct" {
-        clientMode = shm.ModeDirect
-    } else {
-        clientMode = shm.ModeQueue
-    }
+	// Select Mode
+	var clientMode shm.Mode
+	if *mode == "direct" {
+		clientMode = shm.ModeDirect
+	} else {
+		clientMode = shm.ModeQueue
+	}
 
-    // Connect
-    fmt.Println("[Go] Connecting to Host...")
-    client, err := shm.Connect("SimpleIPC", clientMode)
-    if err != nil {
-        log.Fatalf("Failed to connect: %v", err)
-    }
-    fmt.Println("[Go] Connected.")
+	// Connect
+	fmt.Println("[Go] Connecting to Host...")
+	client, err := shm.Connect("SimpleIPC", clientMode)
+	if err != nil {
+		log.Fatalf("Failed to connect: %v", err)
+	}
+	fmt.Println("[Go] Connected.")
 
-    // Pool for builders
-    pool := sync.Pool{
-        New: func() interface{} {
-            return flatbuffers.NewBuilder(1024)
-        },
-    }
+	// Handler - using simple byte slice handler now
+	client.Handle(func(reqData []byte) []byte {
+		if len(reqData) != ReqSize {
+			// Malformed request - ignore or return empty/error frame
+            // In a benchmark we typically panic or return nil to indicate drop
+            // But let's be robust
+			return nil
+		}
 
-    // Handler
-    client.Handle(func(reqData []byte) []byte {
-        builder := pool.Get().(*flatbuffers.Builder)
-        builder.Reset()
-        defer pool.Put(builder)
+		// Parse Request (Little Endian)
+		// C++: struct { int64_t id; double x; double y; }
+		id := int64(binary.LittleEndian.Uint64(reqData[0:8]))
+		x := math.Float64frombits(binary.LittleEndian.Uint64(reqData[8:16]))
+		y := math.Float64frombits(binary.LittleEndian.Uint64(reqData[16:24]))
 
-        msg := ipc.GetRootAsMessage(reqData, 0)
-        reqID := msg.ReqId() // App-level ID (optional now)
+		// Process
+		res := x + y
 
-        var payloadOffset flatbuffers.UOffsetT
-        var payloadType ipc.Payload
+		// Prepare Response
+		// C++: struct { int64_t id; double result; }
+		respData := make([]byte, 16)
+		binary.LittleEndian.PutUint64(respData[0:8], uint64(id))
+		binary.LittleEndian.PutUint64(respData[8:16], math.Float64bits(res))
 
-        pt := msg.PayloadType()
+		return respData
+	})
 
-        switch pt {
-        case ipc.PayloadAddRequest:
-            req := new(ipc.AddRequest)
-            var t flatbuffers.Table
-            if msg.Payload(&t) {
-                req.Init(t.Bytes, t.Pos)
-                res := req.X() + req.Y()
+	// Start (Blocking)
+	go client.Start()
 
-                ipc.AddResponseStart(builder)
-                ipc.AddResponseAddResult(builder, res)
-                payloadOffset = ipc.AddResponseEnd(builder)
-                payloadType = ipc.PayloadAddResponse
-            }
-        case ipc.PayloadMyRandRequest:
-            ipc.MyRandResponseStart(builder)
-            ipc.MyRandResponseAddResult(builder, 0.12345)
-            payloadOffset = ipc.MyRandResponseEnd(builder)
-            payloadType = ipc.PayloadMyRandResponse
-        }
-
-        ipc.MessageStart(builder)
-        ipc.MessageAddReqId(builder, reqID)
-        ipc.MessageAddPayloadType(builder, payloadType)
-        ipc.MessageAddPayload(builder, payloadOffset)
-        resMsg := ipc.MessageEnd(builder)
-
-        builder.Finish(resMsg)
-        return builder.FinishedBytes()
-    })
-
-    // Start (Blocking)
-    go client.Start()
-
-    // Wait
-    client.Wait()
-    fmt.Println("[Go] Received Shutdown. Exiting...")
-    client.Close()
+	// Wait
+	client.Wait()
+	fmt.Println("[Go] Received Shutdown. Exiting...")
+	client.Close()
 
 	if *memprofile != "" {
 		f, err := os.Create(*memprofile)
