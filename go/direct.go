@@ -144,68 +144,24 @@ func (g *DirectGuest) workerLoop(idx int, handler func([]byte) []byte) {
 	// Ensure we start fresh
 	atomic.StoreUint32(&header.State, SlotFree)
 
+    // Simplified Polling Loop (Aggressive)
 	for {
-		// Check adaptive logic: Are we allowed to poll?
-		canPoll := false
-		active := atomic.LoadInt32(&g.activePollers)
-		target := atomic.LoadInt32(&g.targetPollers)
+        // Set to Polling immediately (we are always polling)
+        // If we were in Free, we move to Polling.
+        // If we were in HostDone, we move to Polling.
+        // We only transition Free -> Polling once here if needed, but really we just loop.
 
-		if active < target {
-			if atomic.CompareAndSwapInt32(&g.activePollers, active, active+1) {
-				canPoll = true
-			}
-		}
-
-		found := false
-
-		if canPoll {
-			// 1. Enter Polling State
-			atomic.StoreUint32(&header.State, SlotPolling)
-
-			// 2. Spin wait
-			spins := 0
-			// Spin limit: 100k iterations (approx 10-50us depending on machine)
-			const SpinLimit = 100000
-			for spins < SpinLimit {
-				s := atomic.LoadUint32(&header.State)
-				if s == SlotReqReady {
-					found = true
-					break
-				}
-				spins++
-				// Small pause to be friendly
-				if spins%100 == 0 {
-					runtime.Gosched()
-				}
-			}
-
-			atomic.AddInt32(&g.activePollers, -1)
-
-			if !found {
-				// Transition to Free (Sleeping)
-				if !atomic.CompareAndSwapUint32(&header.State, SlotPolling, SlotFree) {
-					// Failed means state changed -> ReqReady
-					found = true
-				}
-			}
-		}
-
-		if !found {
-            // Robust Wait Loop: Keep waiting until State is ReqReady
-            // We use timeout to handle potential signal loss or races
-            for {
-                s := atomic.LoadUint32(&header.State)
-                if s == SlotReqReady {
-                    break
-                }
-                // Wait with timeout
-                WaitForEvent(slot.event, 100)
-            }
-		} else {
-             // Found while polling. Just wait for state to be definitely ReqReady
-             for atomic.LoadUint32(&header.State) != SlotReqReady {
-                runtime.Gosched()
+        // Wait for ReqReady
+        for {
+             s := atomic.LoadUint32(&header.State)
+             if s == SlotReqReady {
+                 break
              }
+             if s == SlotFree {
+                 // Try to advertise we are polling
+                 atomic.CompareAndSwapUint32(&header.State, SlotFree, SlotPolling)
+             }
+             // Busy wait - no sleep, no yield
         }
 
 		// 3. Process Request
@@ -231,14 +187,15 @@ func (g *DirectGuest) workerLoop(idx int, handler func([]byte) []byte) {
 		// 4. Signal Ready
 		atomic.StoreUint32(&header.State, SlotRespReady)
 
-		// Check if Host is waiting
+        // In pure busy-loop mode, Host is likely spinning, so HostState might stay Active.
+        // But if Host *did* go to sleep (shouldn't happened with our C++ changes), we signal.
 		if atomic.LoadUint32(&header.HostState) == HostStateWaiting {
 			SignalEvent(slot.respEvent)
 		}
 
 		// 5. Wait for Host Done
 		for atomic.LoadUint32(&header.State) != SlotHostDone {
-			runtime.Gosched()
+			// Busy wait
 		}
 	}
 }

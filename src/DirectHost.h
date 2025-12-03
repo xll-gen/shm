@@ -124,7 +124,6 @@ public:
                      slotIdx = i; wasSleeping = true; goto Found;
                 }
             }
-            std::this_thread::yield();
         }
         return false;
 
@@ -146,42 +145,7 @@ public:
              return true;
         }
 
-        // Wait for Response (Adaptive)
-        bool success = false;
-        bool canSpin = false;
-        int currentActive = activePollers.load(std::memory_order_relaxed);
-        int currentTarget = targetPollers.load(std::memory_order_relaxed);
-
-        if (currentActive < currentTarget) {
-            activePollers.fetch_add(1, std::memory_order_relaxed);
-            canSpin = true;
-        }
-
-        if (canSpin) {
-            int spins = 0;
-            const int SpinLimit = 5000; // Tuned for single-core/yielding environment
-            while (running && spins < SpinLimit) {
-                uint32_t s = slot.header->state.load(std::memory_order_acquire);
-                if (s == SLOT_RESP_READY) {
-                    success = true;
-                    break;
-                }
-                spins++;
-                if (spins % 100 == 0) std::this_thread::yield();
-            }
-            activePollers.fetch_sub(1, std::memory_order_relaxed);
-
-            if (!success) {
-                // Spin failed (timeout) -> Decrease target
-                int t = targetPollers.load(std::memory_order_relaxed);
-                if (t > 1) targetPollers.fetch_sub(1, std::memory_order_relaxed);
-            }
-        }
-
-        if (!success) {
-            WaitForResponse(slot);
-            success = true;
-        }
+        WaitForResponse(slot);
 
         if (!running) return false;
 
@@ -202,25 +166,9 @@ public:
     }
 
     void WaitForResponse(SlotContext& slot) {
-        // Must wait loop to handle spurious wakeups (stray signals)
+        // Aggressive busy loop
         while (running) {
-            slot.header->hostState.store(HOST_STATE_WAITING, std::memory_order_seq_cst);
-
-            // Double check to avoid race
             if (slot.header->state.load(std::memory_order_acquire) == SLOT_RESP_READY) {
-                slot.header->hostState.store(HOST_STATE_ACTIVE, std::memory_order_relaxed);
-                return;
-            }
-
-            Platform::WaitEvent(slot.hRespEvent);
-
-            // We woke up. Check state again.
-            slot.header->hostState.store(HOST_STATE_ACTIVE, std::memory_order_relaxed);
-
-            if (slot.header->state.load(std::memory_order_acquire) == SLOT_RESP_READY) {
-                // We were forced to wait -> Increase target
-                int t = targetPollers.load(std::memory_order_relaxed);
-                if (t < (int)numSlots) targetPollers.fetch_add(1, std::memory_order_relaxed);
                 return;
             }
         }
@@ -243,7 +191,6 @@ public:
                      goto Found;
                  }
              }
-             std::this_thread::yield();
         }
         return false;
 
@@ -257,42 +204,7 @@ public:
 
         if (msgId == MSG_ID_SHUTDOWN) return true;
 
-         // Wait for Response (Adaptive) - Duplicated logic for CallSlot?
-         // Ideally refactor, but for now inline.
-        bool success = false;
-        bool canSpin = false;
-        int currentActive = activePollers.load(std::memory_order_relaxed);
-        int currentTarget = targetPollers.load(std::memory_order_relaxed);
-
-        if (currentActive < currentTarget) {
-            activePollers.fetch_add(1, std::memory_order_relaxed);
-            canSpin = true;
-        }
-
-        if (canSpin) {
-            int spins = 0;
-            const int SpinLimit = 100000;
-            while (running && spins < SpinLimit) {
-                uint32_t s = slot.header->state.load(std::memory_order_acquire);
-                if (s == SLOT_RESP_READY) {
-                    success = true;
-                    break;
-                }
-                spins++;
-                if (spins % 100 == 0) std::atomic_thread_fence(std::memory_order_seq_cst);
-            }
-            activePollers.fetch_sub(1, std::memory_order_relaxed);
-
-            if (!success) {
-                int t = targetPollers.load(std::memory_order_relaxed);
-                if (t > 1) targetPollers.fetch_sub(1, std::memory_order_relaxed);
-            }
-        }
-
-        if (!success) {
-            WaitForResponse(slot);
-            success = true;
-        }
+        WaitForResponse(slot);
 
         if (!running) return false;
 
