@@ -8,20 +8,28 @@ import (
 )
 
 const (
-	BlockMagicData  = 0xDA7A0001
-	BlockMagicPad   = 0xDA7A0002
+	BlockMagicData  = 0xAB12CD34
+	BlockMagicPad   = 0xAB12CD35
 	BlockHeaderSize = 16
 	QueueHeaderSize = 128
 )
 
-// Corresponds to the C++ layout
+// Corresponds to the C++ layout in include/IPCUtils.h
+// struct QueueHeader {
+//     std::atomic<uint64_t> writePos;     // 8 bytes
+//     std::atomic<uint64_t> readPos;      // 8 bytes
+//     std::atomic<uint64_t> capacity;     // 8 bytes
+//     std::atomic<uint32_t> consumerActive; // 4 bytes (0=Sleeping, 1=Active)
+//     uint32_t _pad1;                     // 4 bytes
+//     uint8_t _pad2[96];                  // Padding to 128 bytes
+// };
 type QueueHeader struct {
 	WritePos        uint64   // 8 bytes
-	_pad1           [56]byte // 56 bytes
 	ReadPos         uint64   // 8 bytes
 	Capacity        uint64   // 8 bytes
 	ConsumerActive  uint32   // 4 bytes
-	_pad2           [44]byte // 44 bytes
+	_pad1           [4]byte  // 4 bytes
+	_pad2           [96]byte // 96 bytes
 }
 
 type SPSCQueue struct {
