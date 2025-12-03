@@ -135,6 +135,8 @@ func (g *DirectGuest) Wait() {
 }
 
 func (g *DirectGuest) workerLoop(idx int, handler func([]byte) []byte) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	defer g.wg.Done()
 	slot := &g.slots[idx]
 	header := slot.header
