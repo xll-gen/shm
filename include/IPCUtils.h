@@ -35,11 +35,11 @@ struct BlockHeader {
 // Queue Header (shared memory layout)
 struct QueueHeader {
     std::atomic<uint64_t> writePos;     // 8 bytes
+    uint8_t _pad1[56];                  // Padding to separate writePos and readPos
     std::atomic<uint64_t> readPos;      // 8 bytes
     std::atomic<uint64_t> capacity;     // 8 bytes
     std::atomic<uint32_t> consumerActive; // 4 bytes (0=Sleeping, 1=Active)
-    uint32_t _pad1;                     // 4 bytes
-    uint8_t _pad2[96];                  // Padding to 128 bytes
+    uint8_t _pad2[44];                  // Padding to 128 bytes
 };
 
 // Direct Mode Slot Header
