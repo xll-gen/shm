@@ -50,7 +50,8 @@ func openEvent(name string) (EventHandle, error) {
 }
 
 func signalEvent(h EventHandle) {
-	procSetEvent.Call(uintptr(h))
+    // SetEvent is non-blocking, so we use RawSyscall to avoid scheduler overhead.
+	syscall.RawSyscall(procSetEvent.Addr(), 1, uintptr(h), 0, 0)
 }
 
 func waitForEvent(h EventHandle, timeoutMs uint32) {

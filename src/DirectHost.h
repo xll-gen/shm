@@ -159,7 +159,7 @@ public:
 
         if (canSpin) {
             int spins = 0;
-            const int SpinLimit = 100000;
+            const int SpinLimit = 5000; // Tuned for single-core/yielding environment
             while (running && spins < SpinLimit) {
                 uint32_t s = slot.header->state.load(std::memory_order_acquire);
                 if (s == SLOT_RESP_READY) {
@@ -167,7 +167,7 @@ public:
                     break;
                 }
                 spins++;
-                if (spins % 100 == 0) std::atomic_thread_fence(std::memory_order_seq_cst);
+                if (spins % 100 == 0) std::this_thread::yield();
             }
             activePollers.fetch_sub(1, std::memory_order_relaxed);
 
