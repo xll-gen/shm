@@ -50,8 +50,14 @@ public:
         this->numSlots = numSlots;
         this->slotSize = slotSize;
 
+        // Ensure alignment
         size_t headerSize = sizeof(ExchangeHeader);
-        size_t perSlotSize = sizeof(SlotHeader) + slotSize;
+        if (headerSize < 64) headerSize = 64;
+
+        size_t slotHeaderSize = sizeof(SlotHeader);
+        if (slotHeaderSize < 128) slotHeaderSize = 128; // Pad SlotHeader to 128
+
+        size_t perSlotSize = slotHeaderSize + slotSize;
         size_t totalSize = headerSize + (perSlotSize * numSlots);
 
         bool exists = false;
@@ -69,7 +75,7 @@ public:
         for (uint32_t i = 0; i < numSlots; i++) {
             SlotContext ctx;
             ctx.header = (SlotHeader*)ptr;
-            ctx.data = ptr + sizeof(SlotHeader);
+            ctx.data = ptr + slotHeaderSize;
 
             std::string evName = shmName + "_slot_" + std::to_string(i);
             ctx.hEvent = Platform::CreateNamedEvent(evName.c_str());
@@ -134,10 +140,7 @@ public:
         slot.header->msgId = msgId;
 
         slot.header->state.store(SLOT_REQ_READY, std::memory_order_release);
-
-        if (wasSleeping) {
-            Platform::SignalEvent(slot.hEvent);
-        }
+        if (wasSleeping) Platform::SignalEvent(slot.hEvent);
 
         if (msgId == MSG_ID_SHUTDOWN) {
              return true;
@@ -201,7 +204,7 @@ public:
     void WaitForResponse(SlotContext& slot) {
         // Must wait loop to handle spurious wakeups (stray signals)
         while (running) {
-            slot.header->hostState.store(HOST_STATE_WAITING, std::memory_order_release);
+            slot.header->hostState.store(HOST_STATE_WAITING, std::memory_order_seq_cst);
 
             // Double check to avoid race
             if (slot.header->state.load(std::memory_order_acquire) == SLOT_RESP_READY) {

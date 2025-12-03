@@ -20,6 +20,7 @@ const (
 
 // SlotHeader matching C++
 type SlotHeader struct {
+    _         [64]byte // Pre-padding
 	State     uint32
 	ReqSize   uint32
 	RespSize  uint32
@@ -64,7 +65,12 @@ type slotContext struct {
 func NewDirectGuest(name string, numSlots int, slotSize int) (*DirectGuest, error) {
 	// Calculate size
 	headerSize := uint64(unsafe.Sizeof(ExchangeHeader{}))
-	perSlotSize := uint64(unsafe.Sizeof(SlotHeader{})) + uint64(slotSize)
+    if headerSize < 64 { headerSize = 64 }
+
+    slotHeaderSize := uint64(unsafe.Sizeof(SlotHeader{}))
+    if slotHeaderSize < 128 { slotHeaderSize = 128 }
+
+	perSlotSize := slotHeaderSize + uint64(slotSize)
 	totalSize := headerSize + (perSlotSize * uint64(numSlots))
 
 	h, addr, err := OpenShm(name, totalSize)
@@ -73,7 +79,7 @@ func NewDirectGuest(name string, numSlots int, slotSize int) (*DirectGuest, erro
 	}
 
 	// Initialize target pollers to max(1, NumCPU/4)
-	target := int32(runtime.NumCPU() / 4)
+    target := int32(1) // Force 1 for container safety
 	if target < 1 {
 		target = 1
 	}
@@ -92,7 +98,7 @@ func NewDirectGuest(name string, numSlots int, slotSize int) (*DirectGuest, erro
 	for i := 0; i < numSlots; i++ {
 		g.slots[i].header = (*SlotHeader)(unsafe.Pointer(ptr))
 
-		dataPtr := unsafe.Pointer(ptr + unsafe.Sizeof(SlotHeader{}))
+		dataPtr := unsafe.Pointer(ptr + uintptr(slotHeaderSize))
 		g.slots[i].data = unsafe.Slice((*byte)(dataPtr), slotSize)
 
 		eventName := fmt.Sprintf("%s_slot_%d", name, i)
@@ -171,27 +177,9 @@ func (g *DirectGuest) workerLoop(idx int, handler func([]byte) []byte) {
 				}
 			}
 
-			// If we found it, we keep activePollers incremented until we finish processing?
-			// Actually, if we are processing, we are effectively "busy" but not "polling".
-			// But for simplicity of "max CPU usage", processing also consumes CPU.
-			// However, the "poller count" usually restricts the *busy wait* phase.
-			// Once we have work, we should probably release the slot token so another thread can poll?
-			// But if we release, another thread wakes up and spins, potentially oversubscribing CPUs if we are also CPU bound processing.
-			// BUT: The requirement is "limit busy loop workers". Processing is useful work.
-			// So we should decrement activePollers once we exit the spin loop (success or fail).
 			atomic.AddInt32(&g.activePollers, -1)
 
 			if !found {
-				// Failed to find work while spinning.
-				// This implies work is sparse. Decrease target to save CPU.
-				// Decrease logic: if target > 1, decrement.
-				// To avoid rapid oscillation, maybe probabilistic? Or just do it.
-				// Let's do it simply.
-				curTarget := atomic.LoadInt32(&g.targetPollers)
-				if curTarget > 1 {
-					atomic.CompareAndSwapInt32(&g.targetPollers, curTarget, curTarget-1)
-				}
-
 				// Transition to Free (Sleeping)
 				if !atomic.CompareAndSwapUint32(&header.State, SlotPolling, SlotFree) {
 					// Failed means state changed -> ReqReady
@@ -201,22 +189,22 @@ func (g *DirectGuest) workerLoop(idx int, handler func([]byte) []byte) {
 		}
 
 		if !found {
-			// Wait on Event
-			WaitForEvent(slot.event, 0xFFFFFFFF)
-
-			// We woke up. This means there is work.
-			// Increase target pollers because we were forced to sleep.
-			curTarget := atomic.LoadInt32(&g.targetPollers)
-			if curTarget < int32(g.numSlots) { // Cap at numSlots or NumCPU?
-				// Cap at numSlots is logical max.
-				atomic.CompareAndSwapInt32(&g.targetPollers, curTarget, curTarget+1)
-			}
-		}
-
-		// Wait until state is definitively ReqReady (in case of race after wake)
-		for atomic.LoadUint32(&header.State) != SlotReqReady {
-			runtime.Gosched()
-		}
+            // Robust Wait Loop: Keep waiting until State is ReqReady
+            // We use timeout to handle potential signal loss or races
+            for {
+                s := atomic.LoadUint32(&header.State)
+                if s == SlotReqReady {
+                    break
+                }
+                // Wait with timeout
+                WaitForEvent(slot.event, 100)
+            }
+		} else {
+             // Found while polling. Just wait for state to be definitely ReqReady
+             for atomic.LoadUint32(&header.State) != SlotReqReady {
+                runtime.Gosched()
+             }
+        }
 
 		// 3. Process Request
 		msgId := header.MsgId
