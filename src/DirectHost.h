@@ -8,6 +8,7 @@
 #include <iostream>
 #include <functional>
 #include <atomic>
+#include <cmath>
 #include "Platform.h"
 #include "IPCUtils.h"
 
@@ -162,57 +163,17 @@ public:
     }
 
     /**
-     * @brief Sends a request to a specific slot.
+     * @brief Acquires a free slot for Zero-Copy usage.
+     * Blocks until a slot is available using the same adaptive strategy as Send.
      *
-     * Used when strict 1:1 thread-to-worker affinity is required.
-     * Blocks until the slot is free and then until the response is received.
-     *
-     * @param slotIdx The index of the slot to use.
-     * @param data Pointer to the request data.
-     * @param size Size of the request data.
-     * @param msgId The message ID (e.g., MSG_ID_NORMAL).
-     * @param[out] outResp Vector to store the response data.
-     * @return int Bytes read (response size), or -1 on error.
+     * @return The index of the acquired slot, or -1 if not running.
      */
-    int SendToSlot(uint32_t slotIdx, const uint8_t* data, uint32_t size, uint32_t msgId, std::vector<uint8_t>& outResp) {
-        if (!running || slotIdx >= numSlots) return -1;
-
-        Slot* slot = &slots[slotIdx];
-
-        // Claim specific slot
-        int retries = 0;
-        while(true) {
-             uint32_t expected = SLOT_FREE;
-             if (slot->header->state.compare_exchange_strong(expected, SLOT_BUSY, std::memory_order_acquire)) {
-                 break;
-             }
-             Platform::CpuRelax();
-             retries++;
-             if (retries > 1000) {
-                 Platform::ThreadYield();
-                 retries = 0;
-             }
-        }
-
-        return ProcessSlot(slot, data, size, msgId, outResp);
-    }
-
-    /**
-     * @brief Sends a request using any available slot.
-     *
-     * Attempts to use a thread-local cached slot first, then searches for a free slot.
-     *
-     * @param data Pointer to the request data.
-     * @param size Size of the request data.
-     * @param msgId The message ID.
-     * @param[out] outResp Vector to store the response data.
-     * @return int Bytes read (response size), or -1 on error.
-     */
-    int Send(const uint8_t* data, uint32_t size, uint32_t msgId, std::vector<uint8_t>& outResp) {
+    int32_t AcquireSlot() {
         if (!running) return -1;
 
         static thread_local uint32_t cachedSlotIdx = 0xFFFFFFFF;
         Slot* slot = nullptr;
+        int32_t resultIdx = -1;
 
         // Fast Path: Try cached slot
         if (cachedSlotIdx < numSlots) {
@@ -220,6 +181,7 @@ public:
             uint32_t expected = SLOT_FREE;
             if (s.header->state.compare_exchange_strong(expected, SLOT_BUSY, std::memory_order_acquire)) {
                 slot = &s;
+                resultIdx = (int32_t)cachedSlotIdx;
             }
         }
 
@@ -234,6 +196,7 @@ public:
                 if (s.header->state.compare_exchange_strong(expected, SLOT_BUSY, std::memory_order_acquire)) {
                     slot = &s;
                     cachedSlotIdx = idx; // Update Cache
+                    resultIdx = (int32_t)idx;
                     break;
                 }
                 idx = (idx + 1) % numSlots;
@@ -244,24 +207,83 @@ public:
                 }
             }
         }
-
-        return ProcessSlot(slot, data, size, msgId, outResp);
+        return resultIdx;
     }
 
-private:
-    int ProcessSlot(Slot* slot, const uint8_t* data, uint32_t size, uint32_t msgId, std::vector<uint8_t>& outResp) {
-        // 2. Write Request
-        if (size > slot->maxReqSize) size = slot->maxReqSize;
-        if (data && size > 0) {
-            memcpy(slot->reqBuffer, data, size);
+    /**
+     * @brief Acquires a specific slot.
+     * @param slotIdx The index of the slot to acquire.
+     * @return The slot index (same as input), or -1 if failed.
+     */
+    int32_t AcquireSpecificSlot(int32_t slotIdx) {
+        if (!running || slotIdx < 0 || slotIdx >= (int32_t)numSlots) return -1;
+        Slot* slot = &slots[slotIdx];
+
+        int retries = 0;
+        while(true) {
+             uint32_t expected = SLOT_FREE;
+             if (slot->header->state.compare_exchange_strong(expected, SLOT_BUSY, std::memory_order_acquire)) {
+                 break;
+             }
+             Platform::CpuRelax();
+             retries++;
+             if (retries > 1000) {
+                 Platform::ThreadYield();
+                 retries = 0;
+             }
         }
+        return slotIdx;
+    }
+
+    /**
+     * @brief Gets the request buffer pointer for an acquired slot.
+     * @param slotIdx The slot index.
+     * @return Pointer to the buffer, or nullptr if invalid.
+     */
+    uint8_t* GetReqBuffer(int32_t slotIdx) {
+        if (slotIdx < 0 || slotIdx >= (int32_t)numSlots) return nullptr;
+        return slots[slotIdx].reqBuffer;
+    }
+
+    /**
+     * @brief Gets the max request size for a slot.
+     * @param slotIdx The slot index.
+     * @return Max size in bytes.
+     */
+    int32_t GetMaxReqSize(int32_t slotIdx) {
+        if (slotIdx < 0 || slotIdx >= (int32_t)numSlots) return 0;
+        return (int32_t)slots[slotIdx].maxReqSize;
+    }
+
+    /**
+     * @brief Sends a request using an acquired slot (Zero-Copy flow).
+     *
+     * @param slotIdx The index of the acquired slot.
+     * @param size Size of the data. Negative means End-Aligned (Zero-Copy).
+     * @param msgId The message ID.
+     * @param[out] outResp Vector to store the response data.
+     * @return int Bytes read (response size), or -1 on error.
+     */
+    int SendAcquired(int32_t slotIdx, int32_t size, uint32_t msgId, std::vector<uint8_t>& outResp) {
+        if (slotIdx < 0 || slotIdx >= (int32_t)numSlots) return -1;
+        Slot* slot = &slots[slotIdx];
+
+        // Bounds Check
+        int32_t absSize = size < 0 ? -size : size;
+        if ((uint32_t)absSize > slot->maxReqSize) {
+             // Truncate logic? Or Error?
+             // Original logic truncated. We will truncate magnitude.
+             absSize = (int32_t)slot->maxReqSize;
+             size = size < 0 ? -absSize : absSize;
+        }
+
         slot->header->reqSize = size;
         slot->header->msgId = msgId;
 
         // Reset Host State
         slot->header->hostState.store(HOST_STATE_ACTIVE, std::memory_order_relaxed);
 
-        // 3. Signal Ready
+        // Signal Ready
         slot->header->state.store(SLOT_REQ_READY, std::memory_order_seq_cst);
 
         // Wake Guest if waiting
@@ -269,13 +291,12 @@ private:
             Platform::SignalEvent(slot->hReqEvent);
         }
 
-        // 4. Adaptive Wait for Response
+        // Adaptive Wait for Response
         bool ready = false;
         int currentLimit = slot->spinLimit;
         const int MIN_SPIN = 100;
         const int MAX_SPIN = 20000;
 
-        // Spin Phase
         for (int i = 0; i < currentLimit; ++i) {
             if (slot->header->state.load(std::memory_order_acquire) == SLOT_RESP_READY) {
                 ready = true;
@@ -290,15 +311,12 @@ private:
             if (currentLimit > MIN_SPIN) currentLimit -= 500;
             if (currentLimit < MIN_SPIN) currentLimit = MIN_SPIN;
 
-            // Sleep Phase
             slot->header->hostState.store(HOST_STATE_WAITING, std::memory_order_seq_cst);
 
-            // Double check
             if (slot->header->state.load(std::memory_order_acquire) == SLOT_RESP_READY) {
                 ready = true;
                 slot->header->hostState.store(HOST_STATE_ACTIVE, std::memory_order_relaxed);
             } else {
-                // Wait
                  while (slot->header->state.load(std::memory_order_acquire) != SLOT_RESP_READY) {
                     Platform::WaitEvent(slot->hRespEvent, 100);
                  }
@@ -308,23 +326,73 @@ private:
         }
         slot->spinLimit = currentLimit;
 
-        // 5. Read Response
+        // Read Response
         int resultSize = 0;
         if (ready) {
-            uint32_t respSize = slot->header->respSize;
-            if (respSize > slot->maxRespSize) respSize = slot->maxRespSize;
+            int32_t respSize = slot->header->respSize;
+            int32_t absResp = respSize < 0 ? -respSize : respSize;
 
-            outResp.resize(respSize);
-            if (respSize > 0) {
-                memcpy(outResp.data(), slot->respBuffer, respSize);
+            if ((uint32_t)absResp > slot->maxRespSize) absResp = (int32_t)slot->maxRespSize;
+
+            outResp.resize(absResp);
+            if (absResp > 0) {
+                if (respSize >= 0) {
+                    // Start-aligned
+                    memcpy(outResp.data(), slot->respBuffer, absResp);
+                } else {
+                    // End-aligned (Zero-Copy Guest)
+                    uint32_t offset = slot->maxRespSize - absResp;
+                    memcpy(outResp.data(), slot->respBuffer + offset, absResp);
+                }
             }
-            resultSize = (int)respSize;
+            resultSize = absResp;
         }
 
-        // 6. Release Slot
+        // Release Slot
         slot->header->state.store(SLOT_FREE, std::memory_order_release);
 
         return resultSize;
+    }
+
+    /**
+     * @brief Sends a request to a specific slot.
+     * @param slotIdx The index of the slot to use.
+     * @param data Pointer to the request data.
+     * @param size Size of the request data.
+     * @param msgId The message ID.
+     * @param[out] outResp Vector to store the response data.
+     * @return int Bytes read (response size), or -1 on error.
+     */
+    int SendToSlot(uint32_t slotIdx, const uint8_t* data, int32_t size, uint32_t msgId, std::vector<uint8_t>& outResp) {
+        int32_t idx = AcquireSpecificSlot((int32_t)slotIdx);
+        if (idx < 0) return -1;
+
+        if (size > 0 && data) {
+            int32_t max = GetMaxReqSize(idx);
+            if (size > max) size = max;
+            memcpy(GetReqBuffer(idx), data, size);
+        }
+        return SendAcquired(idx, size, msgId, outResp);
+    }
+
+    /**
+     * @brief Sends a request using any available slot.
+     * @param data Pointer to the request data.
+     * @param size Size of the request data.
+     * @param msgId The message ID.
+     * @param[out] outResp Vector to store the response data.
+     * @return int Bytes read (response size), or -1 on error.
+     */
+    int Send(const uint8_t* data, int32_t size, uint32_t msgId, std::vector<uint8_t>& outResp) {
+        int32_t idx = AcquireSlot();
+        if (idx < 0) return -1;
+
+        if (size > 0 && data) {
+            int32_t max = GetMaxReqSize(idx);
+            if (size > max) size = max;
+            memcpy(GetReqBuffer(idx), data, size);
+        }
+        return SendAcquired(idx, size, msgId, outResp);
     }
 };
 

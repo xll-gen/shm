@@ -40,8 +40,8 @@ The memory layout is manually synchronized between C++ and Go. **Any mismatch wi
 | :--- | :--- | :--- |
 | `pre_pad` | 64 | **Padding to avoid false sharing** |
 | `State` | 4 | Atomic |
-| `ReqSize` | 4 | |
-| `RespSize` | 4 | |
+| `ReqSize` | 4 | int32 (Negative = End-aligned) |
+| `RespSize` | 4 | int32 (Negative = End-aligned) |
 | `MsgId` | 4 | |
 | `HostState` | 4 | Atomic |
 | `GuestState` | 4 | Atomic |

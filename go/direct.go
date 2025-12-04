@@ -45,8 +45,8 @@ const (
 type SlotHeader struct {
     _         [64]byte
 	State     uint32
-	ReqSize   uint32
-	RespSize  uint32
+	ReqSize   int32
+	RespSize  int32
 	MsgId     uint32
 	HostState uint32
 	GuestState uint32
@@ -179,7 +179,7 @@ func NewDirectGuest(name string, _ int, _ int) (*DirectGuest, error) {
 // Start launches the worker goroutines.
 //
 // handler: The function to process requests.
-func (g *DirectGuest) Start(handler func(req []byte, resp []byte) uint32) {
+func (g *DirectGuest) Start(handler func(req []byte, resp []byte) int32) {
 	for i := 0; i < int(g.numSlots); i++ {
 		g.wg.Add(1)
 		go g.workerLoop(i, handler)
@@ -203,7 +203,7 @@ func (g *DirectGuest) Wait() {
 }
 
 // workerLoop is the main loop for a single slot worker.
-func (g *DirectGuest) workerLoop(idx int, handler func([]byte, []byte) uint32) {
+func (g *DirectGuest) workerLoop(idx int, handler func([]byte, []byte) int32) {
 	defer g.wg.Done()
 
 	slot := &g.slots[idx]
@@ -263,12 +263,22 @@ func (g *DirectGuest) workerLoop(idx int, handler func([]byte, []byte) uint32) {
                  header.MsgId = MsgIdHeartbeatResp
                  header.RespSize = 0
              } else {
-                 reqLen := header.ReqSize
-                 if reqLen > uint32(len(slot.reqBuffer)) { reqLen = uint32(len(slot.reqBuffer)) }
+                 reqSize := header.ReqSize
+                 var reqData []byte
 
-                 reqData := slot.reqBuffer[:reqLen]
-                 respLen := handler(reqData, slot.respBuffer)
-                 header.RespSize = respLen
+                 if reqSize >= 0 {
+                     if reqSize > int32(len(slot.reqBuffer)) { reqSize = int32(len(slot.reqBuffer)) }
+                     reqData = slot.reqBuffer[:reqSize]
+                 } else {
+                     // Negative size means data is at the end
+                     rLen := -reqSize
+                     if rLen > int32(len(slot.reqBuffer)) { rLen = int32(len(slot.reqBuffer)) }
+                     offset := int32(len(slot.reqBuffer)) - rLen
+                     reqData = slot.reqBuffer[offset:]
+                 }
+
+                 respSize := handler(reqData, slot.respBuffer)
+                 header.RespSize = respSize
              }
 
              // Signal Ready
