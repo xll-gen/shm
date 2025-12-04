@@ -21,7 +21,6 @@ const (
 
 func main() {
 	workers := flag.Int("w", 1, "Number of worker threads")
-	// mode flag removed
 	cpuprofile := flag.String("cpuprofile", "", "write cpu profile to file")
 	memprofile := flag.String("memprofile", "", "write memory profile to file")
 	flag.Parse()
@@ -45,12 +44,11 @@ func main() {
 	}
 	fmt.Println("[Go] Connected.")
 
-	// Handler - using simple byte slice handler now
-	client.Handle(func(reqData []byte) []byte {
+	// Handler - Zero Copy
+	client.Handle(func(reqData []byte, respBuf []byte) int {
 		// Expect TransportHeader (8 bytes) + ReqSize
-		if len(reqData) != 8+ReqSize {
-			fmt.Printf("[Go] Error: Malformed request. Len=%d, Expected=%d\n", len(reqData), 8+ReqSize)
-			return nil
+		if len(reqData) < 8+ReqSize {
+			return 0
 		}
 
 		// Extract Transport Header (req_id)
@@ -67,14 +65,17 @@ func main() {
 		res := x + y
 
 		// Prepare Response: Header (8) + Resp (16)
-		respData := make([]byte, 8+16)
-		copy(respData[0:8], reqIdHeader)
+		if len(respBuf) < 8+16 {
+			return 0
+		}
+
+		copy(respBuf[0:8], reqIdHeader)
 
 		// C++: struct { int64_t id; double result; }
-		binary.LittleEndian.PutUint64(respData[8:16], uint64(id))
-		binary.LittleEndian.PutUint64(respData[16:24], math.Float64bits(res))
+		binary.LittleEndian.PutUint64(respBuf[8:16], uint64(id))
+		binary.LittleEndian.PutUint64(respBuf[16:24], math.Float64bits(res))
 
-		return respData
+		return 8 + 16
 	})
 
 	// Start (Blocking)

@@ -11,6 +11,11 @@ This project implements a high-performance, lock-free Shared Memory IPC (Inter-P
 -   **Guest (Go):** Attaches to shared memory.
 -   **Philosophy:** Zero-copy (where possible), cache-line aligned, direct slot exchange.
 
+### Architecture (Updated)
+-   **Direct Mode Only:** Each worker thread maps 1:1 to a specific slot.
+-   **PingPong Logic:** Uses a simplified State Machine (`WaitReq` -> `ReqReady` -> `RespReady`).
+-   **Split Buffer:** Each slot is divided into `Header` (128B), `ReqBuffer` (Half Slot), `RespBuffer` (Half Slot) to enable Zero Copy.
+
 ### Directory Structure
 
 -   `src/`: C++ Host implementation (`IPCHost`, `DirectHost`, `Platform`).
@@ -38,21 +43,26 @@ The memory layout is manually synchronized between C++ and Go. **Any mismatch wi
 | Field | Size (Bytes) | Notes |
 | :--- | :--- | :--- |
 | `pre_pad` | 64 | **Padding to avoid false sharing** |
-| `State` | 4 | Atomic |
+| `State` | 4 | Atomic (`SLOT_WAIT_REQ` etc.) |
 | `ReqSize` | 4 | |
 | `RespSize` | 4 | |
 | `MsgId` | 4 | |
-| `HostState` | 4 | Atomic |
-| `padding` | 44 | **Aligns struct to 128 bytes** |
+| `HostSleeping` | 4 | Atomic (1 = Sleeping) |
+| `GuestSleeping` | 4 | Atomic (1 = Sleeping) |
+| `padding` | 40 | **Aligns struct to 128 bytes** |
+
+#### Slot Data Layout
+`[SlotHeader (128B)] [ReqBuffer (HalfSize)] [RespBuffer (HalfSize)]`
 
 ### 2.2. Synchronization Primitives
 
 -   **Hot Path:** Do not use OS Mutexes in the hot loops.
 -   **Spin-Wait:**
-    -   C++: Use `CpuRelax()` (wraps `_mm_pause` or `yield`) and `std::this_thread::yield()`.
+    -   C++: Use `Platform::ThreadYield()` (wraps `sched_yield` or `_mm_pause`).
     -   Go: Use `runtime.Gosched()`.
 -   **Signaling:**
-    -   Hybrid approach: Spin for a set duration, then sleep on an OS Event.
+    -   Hybrid approach: Adaptive Spin -> Sleep on Semaphore.
+    -   Atomic Flags (`HostSleeping`, `GuestSleeping`) used to avoid unnecessary syscalls.
 
 ---
 
@@ -70,8 +80,8 @@ The memory layout is manually synchronized between C++ and Go. **Any mismatch wi
 Before submitting, you must run the benchmarks to ensure no regressions.
 
 ```bash
-# Run all benchmarks (Requires CMake and Go)
-task run:benchmark
+# Run all benchmarks
+./benchmarks/run_bench.sh
 ```
 
 If the benchmark hangs or produces "ID Mismatch" errors, you have broken the memory layout or synchronization logic.

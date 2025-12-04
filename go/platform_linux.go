@@ -10,18 +10,14 @@ package shm
 #include <time.h>
 #include <errno.h>
 
-// Helper to open semaphore
 sem_t* create_sem(const char* name) {
-	// O_CREAT with permissions 0644, init value 0
 	return sem_open(name, O_CREAT, 0644, 0);
 }
 
 sem_t* open_sem_existing(const char* name) {
-    // No O_CREAT
     return sem_open(name, 0);
 }
 
-// Helper for timed wait
 int wait_sem(sem_t* sem, int ms) {
 	struct timespec ts;
 	clock_gettime(CLOCK_REALTIME, &ts);
@@ -34,12 +30,15 @@ int wait_sem(sem_t* sem, int ms) {
 	return sem_timedwait(sem, &ts);
 }
 
+int wait_sem_infinite(sem_t* sem) {
+    return sem_wait(sem);
+}
+
 int create_shm_fd(const char* name) {
 	return shm_open(name, O_CREAT | O_RDWR, 0666);
 }
 
 int open_shm_fd(const char* name) {
-    // No O_CREAT
     return shm_open(name, O_RDWR, 0666);
 }
 
@@ -82,7 +81,11 @@ func signalEvent(h EventHandle) {
 }
 
 func waitForEvent(h EventHandle, timeoutMs uint32) {
-	C.wait_sem((*C.sem_t)(unsafe.Pointer(h)), C.int(timeoutMs))
+    if timeoutMs == 0xFFFFFFFF {
+        C.wait_sem_infinite((*C.sem_t)(unsafe.Pointer(h)))
+    } else {
+	    C.wait_sem((*C.sem_t)(unsafe.Pointer(h)), C.int(timeoutMs))
+    }
 }
 
 func closeEvent(h EventHandle) {
@@ -121,11 +124,10 @@ func openShm(name string, size uint64) (ShmHandle, uintptr, error) {
         return 0, 0, fmt.Errorf("shm_open(existing) failed")
     }
 
-    // Check size to avoid SIGBUS if Host hasn't truncated yet
     curSize := C.get_file_size(fd)
     if curSize < C.long(size) {
         C.close(fd)
-        return 0, 0, fmt.Errorf("shm file size too small (host initializing?)")
+        return 0, 0, fmt.Errorf("shm file size too small")
     }
 
     addr := C.mmap(nil, C.size_t(size), C.PROT_READ|C.PROT_WRITE, C.MAP_SHARED, fd, 0)

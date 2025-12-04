@@ -15,6 +15,9 @@
     #include <string>
     #include <cstring>
     #include <iostream>
+    #if defined(__x86_64__) || defined(__i386__)
+        #include <immintrin.h>
+    #endif
 
     typedef sem_t* EventHandle;
     typedef int ShmHandle; // File Descriptor
@@ -30,7 +33,7 @@ public:
         return CreateEventA(NULL, FALSE, FALSE, evName.c_str());
 #else
         std::string evName = "/" + std::string(name);
-        EventHandle sem = sem_open(evName.c_str(), O_CREAT, 0644, 0);
+        EventHandle sem = sem_open(evName.c_str(), O_CREAT, 0666, 0); // 0666 to ensure access
         if (sem == SEM_FAILED) {
             std::cerr << "sem_open failed: " << strerror(errno) << std::endl;
             return nullptr;
@@ -94,7 +97,7 @@ public:
 
         struct stat st;
         fstat(outHandle, &st);
-        outExists = (st.st_size > 0); // Simplistic check
+        outExists = (st.st_size > 0);
 
         if (ftruncate(outHandle, size) == -1) {
             close(outHandle);
@@ -115,7 +118,7 @@ public:
         if (addr) UnmapViewOfFile(addr);
         if (h) CloseHandle(h);
 #else
-        // munmap(addr, size); // size is lost here, leak in this simple abstraction
+        // munmap not fully supported in this simple API
         if (h >= 0) close(h);
 #endif
     }
@@ -125,6 +128,20 @@ public:
         SwitchToThread();
 #else
         sched_yield();
+#endif
+    }
+
+    static void CpuRelax() {
+#ifdef _WIN32
+        YieldProcessor();
+#else
+        #if defined(__x86_64__) || defined(__i386__)
+            _mm_pause();
+        #elif defined(__aarch64__)
+            asm volatile("yield");
+        #else
+            sched_yield();
+        #endif
 #endif
     }
 

@@ -8,7 +8,7 @@ import (
 // Client is the high-level API for Guest.
 type Client struct {
 	guest   *DirectGuest
-	handler func([]byte) []byte
+	handler func([]byte, []byte) int
 }
 
 // Connect creates a connection to the Host (Direct Mode only).
@@ -19,9 +19,7 @@ func Connect(name string) (*Client, error) {
 
 	// Retry loop
 	for i := 0; i < 50; i++ {
-		// Direct Mode: Auto-discover configuration from SHM Header.
-		// Extra params ignored as DirectGuest discovers size from header.
-		g, err = NewDirectGuest(name, 0, 0)
+		g, err = NewDirectGuest(name)
 
 		if err == nil {
 			return &Client{guest: g}, nil
@@ -31,7 +29,7 @@ func Connect(name string) (*Client, error) {
 	return nil, fmt.Errorf("failed to connect after retries: %v", err)
 }
 
-func (c *Client) Handle(h func([]byte) []byte) {
+func (c *Client) Handle(h func([]byte, []byte) int) {
 	c.handler = h
 }
 
