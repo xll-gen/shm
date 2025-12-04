@@ -18,6 +18,13 @@ const (
 	SlotHostDone  = 5
 )
 
+const (
+	MsgIdNormal        = 0
+	MsgIdHeartbeatReq  = 1
+	MsgIdHeartbeatResp = 2
+	MsgIdShutdown      = 3
+)
+
 // SlotHeader matching C++
 type SlotHeader struct {
     _         [64]byte // Pre-padding

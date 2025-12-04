@@ -20,26 +20,15 @@ tasks:
     deps: [build:cpp, build:go]
 
   run:benchmark:
-    desc: Runs SPSC benchmark
+    desc: Runs Direct benchmark
     deps: [build]
     cmds:
       - task: run:case
-        vars: { THREADS: 1, MODE: spsc }
+        vars: { THREADS: 1 }
       - task: run:case
-        vars: { THREADS: 4, MODE: spsc }
+        vars: { THREADS: 4 }
       - task: run:case
-        vars: { THREADS: 8, MODE: spsc }
-
-  run:benchmark_mpsc:
-    desc: Runs MPSC benchmark
-    deps: [build]
-    cmds:
-      - task: run:case
-        vars: { THREADS: 1, MODE: mpsc }
-      - task: run:case
-        vars: { THREADS: 4, MODE: mpsc }
-      - task: run:case
-        vars: { THREADS: 8, MODE: mpsc }
+        vars: { THREADS: 8 }
 
   run:case:
     internal: true
@@ -50,10 +39,10 @@ tasks:
         ignore_error: true
         platforms: [linux]
 
-      # Start Server (pass mode)
-      - cmd: './benchmarks/go/server -w {{.THREADS}} -mode {{.MODE}} > server_{{.MODE}}_{{.THREADS}}.log 2>&1 &'
+      # Start Server
+      - cmd: './benchmarks/go/server -w {{.THREADS}} > server_{{.THREADS}}.log 2>&1 &'
         platforms: [linux]
-      - cmd: 'cmd /c "start /B benchmarks\go\server.exe -w {{.THREADS}} -mode {{.MODE}} > server_{{.MODE}}_{{.THREADS}}.log 2>&1"'
+      - cmd: 'cmd /c "start /B benchmarks\go\server.exe -w {{.THREADS}} > server_{{.THREADS}}.log 2>&1"'
         platforms: [windows]
 
       # Wait for start
@@ -63,9 +52,9 @@ tasks:
         platforms: [windows]
 
       # Run Client
-      - cmd: './benchmarks/build/shm_benchmark -t {{.THREADS}} -mode {{.MODE}}'
+      - cmd: './benchmarks/build/shm_benchmark -t {{.THREADS}}'
         platforms: [linux]
-      - cmd: 'benchmarks\build\shm_benchmark.exe -t {{.THREADS}} -mode {{.MODE}}'
+      - cmd: 'benchmarks\build\shm_benchmark.exe -t {{.THREADS}}'
         platforms: [windows]
 
       # Cleanup
