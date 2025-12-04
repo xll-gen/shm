@@ -36,22 +36,8 @@ func Connect(name string, mode Mode) (*Client, error) {
 	for i := 0; i < 50; i++ {
 		if mode == ModeDirect {
 			// Direct Mode
-            // We need to guess or know the params.
-            // In benchmark, we use -w for threads. Host uses same count.
-            // But NewDirectGuest needs numSlots.
-            // Client.Connect signature doesn't take numSlots.
-            // We'll assume a default or we need to change Connect signature?
-            // For now, let's assume the user of Connect (Benchmark) might need to use NewDirectGuest directly if they want custom slots.
-            // BUT, the existing code had defaults "4, 1MB".
-            // Let's stick to that for now, or better:
-            // The Host creates the SHM. Guest just opens it.
-            // Actually, Guest needs to know numSlots to Open events (slot_0, slot_1).
-            // This is a limitation of the current Connect API.
-            // We will use 4 slots as a fallback if not specified,
-            // but the benchmark passes -w.
-            // The previous client.go had "4". Let's use 64 to be safe?
-            // Or just 16.
-			t, err = NewDirectGuest(name, 16, 1024*1024)
+			// Auto-discover configuration from SHM Header.
+			t, err = NewDirectGuest(name, 0, 0)
 		} else {
 			// Queue Mode
 			qTotalSize := uint64(QueueHeaderSize + 32*1024*1024)
@@ -69,7 +55,7 @@ func Connect(name string, mode Mode) (*Client, error) {
 
 					if toQ.Header.Capacity > 0 {
 						t = NewIPCGuest(toQ, fromQ)
-                        _ = hMap
+						_ = hMap
 					} else {
 						err = fmt.Errorf("queue not initialized")
 					}

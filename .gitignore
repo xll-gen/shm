@@ -51,3 +51,4 @@ CMakeUserPresets.json
 # Benchmarks
 benchmarks/build/
 benchmarks/go/server
+benchmarks/go/go_bench

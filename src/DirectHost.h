@@ -47,12 +47,16 @@ public:
         this->numQueues = numQueues;
         this->onMessage = msgHandler;
 
-        uint32_t slotsPerLane = 1024;
+        // Force 1 slot per lane for compatibility with Go DirectGuest
+        uint32_t slotsPerLane = 1;
         this->slotDataSize = 1024 * 1024; // 1MB
         this->perSlotTotal = sizeof(SlotHeader) + slotDataSize;
 
+        size_t exchangeHeaderSize = sizeof(ExchangeHeader);
+        if (exchangeHeaderSize < 64) exchangeHeaderSize = 64;
+
         size_t laneSize = slotsPerLane * perSlotTotal;
-        size_t totalSize = laneSize * numQueues;
+        size_t totalSize = exchangeHeaderSize + (laneSize * numQueues);
 
         bool exists = false;
         shmBase = Platform::CreateNamedShm(shmName.c_str(), totalSize, hMapFile, exists);
@@ -61,8 +65,13 @@ public:
         // Zero out memory if new
         memset(shmBase, 0, totalSize);
 
+        // Write ExchangeHeader
+        ExchangeHeader* exHeader = (ExchangeHeader*)shmBase;
+        exHeader->numSlots = numQueues;
+        exHeader->slotSize = slotDataSize;
+
         lanes.resize(numQueues);
-        uint8_t* ptr = (uint8_t*)shmBase;
+        uint8_t* ptr = (uint8_t*)shmBase + exchangeHeaderSize;
 
         for (uint32_t i = 0; i < numQueues; ++i) {
             lanes[i].slots = (SlotHeader*)ptr;

@@ -35,6 +35,12 @@ const (
 )
 
 // ExchangeHeader matching C++
+// Reference: include/IPCUtils.h
+// struct ExchangeHeader {
+//     uint32_t numSlots;
+//     uint32_t slotSize;
+//     uint8_t padding[56]; // Padding to 64 bytes
+// };
 type ExchangeHeader struct {
 	NumSlots uint32
 	SlotSize uint32
@@ -62,8 +68,30 @@ type slotContext struct {
 	respEvent EventHandle // Resp Event
 }
 
-func NewDirectGuest(name string, numSlots int, slotSize int) (*DirectGuest, error) {
-	// Calculate size
+func NewDirectGuest(name string, _ int, _ int) (*DirectGuest, error) {
+	// Step 1: Map the first page (4KB) to read the header
+	const HeaderMapSize = 4096
+	h, addr, err := OpenShm(name, HeaderMapSize)
+	if err != nil {
+		return nil, err
+	}
+
+	// Read ExchangeHeader
+	header := (*ExchangeHeader)(unsafe.Pointer(addr))
+
+	numSlots := header.NumSlots
+	slotSize := header.SlotSize
+
+	// Basic validation: if 0, Host hasn't initialized yet.
+	if numSlots == 0 || slotSize == 0 {
+		CloseShm(h, addr, HeaderMapSize)
+		return nil, fmt.Errorf("shared memory not ready (slots/size is 0)")
+	}
+
+	// Unmap header
+	CloseShm(h, addr, HeaderMapSize)
+
+	// Step 2: Calculate full size and remap
 	headerSize := uint64(unsafe.Sizeof(ExchangeHeader{}))
     if headerSize < 64 { headerSize = 64 }
 
@@ -73,7 +101,7 @@ func NewDirectGuest(name string, numSlots int, slotSize int) (*DirectGuest, erro
 	perSlotSize := slotHeaderSize + uint64(slotSize)
 	totalSize := headerSize + (perSlotSize * uint64(numSlots))
 
-	h, addr, err := OpenShm(name, totalSize)
+	h, addr, err = OpenShm(name, totalSize)
 	if err != nil {
 		return nil, err
 	}
@@ -88,14 +116,14 @@ func NewDirectGuest(name string, numSlots int, slotSize int) (*DirectGuest, erro
 		shmBase:       addr,
 		shmSize:       totalSize,
 		handle:        h,
-		numSlots:      uint32(numSlots),
-		slotSize:      uint32(slotSize),
+		numSlots:      numSlots,
+		slotSize:      slotSize,
 		slots:         make([]slotContext, numSlots),
 		targetPollers: target,
 	}
 
 	ptr := addr + uintptr(headerSize)
-	for i := 0; i < numSlots; i++ {
+	for i := 0; i < int(numSlots); i++ {
 		g.slots[i].header = (*SlotHeader)(unsafe.Pointer(ptr))
 
 		dataPtr := unsafe.Pointer(ptr + uintptr(slotHeaderSize))
@@ -104,6 +132,7 @@ func NewDirectGuest(name string, numSlots int, slotSize int) (*DirectGuest, erro
 		eventName := fmt.Sprintf("%s_slot_%d", name, i)
 		ev, err := OpenEvent(eventName)
 		if err != nil {
+			g.Close()
 			return nil, err
 		}
 		g.slots[i].event = ev
@@ -111,9 +140,12 @@ func NewDirectGuest(name string, numSlots int, slotSize int) (*DirectGuest, erro
 		respName := fmt.Sprintf("%s_slot_%d_resp", name, i)
 		evResp, err := OpenEvent(respName)
 		if err != nil {
-			return nil, err
-		}
-		g.slots[i].respEvent = evResp
+            // Response event might not exist if Host doesn't use it (busy polling).
+            // We ignore this error and just don't signal response.
+            g.slots[i].respEvent = 0
+		} else {
+		    g.slots[i].respEvent = evResp
+        }
 
 		ptr += uintptr(perSlotSize)
 	}
@@ -124,35 +156,7 @@ func NewDirectGuest(name string, numSlots int, slotSize int) (*DirectGuest, erro
 // Implement Transport Interface
 
 func (g *DirectGuest) Send(data []byte) {
-	// Direct mode does not support arbitrary 'Send'.
-	// It only sends 'Response' to the current slot being processed.
-	// However, the unified 'Client' expects to call 'Send' with the response data
-	// AFTER the handler returns.
-	// But 'Start' calls the handler.
-	// In 'DirectGuest', the worker loop calls the handler and writes the response IMMEDIATELY to the slot.
-	// This means DirectGuest CANNOT implement generic 'Send' easily unless 'Start' manages the flow differently.
-
-	// FIX: The 'Client' implementation I wrote calls 'Start' with a wrapper handler that calls 'handler' then 'Send'.
-	// This works for Queue mode (read -> handle -> write).
-	// But for Direct mode, the 'workerLoop' handles the write step implicitly.
-	// Therefore, DirectGuest's 'Start' should take the 'handler' and do everything.
-	// BUT, 'Client' is trying to be generic.
-
-	// Solution: 'DirectGuest.Send' is a no-op or panic because DirectGuest.Start() handles the response writing internally?
-	// No, the 'handler' passed to Start returns void in Client's wrapper?
-	// Client.Start passes `func(data)` to Transport.Start.
-	// This function calls user handler, gets result, and calls Transport.Send(result).
-
-	// This flow breaks DirectGuest which expects handler to return []byte.
-
-	// Refactoring Client:
-	// Let Transport.Start take `func([]byte) []byte`?
-	// If Queue mode, it reads, calls handler, sends result.
-	// If Direct mode, it reads, calls handler, writes result to slot.
-	// This is much better for Direct mode efficiency too (no extra buffer copy/Send call).
-
-	// Let's change the plan for Client slightly.
-	// Transport.Start(handler func([]byte) []byte)
+	// Not used in Direct Mode loop
 }
 
 // Start spawns workers. Each worker is pinned to a slot index.
@@ -174,10 +178,14 @@ func (g *DirectGuest) Wait() {
 }
 
 func (g *DirectGuest) Close() {
-	CloseShm(g.handle, g.shmBase)
+	CloseShm(g.handle, g.shmBase, g.shmSize)
 	for _, s := range g.slots {
-		CloseEvent(s.event)
-		CloseEvent(s.respEvent)
+		if s.event != 0 {
+			CloseEvent(s.event)
+		}
+		if s.respEvent != 0 {
+			CloseEvent(s.respEvent)
+		}
 	}
 }
 
@@ -289,7 +297,9 @@ func (g *DirectGuest) workerLoop(idx int, handler func([]byte) []byte) {
 
 		// Check if Host is waiting
 		if atomic.LoadUint32(&header.HostState) == HostStateWaiting {
-			SignalEvent(slot.respEvent)
+            if slot.respEvent != 0 {
+			    SignalEvent(slot.respEvent)
+            }
 		}
 
 		// 5. Wait for Host Done
