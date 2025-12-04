@@ -7,15 +7,15 @@ This document provides context, rules, and guidelines for AI Agents working on t
 
 This project implements a high-performance, lock-free Shared Memory IPC (Inter-Process Communication) library between **C++ (Host)** and **Go (Guest)**.
 
--   **Host (C++):** Creates shared memory, acts as the server/initiator in some contexts or queue owner.
+-   **Host (C++):** Creates shared memory, acts as the server/initiator.
 -   **Guest (Go):** Attaches to shared memory.
--   **Philosophy:** Zero-copy (where possible), cache-line aligned, lock-free ring buffers (SPSC), and direct slot exchange.
+-   **Philosophy:** Zero-copy (where possible), cache-line aligned, direct slot exchange.
 
 ### Directory Structure
 
 -   `src/`: C++ Host implementation (`IPCHost`, `DirectHost`, `Platform`).
--   `include/`: Shared C++ headers (`IPCUtils.h` - **CRITICAL**, `SPSCQueue.h`).
--   `go/`: Go Guest implementation (`queue.go`, `direct.go`, `platform.go`).
+-   `include/`: Shared C++ headers (`IPCUtils.h` - **CRITICAL**).
+-   `go/`: Go Guest implementation (`direct.go`, `platform.go`, `client.go`).
 -   `benchmarks/`: C++ client and Go server for performance testing.
 -   `Taskfile.yaml`: Automation for building and running benchmarks.
 
@@ -32,36 +32,27 @@ The memory layout is manually synchronized between C++ and Go. **Any mismatch wi
 2.  **Padding:** Never remove `_pad` fields without recalculating exact offsets.
 3.  **Types:** `uint64_t` (C++) == `uint64` (Go), `std::atomic<T>` behaves like `atomic` package.
 
-#### QueueHeader Layout
-*Reference: `include/IPCUtils.h` (C++) and `go/queue.go` (Go)*
+#### SlotHeader Layout (Direct Mode)
+*Reference: `include/IPCUtils.h` (C++) and `go/direct.go` (Go)*
 
-| Offset | Field | Size (Bytes) | Notes |
-| :--- | :--- | :--- | :--- |
-| 0 | `WritePos` | 8 | Atomic |
-| 8 | `_pad1` | 56 | **Separates Write/Read Cache Lines** |
-| 64 | `ReadPos` | 8 | Atomic |
-| 72 | `Capacity` | 8 | Atomic |
-| 80 | `ConsumerActive` | 4 | Atomic (0=Sleep, 1=Active) |
-| 84 | `_pad2` | 44 | **Aligns struct to 128 bytes** |
-
-#### BlockHeader Layout
-*Reference: `include/IPCUtils.h`*
--   Total Size: **16 Bytes**
--   `size` (4), `msgId` (4), `magic` (4), `_pad` (4).
-
-#### Magic Numbers
--   `BLOCK_MAGIC_DATA`: `0xAB12CD34`
--   `BLOCK_MAGIC_PAD`: `0xAB12CD35`
+| Field | Size (Bytes) | Notes |
+| :--- | :--- | :--- |
+| `pre_pad` | 64 | **Padding to avoid false sharing** |
+| `State` | 4 | Atomic |
+| `ReqSize` | 4 | |
+| `RespSize` | 4 | |
+| `MsgId` | 4 | |
+| `HostState` | 4 | Atomic |
+| `padding` | 44 | **Aligns struct to 128 bytes** |
 
 ### 2.2. Synchronization Primitives
 
--   **Hot Path:** Do not use OS Mutexes (`std::mutex`, `sync.Mutex`) in the Enqueue/Dequeue hot loops.
+-   **Hot Path:** Do not use OS Mutexes in the hot loops.
 -   **Spin-Wait:**
-    -   C++: Use `CpuRelax()` (wraps `_mm_pause` or `yield`).
+    -   C++: Use `CpuRelax()` (wraps `_mm_pause` or `yield`) and `std::this_thread::yield()`.
     -   Go: Use `runtime.Gosched()`.
 -   **Signaling:**
-    -   Hybrid approach: Spin for a set duration, then sleep on an OS Event (Semaphore/Event).
-    -   Variables: `ConsumerActive` determines if the consumer needs a signal.
+    -   Hybrid approach: Spin for a set duration, then sleep on an OS Event.
 
 ---
 
@@ -73,7 +64,7 @@ The memory layout is manually synchronized between C++ and Go. **Any mismatch wi
 
 ### 3.2. Performance
 -   **No Logging in Loops:** Never put `fmt.Println` or `std::cout` in the critical path. It invalidates benchmarks.
--   **Allocations:** Minimize Go heap allocations in the hot loop. Use `sync.Pool`.
+-   **Allocations:** Minimize Go heap allocations in the hot loop.
 
 ### 3.3. Verification
 Before submitting, you must run the benchmarks to ensure no regressions.
@@ -87,6 +78,5 @@ If the benchmark hangs or produces "ID Mismatch" errors, you have broken the mem
 
 ## 4. Common Pitfalls
 
-1.  **Padding drift:** Adding a field to `QueueHeader` without adjusting `_pad2`.
-2.  **Magic Number Mismatch:** Changing a constant in C++ but forgetting Go.
-3.  **Zombie Semaphores (Linux):** If the benchmark crashes, shared memory files (`/dev/shm/*`) may remain. Use `rm /dev/shm/SimpleIPC*` to clean up.
+1.  **Padding drift:** Adding a field to structs without adjusting padding.
+2.  **Zombie Semaphores (Linux):** If the benchmark crashes, shared memory files (`/dev/shm/*`) may remain. Use `rm /dev/shm/SimpleIPC*` to clean up.

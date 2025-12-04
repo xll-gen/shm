@@ -5,68 +5,26 @@ import (
 	"time"
 )
 
-type Mode int
-
-const (
-	ModeQueue Mode = iota
-	ModeDirect
-)
-
 // Client is the high-level API for Guest.
-// It wraps a Transport (Queue or Direct) and handles connection retries.
 type Client struct {
-	transport Transport
-	handler   func([]byte) []byte
+	guest   *DirectGuest
+	handler func([]byte) []byte
 }
 
-// Transport interface defines the contract for IPC mechanisms.
-type Transport interface {
-	Start(func([]byte) []byte)
-	Close()
-	Wait()
-}
-
-// Connect creates a connection to the Host.
+// Connect creates a connection to the Host (Direct Mode only).
 // It automatically retries until connection is established.
-func Connect(name string, mode Mode) (*Client, error) {
-	var t Transport
+func Connect(name string) (*Client, error) {
+	var g *DirectGuest
 	var err error
 
 	// Retry loop
 	for i := 0; i < 50; i++ {
-		if mode == ModeDirect {
-			// Direct Mode
-			// Auto-discover configuration from SHM Header.
-			t, err = NewDirectGuest(name, 0, 0)
-		} else {
-			// Queue Mode
-			qTotalSize := uint64(QueueHeaderSize + 32*1024*1024)
-			totalSize := uint64(qTotalSize * 2)
-
-			var hMap ShmHandle
-			var addr uintptr
-			hMap, addr, err = OpenShm(name, totalSize)
-			if err == nil {
-				hTo, err2 := OpenEvent(name + "_event_req")
-				hFrom, err3 := OpenEvent(name + "_event_resp")
-				if err2 == nil && err3 == nil {
-					toQ := NewLockedSPSCQueue(addr, 32*1024*1024, hTo)
-					fromQ := NewLockedSPSCQueue(addr+uintptr(qTotalSize), 32*1024*1024, hFrom)
-
-					if toQ.Header.Capacity > 0 {
-						t = NewIPCGuest(toQ, fromQ)
-						_ = hMap
-					} else {
-						err = fmt.Errorf("queue not initialized")
-					}
-				} else {
-					err = fmt.Errorf("events not ready")
-				}
-			}
-		}
+		// Direct Mode: Auto-discover configuration from SHM Header.
+		// Extra params ignored as DirectGuest discovers size from header.
+		g, err = NewDirectGuest(name, 0, 0)
 
 		if err == nil {
-			return &Client{transport: t}, nil
+			return &Client{guest: g}, nil
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
@@ -77,19 +35,17 @@ func (c *Client) Handle(h func([]byte) []byte) {
 	c.handler = h
 }
 
-
 func (c *Client) Start() {
 	if c.handler == nil {
 		panic("Handler not set")
 	}
-    // Pass the handler directly. No extra headers.
-	c.transport.Start(c.handler)
+	c.guest.Start(c.handler)
 }
 
 func (c *Client) Wait() {
-	c.transport.Wait()
+	c.guest.Wait()
 }
 
 func (c *Client) Close() {
-	c.transport.Close()
+	c.guest.Close()
 }

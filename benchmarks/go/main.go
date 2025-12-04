@@ -21,7 +21,7 @@ const (
 
 func main() {
 	workers := flag.Int("w", 1, "Number of worker threads")
-	mode := flag.String("mode", "spsc", "Queue mode: spsc, mpsc, or direct")
+	// mode flag removed
 	cpuprofile := flag.String("cpuprofile", "", "write cpu profile to file")
 	memprofile := flag.String("memprofile", "", "write memory profile to file")
 	flag.Parse()
@@ -35,19 +35,11 @@ func main() {
 		defer pprof.StopCPUProfile()
 	}
 
-	fmt.Printf("[Go] Starting Guest with %d workers in %s mode...\n", *workers, *mode)
-
-	// Select Mode
-	var clientMode shm.Mode
-	if *mode == "direct" {
-		clientMode = shm.ModeDirect
-	} else {
-		clientMode = shm.ModeQueue
-	}
+	fmt.Printf("[Go] Starting Guest with %d workers (Direct Mode)...\n", *workers)
 
 	// Connect
 	fmt.Println("[Go] Connecting to Host...")
-	client, err := shm.Connect("SimpleIPC", clientMode)
+	client, err := shm.Connect("SimpleIPC")
 	if err != nil {
 		log.Fatalf("Failed to connect: %v", err)
 	}

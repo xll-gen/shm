@@ -59,21 +59,14 @@ void worker(IPCHost* host, int id, int iterations) {
         if (resp->id != req.id) {
              std::cerr << "ID mismatch! Sent: " << req.id << ", Recv: " << resp->id << std::endl;
         }
-        // Verification of calculation (x + y)
-        // double expected = req.x + req.y;
-        // if (std::abs(resp->result - expected) > 1e-9) { ... }
     }
 }
 
-void run_benchmark(int numThreads, int iterations, IPCMode mode) {
+void run_benchmark(int numThreads, int iterations) {
     IPCHost host;
 
-    // Init param logic
-    // Direct: numQueues = numThreads
-    // Queue: queueSize = 32MB
-    uint64_t param = (mode == IPCMode::Direct) ? numThreads : (32 * 1024 * 1024);
-
-    if (!host.Init("SimpleIPC", mode, param)) {
+    // Direct mode: numQueues = numThreads
+    if (!host.Init("SimpleIPC", numThreads)) {
         std::cerr << "Failed to init IPC" << std::endl;
         exit(1);
     }
@@ -110,8 +103,6 @@ void run_benchmark(int numThreads, int iterations, IPCMode mode) {
 int main(int argc, char* argv[]) {
     int iterations = 10000;
     int specificThreadCount = 0;
-    std::string modeStr = "spsc"; // Default
-    IPCMode mode = IPCMode::Queue;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -119,24 +110,18 @@ int main(int argc, char* argv[]) {
             specificThreadCount = std::stoi(argv[++i]);
         } else if (arg == "-i" && i + 1 < argc) {
             iterations = std::stoi(argv[++i]);
-        } else if (arg == "-mode" && i + 1 < argc) {
-            modeStr = argv[++i];
         }
     }
 
-    if (modeStr == "direct") {
-        mode = IPCMode::Direct;
-    }
-
-    std::cout << "Running Benchmark in " << modeStr << " mode." << std::endl;
+    std::cout << "Running Benchmark (Direct Mode Only)" << std::endl;
     std::cout << "Protocol: Raw Byte Structs (Req: 24b, Resp: 16b)" << std::endl;
 
     if (specificThreadCount > 0) {
-        run_benchmark(specificThreadCount, iterations, mode);
+        run_benchmark(specificThreadCount, iterations);
     } else {
-        run_benchmark(1, iterations, mode);
-        run_benchmark(4, iterations, mode);
-        run_benchmark(8, iterations, mode);
+        run_benchmark(1, iterations);
+        run_benchmark(4, iterations);
+        run_benchmark(8, iterations);
     }
 
     return 0;
