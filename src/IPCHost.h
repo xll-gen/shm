@@ -11,6 +11,14 @@
 
 namespace shm {
 
+/**
+ * @class IPCHost
+ * @brief High-level Facade for the IPC Host.
+ *
+ * Wraps DirectHost to provide an asynchronous request-response model.
+ *
+ * @note The current implementation adapts the synchronous DirectHost to the Facade API.
+ */
 class IPCHost {
     struct RequestContext {
         std::promise<std::vector<uint8_t>> promise;
@@ -34,22 +42,44 @@ class IPCHost {
     std::unique_ptr<std::promise<void>> heartbeatPromise;
 
 public:
+    /**
+     * @brief Default constructor.
+     */
     IPCHost() {}
+
+    /**
+     * @brief Destructor.
+     */
     ~IPCHost() { Shutdown(); }
 
+    /**
+     * @brief Initializes the IPC Host.
+     *
+     * @param name Shared memory name.
+     * @param numQueues Number of slots.
+     * @return true on success.
+     */
     bool Init(const std::string& name, uint32_t numQueues) {
-        auto handler = [this](std::vector<uint8_t>&& data, uint32_t msgId) {
-            this->OnMessage(std::move(data), msgId);
-        };
-        return impl.Init(name, numQueues, handler);
+        // DirectHost Init does not take a handler in this version.
+        return impl.Init(name, numQueues);
     }
 
+    /**
+     * @brief Shuts down the host.
+     */
     void Shutdown() {
         SendShutdown(); // Best effort
         impl.Shutdown();
     }
 
-    // Unified Call: Appends Header, Sends, Waits.
+    /**
+     * @brief Sends a request and awaits a response.
+     *
+     * @param reqData Request payload.
+     * @param reqSize Size of payload.
+     * @param[out] outResponse Buffer for response.
+     * @return true on success.
+     */
     bool Call(const uint8_t* reqData, size_t reqSize, std::vector<uint8_t>& outResponse) {
         uint64_t reqId = ++reqIdCounter;
 
@@ -70,16 +100,17 @@ public:
         }
 
         RequestContext ctx;
-        auto future = ctx.promise.get_future();
+        // Future/Promise not strictly needed for synchronous DirectHost, but kept for structure.
 
-        // Insert into pending map
+        // Insert into pending map (metadata tracking)
         {
             Shard& shard = shards[reqId % SHARD_COUNT];
             std::lock_guard<std::mutex> lock(shard.mutex);
             shard.requests[reqId] = &ctx;
         }
 
-        if (!impl.Send(sendBuf.data(), (uint32_t)totalSize, MSG_ID_NORMAL)) {
+        std::vector<uint8_t> rawResp;
+        if (impl.Send(sendBuf.data(), (uint32_t)totalSize, MSG_ID_NORMAL, rawResp) < 0) {
              // Failed to send
              Shard& shard = shards[reqId % SHARD_COUNT];
              std::lock_guard<std::mutex> lock(shard.mutex);
@@ -87,63 +118,55 @@ public:
              return false;
         }
 
-        // Wait
-        outResponse = future.get();
-        return true;
-    }
-
-    bool SendHeartbeat() {
-        std::future<void> future;
+        // Remove from map
         {
-            std::lock_guard<std::mutex> lock(heartbeatMutex);
-            heartbeatPromise = std::unique_ptr<std::promise<void>>(new std::promise<void>());
-            future = heartbeatPromise->get_future();
+            Shard& shard = shards[reqId % SHARD_COUNT];
+            std::lock_guard<std::mutex> lock(shard.mutex);
+            shard.requests.erase(reqId);
         }
 
-        // Heartbeat has no payload, just msgId
-        impl.Send(nullptr, 0, MSG_ID_HEARTBEAT_REQ);
-
-        if (future.wait_for(std::chrono::seconds(1)) == std::future_status::timeout) {
+        // Validate Response
+        if (rawResp.size() < sizeof(TransportHeader)) {
             return false;
         }
+
+        TransportHeader* respHeader = (TransportHeader*)rawResp.data();
+        if (respHeader->req_id != reqId) {
+            // ID mismatch
+            return false;
+        }
+
+        // Strip Header
+        outResponse.assign(rawResp.begin() + sizeof(TransportHeader), rawResp.end());
         return true;
     }
 
+    /**
+     * @brief Sends a heartbeat.
+     * @return true on success.
+     */
+    bool SendHeartbeat() {
+        // DirectHost is synchronous, so we just check return value.
+        std::vector<uint8_t> dummy;
+        int res = impl.Send(nullptr, 0, MSG_ID_HEARTBEAT_REQ, dummy);
+        return res >= 0;
+    }
+
+    /**
+     * @brief Sends shutdown signal.
+     */
     void SendShutdown() {
-        impl.Send(nullptr, 0, MSG_ID_SHUTDOWN);
+        std::vector<uint8_t> dummy;
+        impl.Send(nullptr, 0, MSG_ID_SHUTDOWN, dummy);
     }
 
 private:
+    /**
+     * @brief Callback for processing received messages (Async mode).
+     * @note Not used in synchronous DirectHost mode.
+     */
     void OnMessage(std::vector<uint8_t>&& data, uint32_t msgId) {
-        if (msgId == MSG_ID_HEARTBEAT_RESP) {
-            std::lock_guard<std::mutex> lock(heartbeatMutex);
-            if (heartbeatPromise) {
-                heartbeatPromise->set_value();
-                heartbeatPromise.reset();
-            }
-            return;
-        }
-
-        if (msgId == MSG_ID_NORMAL) {
-            if (data.size() < sizeof(TransportHeader)) return; // Malformed
-
-            // Extract Header
-            TransportHeader* header = (TransportHeader*)data.data();
-            uint64_t reqId = header->req_id;
-
-            // Strip Header for user
-            std::vector<uint8_t> userPayload;
-            userPayload.assign(data.begin() + sizeof(TransportHeader), data.end());
-
-            // Find Promise
-            Shard& shard = shards[reqId % SHARD_COUNT];
-            std::lock_guard<std::mutex> lock(shard.mutex);
-            auto it = shard.requests.find(reqId);
-            if (it != shard.requests.end()) {
-                it->second->promise.set_value(std::move(userPayload));
-                shard.requests.erase(it);
-            }
-        }
+        // Logic moved to Call() for synchronous mode.
     }
 };
 

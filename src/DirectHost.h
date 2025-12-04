@@ -13,6 +13,15 @@
 
 namespace shm {
 
+/**
+ * @class DirectHost
+ * @brief Implements the Host side of the Direct Mode IPC.
+ *
+ * The DirectHost manages a pool of slots in shared memory. Each slot is intended
+ * to be paired with a specific Guest worker thread.
+ * It uses a hybrid spin/wait strategy for low latency and utilizes
+ * specific memory layout defined in IPCUtils.h.
+ */
 class DirectHost {
     void* shmBase;
     std::string shmName;
@@ -21,6 +30,9 @@ class DirectHost {
     ShmHandle hMapFile;
     bool running;
 
+    /**
+     * @brief Internal representation of a Slot.
+     */
     struct Slot {
         SlotHeader* header;
         uint8_t* reqBuffer;
@@ -39,9 +51,27 @@ class DirectHost {
     uint32_t slotSize; // Total payload size per slot
 
 public:
+    /**
+     * @brief Default constructor.
+     */
     DirectHost() : shmBase(nullptr), hMapFile(0), running(false) {}
+
+    /**
+     * @brief Destructor. Ensures Shutdown is called.
+     */
     ~DirectHost() { Shutdown(); }
 
+    /**
+     * @brief Initializes the Shared Memory Host.
+     *
+     * Creates the shared memory region and initializes the ExchangeHeader and SlotHeaders.
+     * Also creates the necessary synchronization events for each slot.
+     *
+     * @param shmName The name of the shared memory region.
+     * @param numQueues The number of slots (workers) to allocate.
+     * @param dataSize The total size of the data payload per slot (split between Req/Resp). Default 1MB.
+     * @return true if initialization succeeded, false otherwise.
+     */
     bool Init(const std::string& shmName, uint32_t numQueues, uint32_t dataSize = 1024 * 1024) {
         this->shmName = shmName;
         this->numSlots = numQueues; // Interpret numQueues as numSlots (1:1 workers)
@@ -116,6 +146,9 @@ public:
         return true;
     }
 
+    /**
+     * @brief Shuts down the host, closing all handles and unmapping memory.
+     */
     void Shutdown() {
         if (!running) return;
 
@@ -128,7 +161,19 @@ public:
         running = false;
     }
 
-    // Explicit 1:1 Send to a specific slot
+    /**
+     * @brief Sends a request to a specific slot.
+     *
+     * Used when strict 1:1 thread-to-worker affinity is required.
+     * Blocks until the slot is free and then until the response is received.
+     *
+     * @param slotIdx The index of the slot to use.
+     * @param data Pointer to the request data.
+     * @param size Size of the request data.
+     * @param msgId The message ID (e.g., MSG_ID_NORMAL).
+     * @param[out] outResp Vector to store the response data.
+     * @return int Bytes read (response size), or -1 on error.
+     */
     int SendToSlot(uint32_t slotIdx, const uint8_t* data, uint32_t size, uint32_t msgId, std::vector<uint8_t>& outResp) {
         if (!running || slotIdx >= numSlots) return -1;
 
@@ -152,7 +197,17 @@ public:
         return ProcessSlot(slot, data, size, msgId, outResp);
     }
 
-    // Dynamic Send (Auto-find slot with Thread Local Affinity)
+    /**
+     * @brief Sends a request using any available slot.
+     *
+     * Attempts to use a thread-local cached slot first, then searches for a free slot.
+     *
+     * @param data Pointer to the request data.
+     * @param size Size of the request data.
+     * @param msgId The message ID.
+     * @param[out] outResp Vector to store the response data.
+     * @return int Bytes read (response size), or -1 on error.
+     */
     int Send(const uint8_t* data, uint32_t size, uint32_t msgId, std::vector<uint8_t>& outResp) {
         if (!running) return -1;
 
