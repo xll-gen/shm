@@ -5,7 +5,7 @@ echo "Compiling C++ Host..."
 g++ -O3 -pthread experiments/pingpong/main.cpp -o experiments/pingpong/host
 
 echo "Compiling Go Guest..."
-go build -o experiments/pingpong/guest experiments/pingpong/main.go
+cd experiments/pingpong/go && go build -o ../guest main.go && cd ../../..
 
 run_test() {
     THREADS=$1
@@ -24,8 +24,13 @@ run_test() {
     wait $GUEST_PID 2>/dev/null || true
 }
 
-run_test 1
-run_test 2
+if [ -n "$1" ]; then
+    run_test $1
+else
+    run_test 1
+    run_test 2
+    run_test 3
+fi
 
 # Final cleanup of binaries (as requested)
 echo "Cleaning up binaries..."

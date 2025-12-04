@@ -5,7 +5,7 @@
 namespace pingpong {
 
 constexpr const char* SHM_NAME = "/pingpong_shm";
-constexpr size_t SHM_SIZE = 4096; // 4KB is enough
+constexpr size_t SHM_SIZE = 4096 * 4; // Increase size to be safe for multiple threads
 
 enum State : uint32_t {
     STATE_WAIT_REQ = 0,
@@ -15,12 +15,14 @@ enum State : uint32_t {
 };
 
 struct Packet {
-    std::atomic<uint32_t> state;
-    uint32_t req_id;
-    int64_t val_a;
-    int64_t val_b;
-    int64_t sum;
-    uint8_t padding[64 - 4 - 4 - 8 - 8 - 8]; // Pad to 64 bytes
+    std::atomic<uint32_t> state;          // 4
+    uint32_t req_id;                      // 4
+    std::atomic<uint32_t> host_sleeping;  // 4
+    std::atomic<uint32_t> guest_sleeping; // 4
+    int64_t val_a;                        // 8
+    int64_t val_b;                        // 8
+    int64_t sum;                          // 8
+    uint8_t padding[24];                  // Pad to 64 bytes
 };
 
 static_assert(sizeof(Packet) == 64, "Packet size mismatch");
