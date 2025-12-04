@@ -9,11 +9,11 @@ This project implements a high-performance, lock-free Shared Memory IPC (Inter-P
 
 -   **Host (C++):** Creates shared memory, acts as the server/initiator.
 -   **Guest (Go):** Attaches to shared memory.
--   **Philosophy:** Zero-copy (where possible), cache-line aligned, direct slot exchange.
+-   **Philosophy:** Zero-copy (where possible), cache-line aligned, direct slot exchange, adaptive hybrid wait.
 
 ### Directory Structure
 
--   `src/`: C++ Host implementation (`IPCHost`, `DirectHost`, `Platform`).
+-   `src/`: C++ Host implementation (`DirectHost`, `Platform`).
 -   `include/`: Shared C++ headers (`IPCUtils.h` - **CRITICAL**).
 -   `go/`: Go Guest implementation (`direct.go`, `platform.go`, `client.go`).
 -   `benchmarks/`: C++ client and Go server for performance testing.
@@ -31,6 +31,7 @@ The memory layout is manually synchronized between C++ and Go. **Any mismatch wi
 1.  **Alignment:** Structs are padded to **128 bytes** to prevent false sharing (cache line contention).
 2.  **Padding:** Never remove `_pad` fields without recalculating exact offsets.
 3.  **Types:** `uint64_t` (C++) == `uint64` (Go), `std::atomic<T>` behaves like `atomic` package.
+4.  **Memory Ordering:** Critical state transitions must use `seq_cst`.
 
 #### SlotHeader Layout (Direct Mode)
 *Reference: `include/IPCUtils.h` (C++) and `go/direct.go` (Go)*
@@ -43,16 +44,18 @@ The memory layout is manually synchronized between C++ and Go. **Any mismatch wi
 | `RespSize` | 4 | |
 | `MsgId` | 4 | |
 | `HostState` | 4 | Atomic |
-| `padding` | 44 | **Aligns struct to 128 bytes** |
+| `GuestState` | 4 | Atomic |
+| `padding` | 40 | **Aligns struct to 128 bytes** |
 
 ### 2.2. Synchronization Primitives
 
 -   **Hot Path:** Do not use OS Mutexes in the hot loops.
--   **Spin-Wait:**
-    -   C++: Use `CpuRelax()` (wraps `_mm_pause` or `yield`) and `std::this_thread::yield()`.
-    -   Go: Use `runtime.Gosched()`.
--   **Signaling:**
-    -   Hybrid approach: Spin for a set duration, then sleep on an OS Event.
+-   **Adaptive Wait:**
+    -   Spin Phase: Check state atomic with `CpuRelax()` / `runtime.Gosched()`.
+    -   Sleep Phase: If spin fails, set `Host/GuestState = WAITING`, double-check, then sleep on OS Event/Semaphore.
+    -   Wakeup: Signal Event/Semaphore only if peer is `WAITING`.
+-   **Platform:**
+    -   Use `Platform::SignalEvent` and `Platform::WaitEvent`.
 
 ---
 
@@ -80,3 +83,4 @@ If the benchmark hangs or produces "ID Mismatch" errors, you have broken the mem
 
 1.  **Padding drift:** Adding a field to structs without adjusting padding.
 2.  **Zombie Semaphores (Linux):** If the benchmark crashes, shared memory files (`/dev/shm/*`) may remain. Use `rm /dev/shm/SimpleIPC*` to clean up.
+3.  **SeqCst:** Use `std::memory_order_seq_cst` for `State` transitions to ensure visibility.

@@ -15,6 +15,7 @@
     #include <string>
     #include <cstring>
     #include <iostream>
+    #include <immintrin.h>
 
     typedef sem_t* EventHandle;
     typedef int ShmHandle; // File Descriptor
@@ -110,12 +111,12 @@ public:
 #endif
     }
 
-    static void CloseShm(ShmHandle h, void* addr) {
+    static void CloseShm(ShmHandle h, void* addr, uint64_t size) {
 #ifdef _WIN32
         if (addr) UnmapViewOfFile(addr);
         if (h) CloseHandle(h);
 #else
-        // munmap(addr, size); // size is lost here, leak in this simple abstraction
+        if (addr) munmap(addr, size);
         if (h >= 0) close(h);
 #endif
     }
@@ -125,6 +126,14 @@ public:
         SwitchToThread();
 #else
         sched_yield();
+#endif
+    }
+
+    static void CpuRelax() {
+#ifdef _WIN32
+        YieldProcessor();
+#else
+        _mm_pause();
 #endif
     }
 
