@@ -13,6 +13,8 @@
 | **1** | 0.401 | 124,663 | Baseline latency for 1KB round-trip |
 | **2** | 0.992 | 100,820 | |
 | **3** | 1.537 | 97,610 | Slight contention observed |
+| **4** | 2.305 | 86,762 | Contention increases |
+| **8** | 2.550 | 156,884 | Throughput improved with higher concurrency |
 
 ## Analysis
 1.  **Data Integrity:**
@@ -24,4 +26,5 @@
     -   Achieving ~100k OPS with verified 1KB transfers demonstrates high efficiency for larger messages.
 
 3.  **Scaling:**
-    -   Aggregate throughput shows mild degradation as threads increase. This is expected as the memory bandwidth usage increases (reading/writing 1KB buffers) and cache coherence traffic grows between cores.
+    -   The dip at 4 threads likely indicates resource contention or scheduler dynamics in this specific environment.
+    -   The recovery at 8 threads suggests that with enough concurrency, the system can mask latency effectively, achieving higher aggregate throughput (156k OPS).
