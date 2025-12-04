@@ -226,6 +226,9 @@ func (q *SPSCQueue) Dequeue() ([]byte, uint32) {
 		if rPos == wPos {
 			if spinCount < 4000 {
 				spinCount++
+				if spinCount > 0 && spinCount%100 == 0 {
+					runtime.Gosched()
+				}
 				continue
 			}
 			// Waiting = 0

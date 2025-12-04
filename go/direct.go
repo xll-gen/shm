@@ -248,19 +248,25 @@ func (g *DirectGuest) scannerLoop() {
 
 		if !worked {
 			// Adaptive Wait Strategy
-            // 1. Spin Phase
-            foundSpin := false
-            for spin := 0; spin < 10000; spin++ {
-                 runtime.Gosched() // Use Gosched instead of CpuRelax equivalent for Go
-                 for i := 0; i < int(g.numSlots); i++ {
-				    if atomic.LoadUint32(&g.slots[i].header.State) == SlotReqReady {
-					    foundSpin = true
-					    break
-				    }
-			    }
-                if foundSpin { break }
-            }
-            if foundSpin { continue }
+			// 1. Spin Phase
+			foundSpin := false
+			for spin := 0; spin < 10000; spin++ {
+				if spin > 0 && spin%100 == 0 {
+					runtime.Gosched()
+				}
+				for i := 0; i < int(g.numSlots); i++ {
+					if atomic.LoadUint32(&g.slots[i].header.State) == SlotReqReady {
+						foundSpin = true
+						break
+					}
+				}
+				if foundSpin {
+					break
+				}
+			}
+			if foundSpin {
+				continue
+			}
 
 			// 2. Set Sleeping
 			atomic.StoreUint32(&g.exchangeHeader.GuestScannerState, ScannerStateSleeping)
