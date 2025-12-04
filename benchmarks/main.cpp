@@ -27,7 +27,11 @@ void log_ts(T msg) {
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
     auto t = std::chrono::system_clock::to_time_t(now);
     std::tm tm;
+#ifdef _WIN32
     localtime_s(&tm, &t);
+#else
+    localtime_r(&t, &tm);
+#endif
     std::cout << std::put_time(&tm, "%Y-%m-%d %H:%M:%S") << '.' << std::setfill('0') << std::setw(3) << ms.count() << " ";
     std::cout << msg << std::endl;
 }
@@ -50,10 +54,11 @@ struct BenchmarkResp {
 static_assert(sizeof(BenchmarkReq) == 24, "BenchmarkReq size mismatch");
 static_assert(sizeof(BenchmarkResp) == 16, "BenchmarkResp size mismatch");
 
-void worker(IPCHost* host, int id, int iterations) {
+void worker(IPCHost* host, int id, int iterations, uint64_t* outCompleted) {
     // Reusable buffer for response
     std::vector<uint8_t> respBuf;
     respBuf.reserve(128); // Pre-allocate enough space
+    uint64_t completed = 0;
 
     for (int i = 0; i < iterations; ++i) {
         BenchmarkReq req;
@@ -65,6 +70,7 @@ void worker(IPCHost* host, int id, int iterations) {
         // We pass the raw struct as the payload
         if (!host->Call(reinterpret_cast<const uint8_t*>(&req), sizeof(req), respBuf)) {
             log_ts("Call failed!");
+            *outCompleted = completed;
             return;
         }
 
@@ -77,12 +83,18 @@ void worker(IPCHost* host, int id, int iterations) {
         // Verify result
         const BenchmarkResp* resp = reinterpret_cast<const BenchmarkResp*>(respBuf.data());
         if (resp->id != req.id) {
-             log_ts("ID mismatch! Sent: " + std::to_string(req.id) + ", Recv: " + std::to_string(resp->id));
+             static int mismatch_log_count = 0;
+             if (mismatch_log_count++ < 5) {
+                 log_ts("ID mismatch! Sent: " + std::to_string(req.id) + ", Recv: " + std::to_string(resp->id));
+             }
+             continue; // Skip incrementing completed
         }
         // Verification of calculation (x + y)
         // double expected = req.x + req.y;
         // if (std::abs(resp->result - expected) > 1e-9) { ... }
+        completed++;
     }
+    *outCompleted = completed;
 }
 
 void run_benchmark(int numThreads, int iterations, IPCMode mode) {
@@ -98,6 +110,21 @@ void run_benchmark(int numThreads, int iterations, IPCMode mode) {
         exit(1);
     }
 
+    // Wait for Guest to be alive
+    if (mode == IPCMode::Direct) {
+        log_ts("Waiting for Guest to connect...");
+        for (int i = 0; i < 50; ++i) { // Wait up to 5s
+            if (host.IsGuestAlive()) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        if (!host.IsGuestAlive()) {
+             log_ts("Guest not detected. Aborting.");
+             host.Shutdown();
+             exit(1);
+        }
+        log_ts("Guest Connected.");
+    }
+
     log_ts("Starting Benchmark with " + std::to_string(numThreads) + " threads...");
 
     std::atomic<bool> benchmark_running = true;
@@ -106,7 +133,7 @@ void run_benchmark(int numThreads, int iterations, IPCMode mode) {
         monitor_thread = std::thread([&]() {
             while (benchmark_running) {
                 bool is_alive = host.IsGuestAlive();
-                log_ts("[Monitor] Guest alive: " + std::string(is_alive ? "yes" : "no"));
+                // log_ts("[Monitor] Guest alive: " + std::string(is_alive ? "yes" : "no"));
 
                 if (!is_alive) {
                     log_ts("Guest is not alive, shutting down.");
@@ -121,8 +148,10 @@ void run_benchmark(int numThreads, int iterations, IPCMode mode) {
     auto start = std::chrono::high_resolution_clock::now();
 
     std::vector<std::thread> threads;
+    std::vector<uint64_t> thread_ops(numThreads, 0);
+
     for (int i = 0; i < numThreads; ++i) {
-        threads.emplace_back(worker, &host, i, iterations);
+        threads.emplace_back(worker, &host, i, iterations, &thread_ops[i]);
     }
 
     for (auto& t : threads) t.join();
@@ -135,12 +164,14 @@ void run_benchmark(int numThreads, int iterations, IPCMode mode) {
         monitor_thread.join();
     }
 
-    double totalOps = (double)numThreads * iterations;
-    double ops = totalOps / diff.count();
-    double latency = (diff.count() * 1000000.0) / totalOps;
+    uint64_t totalOps = 0;
+    for (auto ops : thread_ops) totalOps += ops;
+
+    double ops = (double)totalOps / diff.count();
+    double latency = (totalOps > 0) ? (diff.count() * 1000000.0) / totalOps : 0.0;
 
     std::cerr << "Threads: " << numThreads << std::endl;
-    std::cerr << "Total Ops: " << (long long)totalOps << std::endl;
+    std::cerr << "Total Ops: " << totalOps << std::endl;
     std::cerr << "Time: " << diff.count() << " s" << std::endl;
     std::cerr << "Throughput: " << std::fixed << std::setprecision(2) << ops << " ops/s" << std::endl;
     std::cerr << "Avg Latency: " << latency << " us" << std::endl;

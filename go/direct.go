@@ -83,30 +83,27 @@ type slotContext struct {
 }
 
 func NewDirectGuest(name string) (*DirectGuest, error) {
-	log.Println("offsetof(GuestHeartbeat):", unsafe.Offsetof(new(ExchangeHeader).GuestHeartbeat))
-	// Preliminary size calculation just to open shm.
-	// We don't know the real size until we read the header.
-	// Let's assume a reasonable max size for now.
-	// Max 256 threads, 1MB slot size.
-	preliminaryTotalSize := uint64(64 + (128+1024*1024*2)*256)
-
+	// 1. First Pass: Map just the header (4KB page) to read layout
+	preliminaryTotalSize := uint64(4096)
 	h, addr, err := OpenShm(name, preliminaryTotalSize)
 	if err != nil {
 		return nil, err
 	}
 
-	// Host is the source of truth for layout.
-	// Verify header is initialized.
-	exchangeHeader := (*ExchangeHeader)(unsafe.Pointer(addr))
-	if exchangeHeader.NumSlots == 0 {
+	// Read Header
+	tempHeader := (*ExchangeHeader)(unsafe.Pointer(addr))
+	if tempHeader.NumSlots == 0 {
 		CloseShm(h, addr)
 		return nil, fmt.Errorf("host not ready (header not initialized)")
 	}
 
-	numSlots := int(exchangeHeader.NumSlots)
-	slotSize := int(exchangeHeader.SlotSize)
+	numSlots := int(tempHeader.NumSlots)
+	slotSize := int(tempHeader.SlotSize)
 
-	// Now calculate the real size
+	// Close temporary mapping
+	CloseShm(h, addr)
+
+	// 2. Second Pass: Calculate real size and remap
 	headerSize := uint64(unsafe.Sizeof(ExchangeHeader{}))
 	if headerSize < 64 {
 		headerSize = 64
@@ -117,6 +114,13 @@ func NewDirectGuest(name string) (*DirectGuest, error) {
 	}
 	perSlotSize := slotHeaderSize + uint64(slotSize)*2
 	totalSize := headerSize + (perSlotSize * uint64(numSlots))
+
+	// Map full size
+	h, addr, err = OpenShm(name, totalSize)
+	if err != nil {
+		return nil, fmt.Errorf("failed to map full shm: %v", err)
+	}
+	exchangeHeader := (*ExchangeHeader)(unsafe.Pointer(addr))
 
 	// Open Global Events
 	gEvent, err := OpenEvent(name + "_event_guest")
@@ -170,7 +174,6 @@ func NewDirectGuest(name string) (*DirectGuest, error) {
 
 // Start spawns workers and the scanner.
 func (g *DirectGuest) Start(handler func([]byte, []byte) int, ready chan<- struct{}) {
-	log.Println("DirectGuest.Start called")
 	// Start Workers
 	for i := 0; i < int(g.numSlots); i++ {
 		g.wg.Add(1)
@@ -195,13 +198,10 @@ func (g *DirectGuest) heartbeatLoop() {
 		}
 		g.wg.Done()
 	}()
-	log.Println("Heartbeat loop started")
 	for atomic.LoadInt32(&g.running) == 1 {
-		new_val := atomic.AddUint64(&g.exchangeHeader.GuestHeartbeat, 1)
-		log.Printf("Heartbeat incremented to %d", new_val)
+		atomic.AddUint64(&g.exchangeHeader.GuestHeartbeat, 1)
 		time.Sleep(1 * time.Second)
 	}
-	log.Println("Heartbeat loop finished")
 }
 
 func (g *DirectGuest) Wait() {
@@ -223,7 +223,6 @@ func (g *DirectGuest) scannerLoop() {
 		}
 		g.wg.Done()
 	}()
-	log.Println("Scanner loop started")
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
@@ -237,7 +236,6 @@ func (g *DirectGuest) scannerLoop() {
 			// Check if slot is ReqReady
 			s := atomic.LoadUint32(&g.slots[i].header.State)
 			if s == SlotReqReady {
-				log.Printf("Scanner found slot %d ready, signaling worker", i)
 				// Signal Worker
 				// Non-blocking send to avoid hanging if worker is already busy (shouldn't happen in correct flow)
 				select {
@@ -290,7 +288,6 @@ func (g *DirectGuest) scannerLoop() {
              runtime.Gosched()
         }
 	}
-	log.Println("Scanner loop finished")
 }
 
 func (g *DirectGuest) workerLoop(idx int, handler func([]byte, []byte) int) {
@@ -300,14 +297,11 @@ func (g *DirectGuest) workerLoop(idx int, handler func([]byte, []byte) int) {
 		}
 		g.wg.Done()
 	}()
-	log.Printf("Worker loop %d started\n", idx)
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
-	log.Printf("Worker loop %d locked to thread\n", idx)
 	slot := &g.slots[idx]
 	header := slot.header
 	ch := g.workerChans[idx]
-	log.Printf("Worker loop %d got context\n", idx)
 
 	for atomic.LoadInt32(&g.running) == 1 {
 		// Drain any stale signals from the channel first.
@@ -324,21 +318,16 @@ func (g *DirectGuest) workerLoop(idx int, handler func([]byte, []byte) int) {
 		}
 
 		// Wait for signal from Scanner
-		log.Printf("Worker loop %d waiting for signal\n", idx)
 		<-ch
-		log.Printf("Worker loop %d received signal\n", idx)
 
 		state := atomic.LoadUint32(&header.State)
-		log.Printf("Worker %d woken up, state is %d", idx, state)
 		if state != SlotReqReady {
 			continue
 		}
-		log.Printf("Worker loop %d processing request\n", idx)
 
 		// Process Request
 		msgId := header.MsgId
 		if msgId == MsgIdShutdown {
-			log.Printf("Worker loop %d received shutdown\n", idx)
 			return
 		}
 
@@ -365,7 +354,6 @@ func (g *DirectGuest) workerLoop(idx int, handler func([]byte, []byte) int) {
 
 		// 4. Signal Ready (Response Ready)
 		atomic.StoreUint32(&header.State, SlotRespReady)
-		log.Printf("Worker loop %d finished processing\n", idx)
 
 		// Wake up Host Scanner if sleeping
 		// We read HostScannerState
@@ -387,7 +375,6 @@ func (g *DirectGuest) workerLoop(idx int, handler func([]byte, []byte) int) {
 			}
 			// Check for shutdown
 			if atomic.LoadInt32(&g.running) == 0 {
-				log.Printf("Worker loop %d shutting down\n", idx)
 				return
 			}
 		}
@@ -395,5 +382,4 @@ func (g *DirectGuest) workerLoop(idx int, handler func([]byte, []byte) int) {
 		// 6. Set Free
 		atomic.StoreUint32(&header.State, SlotFree)
 	}
-	log.Printf("Worker loop %d finished\n", idx)
 }

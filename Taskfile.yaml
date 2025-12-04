@@ -30,17 +30,6 @@ tasks:
       - task: run:case
         vars: { THREADS: 8, MODE: spsc }
 
-  run:benchmark_mpsc:
-    desc: Runs MPSC benchmark
-    deps: [build]
-    cmds:
-      - task: run:case
-        vars: { THREADS: 1, MODE: mpsc }
-      - task: run:case
-        vars: { THREADS: 4, MODE: mpsc }
-      - task: run:case
-        vars: { THREADS: 8, MODE: mpsc }
-
   run:benchmark_direct:
     desc: Runs Direct benchmark
     deps: [build]

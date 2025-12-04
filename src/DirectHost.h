@@ -37,6 +37,10 @@ class DirectHost {
         std::condition_variable cv;
         bool responseReady;
         std::vector<uint8_t> responseBuffer;
+
+        // Active Flag for Orphan Detection
+        std::atomic<bool> requestActive;
+        SlotContext() : requestActive(false), responseReady(false) {}
     };
 
     std::vector<std::unique_ptr<SlotContext>> slots;
@@ -167,7 +171,10 @@ public:
     found:
         SlotContext* ctx = slots[slotIdx].get();
 
-        // 2. Write Request
+        // 2. Mark Active (For Orphan Detection)
+        ctx->requestActive.store(true, std::memory_order_release);
+
+        // 3. Write Request
         if (size > slotSize) size = slotSize;
         if (data && size > 0) {
             memcpy(ctx->reqData, data, size);
@@ -181,76 +188,41 @@ public:
             ctx->responseReady = false;
         }
 
-        // 3. Set Ready
+        // 4. Set Ready
         ctx->header->state.store(SLOT_REQ_READY, std::memory_order_release);
 
-        // 4. Wake Guest Scanner if needed
+        // 5. Wake Guest Scanner if needed
         if (exchangeHeader->guestScannerState.load(std::memory_order_relaxed) == SCANNER_STATE_SLEEPING) {
             Platform::SignalEvent(globalGuestEvent);
         }
 
-        // 5. Wait for Response
+        // 6. Wait for Response
         {
             std::unique_lock<std::mutex> lock(ctx->mutex);
             ctx->cv.wait(lock, [&]{ return ctx->responseReady || !running; });
         }
 
-        if (!running) return false;
+        // Critical Section: Finalize Slot State
+        // We hold the lock here (via notify or spurious wakeup check above, but wait released it).
+        // Wait re-acquires lock.
 
-        // 6. Copy Response
-        outResp = std::move(ctx->responseBuffer);
+        ctx->requestActive.store(false, std::memory_order_release);
 
-        // 7. Set Host Done
-        ctx->header->state.store(SLOT_HOST_DONE, std::memory_order_release);
+        if (ctx->responseReady) {
+             // Success: Scanner delivered data.
+             outResp.assign(ctx->responseBuffer.begin(), ctx->responseBuffer.end());
+             ctx->responseBuffer.clear();
 
-        return true;
+             ctx->header->state.store(SLOT_HOST_DONE, std::memory_order_release);
+             return true;
+        }
+
+        // If we are here, it means !running (Shutdown/Abort) AND Scanner didn't deliver yet.
+        // We already set requestActive = false.
+        // Scanner, if it comes later, will see requestActive == false and clean up.
+        return false;
     }
 
-    // Async Send (Legacy Support / Benchmark)
-    // This uses the same "Request" logic but handled by the Scanner?
-    // No, if we call Send, we want fire-and-forget or async callback.
-    // BUT the new model assumes "Wake up thread".
-    // If we use Send, we don't have a thread waiting.
-    // The previous DirectHost::Send didn't wait.
-    // To support the existing benchmark interface (Send + Callback),
-    // we need to bridge it.
-    // BUT, the existing benchmark code (IPCHost.h) manages pending requests via a map and promises.
-    // So IPCHost calls Send, then waits on a Future.
-    // DirectHost::Send used to return true immediately.
-    // Then ReaderLoop would call onMessage.
-
-    // With the new "Scanner + Wake Thread" model, the "Thread" IS the IPCHost thread calling Request.
-    // So we should expose `Request` to IPCHost.
-    // However, IPCHost expects `Send` and `onMessage`.
-    // If I change DirectHost to be blocking, I break IPCHost's async-like assumption if it uses Send.
-    // BUT IPCHost's `Call` method (seen in previous read) does:
-    // impl->Send(); future.get();
-    // It creates a promise.
-
-    // Optimization: If DirectHost supports Blocking Request, IPCHost can use it directly and skip the map/promise!
-    // But IPCHost is generic.
-    // I should update DirectHost::Send to simply spawn a thread that blocks? No, that's expensive.
-
-    // Wait, the user said "Host also needs a scanner... wake up each thread".
-    // This implies the Host IS waiting.
-    // If IPCHost uses `future.get()`, it IS waiting.
-    // But it's waiting on a std::promise, not the slot.
-    // The Scanner (old ReaderLoop) fulfilled the promise via onMessage.
-
-    // The new design:
-    // Scanner finds Response -> Finds Slot -> Notifies "Something".
-    // If we use Blocking Request in DirectHost, we bypass onMessage.
-
-    // I will implement `Send` to behave as it did (Async) for compatibility if needed,
-    // OR I will assume the user wants me to use `Request` in the benchmark.
-    // The benchmark uses `IPCHost::Call` which calls `Send`.
-
-    // I will stick to the Blocking Request implementation in `DirectHost`,
-    // and I will update `IPCHost.h` (the facade) to use `Request` if in Direct Mode.
-    // This aligns perfectly with "Wake up each thread".
-
-    // So DirectHost::Send is NOT used in the optimized path.
-    // But I'll leave a dummy implementation or wrapper.
     bool Send(const uint8_t* data, uint32_t size, uint32_t msgId) {
         // If msgId == SHUTDOWN, handle it.
         if (msgId == MSG_ID_SHUTDOWN) {
@@ -312,27 +284,29 @@ private:
             for (uint32_t i = 0; i < numSlots; ++i) {
                 SlotContext* ctx = slots[i].get();
                 if (ctx->header->state.load(std::memory_order_acquire) == SLOT_RESP_READY) {
-                    // Process Response
-                    std::vector<uint8_t> resp;
-                    uint32_t respLen = ctx->header->respSize;
-                    if (respLen > slotSize) respLen = slotSize;
+                    // Synchronization with Request Thread
+                    std::lock_guard<std::mutex> lock(ctx->mutex);
+                    bool active = ctx->requestActive.load(std::memory_order_acquire);
 
-                    if (respLen > 0) {
-                        resp.assign(ctx->respData, ctx->respData + respLen);
-                    }
+                    if (active) {
+                        // Process Response
+                        std::vector<uint8_t> resp;
+                        uint32_t respLen = ctx->header->respSize;
+                        if (respLen > slotSize) respLen = slotSize;
 
-                    // Notify Waiting Thread
-                    {
-                        std::lock_guard<std::mutex> lock(ctx->mutex);
+                        if (respLen > 0) {
+                            resp.assign(ctx->respData, ctx->respData + respLen);
+                        }
+
+                        // Notify Waiting Thread
                         ctx->responseBuffer = std::move(resp);
                         ctx->responseReady = true;
+                        ctx->cv.notify_one();
+                    } else {
+                         // Orphaned Response (Request Aborted/Shutdown)
+                         // Clean it up so Guest can proceed.
+                         ctx->header->state.store(SLOT_HOST_DONE, std::memory_order_release);
                     }
-                    ctx->cv.notify_one();
-
-                    // Note: We do NOT set HOST_DONE here.
-                    // The Waiting Thread sets HOST_DONE after it wakes up and copies data.
-                    // This ensures the data is safe.
-
                     worked = true;
                 }
             }
