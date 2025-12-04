@@ -185,12 +185,14 @@ int main(int argc, char* argv[]) {
     auto total_end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> total_diff = total_end - total_start;
 
-    double total_ops = 0;
+    long long total_operations = 0;
     for (const auto& r : results) {
-        total_ops += r.ops;
+        total_operations += r.operations;
     }
 
-    std::cout << "[Host] Done. Total Time: " << total_diff.count() << "s. Total OPS: " << total_ops << std::endl;
+    double system_effective_ops = total_operations / total_diff.count();
+
+    std::cout << "[Host] Done. Total Time: " << total_diff.count() << "s. System Effective OPS: " << system_effective_ops << std::endl;
 
     munmap(ptr, SHM_SIZE);
     close(fd);
