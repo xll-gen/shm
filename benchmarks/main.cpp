@@ -29,7 +29,7 @@ void worker(DirectHost* host, int id, int iterations, long long* outOps) {
     auto start = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < iterations; ++i) {
         // Send To Slot Explicitly (1:1 Affinity)
-        int read = host->SendToSlot(id, req.data(), (uint32_t)req.size(), MSG_ID_NORMAL, resp);
+        int read = host->SendToSlot(id, req.data(), (int32_t)req.size(), MSG_ID_NORMAL, resp);
         if (read < 0) {
             std::cerr << "Send failed at " << i << std::endl;
             break;

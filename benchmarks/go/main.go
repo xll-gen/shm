@@ -36,10 +36,10 @@ func main() {
 	defer client.Close()
 
 	// Zero-copy Echo Handler
-	client.Handle(func(req []byte, respBuf []byte) uint32 {
+	client.Handle(func(req []byte, respBuf []byte) int32 {
 		// Simple Echo
 		n := copy(respBuf, req)
-		return uint32(n)
+		return int32(n)
 	})
 
 	fmt.Println("Server ready.")

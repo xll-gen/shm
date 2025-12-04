@@ -9,7 +9,7 @@ import (
 // It wraps DirectGuest and handles connection retries and lifecycle management.
 type Client struct {
 	guest   *DirectGuest
-	handler func([]byte, []byte) uint32
+	handler func([]byte, []byte) int32
 }
 
 // Connect attempts to establish a connection to the Host with the given shared memory name.
@@ -40,10 +40,10 @@ func Connect(name string) (*Client, error) {
 //
 // h: A function that takes a request buffer and a response buffer.
 //    It should process the request, write the response to the response buffer,
-//    and return the size of the response written.
+//    and return the size of the response written (negative for End-Aligned).
 //
 // The handler must be thread-safe as it may be called concurrently by multiple workers.
-func (c *Client) Handle(h func(req []byte, respBuf []byte) uint32) {
+func (c *Client) Handle(h func(req []byte, respBuf []byte) int32) {
 	c.handler = h
 }
 

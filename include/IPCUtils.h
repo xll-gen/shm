@@ -73,13 +73,17 @@ struct SlotHeader {
 
     /**
      * @brief Size of the request payload in bytes.
+     * Positive: Data starts at offset 0.
+     * Negative: Data starts at end (size = -reqSize).
      */
-    uint32_t reqSize;
+    int32_t reqSize;
 
     /**
      * @brief Size of the response payload in bytes.
+     * Positive: Data starts at offset 0.
+     * Negative: Data starts at end (size = -respSize).
      */
-    uint32_t respSize;
+    int32_t respSize;
 
     /**
      * @brief Message ID (e.g., MSG_ID_NORMAL, MSG_ID_SHUTDOWN).
