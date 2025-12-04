@@ -8,9 +8,29 @@
 #include <cstring>
 #include <cstdint>
 #include <cassert>
+#include <mutex>
 #include "../../src/IPCHost.h"
+#include "../../include/IPCUtils.h"
+
+static_assert(sizeof(shm::ExchangeHeader) == 64, "ExchangeHeader size mismatch");
+static_assert(sizeof(shm::SlotHeader) == 128, "SlotHeader size mismatch");
+static_assert(offsetof(shm::ExchangeHeader, guestHeartbeat) == 16, "guestHeartbeat offset mismatch");
 
 using namespace shm;
+
+std::mutex log_mutex;
+
+template<typename T>
+void log_ts(T msg) {
+    std::lock_guard<std::mutex> lock(log_mutex);
+    auto now = std::chrono::system_clock::now();
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
+    auto t = std::chrono::system_clock::to_time_t(now);
+    std::tm tm;
+    localtime_s(&tm, &t);
+    std::cout << std::put_time(&tm, "%Y-%m-%d %H:%M:%S") << '.' << std::setfill('0') << std::setw(3) << ms.count() << " ";
+    std::cout << msg << std::endl;
+}
 
 // Define simple POD structures for the benchmark protocol
 #pragma pack(push, 1)
@@ -37,14 +57,14 @@ void worker(IPCHost* host, int id, int iterations) {
 
     for (int i = 0; i < iterations; ++i) {
         BenchmarkReq req;
-        req.id = i;
+        req.id = (int64_t(id) << 32) | i;
         req.x = 1.0 * i;
         req.y = 2.0 * i;
 
         // Call handles Header injection/extraction
         // We pass the raw struct as the payload
         if (!host->Call(reinterpret_cast<const uint8_t*>(&req), sizeof(req), respBuf)) {
-            std::cerr << "Call failed!" << std::endl;
+            log_ts("Call failed!");
             return;
         }
 
@@ -57,7 +77,7 @@ void worker(IPCHost* host, int id, int iterations) {
         // Verify result
         const BenchmarkResp* resp = reinterpret_cast<const BenchmarkResp*>(respBuf.data());
         if (resp->id != req.id) {
-             std::cerr << "ID mismatch! Sent: " << req.id << ", Recv: " << resp->id << std::endl;
+             log_ts("ID mismatch! Sent: " + std::to_string(req.id) + ", Recv: " + std::to_string(resp->id));
         }
         // Verification of calculation (x + y)
         // double expected = req.x + req.y;
@@ -74,11 +94,29 @@ void run_benchmark(int numThreads, int iterations, IPCMode mode) {
     uint64_t param = (mode == IPCMode::Direct) ? numThreads : (32 * 1024 * 1024);
 
     if (!host.Init("SimpleIPC", mode, param)) {
-        std::cerr << "Failed to init IPC" << std::endl;
+        log_ts("Failed to init IPC");
         exit(1);
     }
 
-    std::cout << "Starting Benchmark with " << numThreads << " threads..." << std::endl;
+    log_ts("Starting Benchmark with " + std::to_string(numThreads) + " threads...");
+
+    std::atomic<bool> benchmark_running = true;
+    std::thread monitor_thread;
+    if (mode == IPCMode::Direct) {
+        monitor_thread = std::thread([&]() {
+            while (benchmark_running) {
+                bool is_alive = host.IsGuestAlive();
+                log_ts("[Monitor] Guest alive: " + std::string(is_alive ? "yes" : "no"));
+
+                if (!is_alive) {
+                    log_ts("Guest is not alive, shutting down.");
+                    host.Shutdown();
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::seconds(2));
+            }
+        });
+    }
 
     auto start = std::chrono::high_resolution_clock::now();
 
@@ -91,6 +129,11 @@ void run_benchmark(int numThreads, int iterations, IPCMode mode) {
 
     auto end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> diff = end - start;
+
+    benchmark_running = false;
+    if (monitor_thread.joinable()) {
+        monitor_thread.join();
+    }
 
     double totalOps = (double)numThreads * iterations;
     double ops = totalOps / diff.count();
@@ -132,11 +175,17 @@ int main(int argc, char* argv[]) {
     std::cout << "Protocol: Raw Byte Structs (Req: 24b, Resp: 16b)" << std::endl;
 
     if (specificThreadCount > 0) {
+        unsigned int num_cpus = std::thread::hardware_concurrency();
+        if (specificThreadCount > (int)num_cpus) {
+            std::cout << "Warning: Thread count capped at " << num_cpus << std::endl;
+            specificThreadCount = num_cpus;
+        }
         run_benchmark(specificThreadCount, iterations, mode);
     } else {
+        unsigned int num_cpus = std::thread::hardware_concurrency();
         run_benchmark(1, iterations, mode);
-        run_benchmark(4, iterations, mode);
-        run_benchmark(8, iterations, mode);
+        if (num_cpus >= 4) run_benchmark(4, iterations, mode);
+        if (num_cpus >= 8) run_benchmark(8, iterations, mode);
     }
 
     return 0;

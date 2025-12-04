@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/binary"
 	"flag"
-	"fmt"
 	"log"
 	"math"
 	"os"
@@ -20,6 +19,7 @@ const (
 )
 
 func main() {
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	workers := flag.Int("w", 1, "Number of worker threads")
 	mode := flag.String("mode", "spsc", "Queue mode: spsc, mpsc, or direct")
 	cpuprofile := flag.String("cpuprofile", "", "write cpu profile to file")
@@ -35,7 +35,7 @@ func main() {
 		defer pprof.StopCPUProfile()
 	}
 
-	fmt.Printf("[Go] Starting Guest with %d workers in %s mode...\n", *workers, *mode)
+	log.Printf("[Go] Starting Guest with %d workers in %s mode...\n", *workers, *mode)
 
 	// Select Mode
 	var clientMode shm.Mode
@@ -46,18 +46,18 @@ func main() {
 	}
 
 	// Connect
-	fmt.Println("[Go] Connecting to Host...")
+	log.Println("[Go] Connecting to Host...")
 	client, err := shm.Connect("SimpleIPC", clientMode)
 	if err != nil {
 		log.Fatalf("Failed to connect: %v", err)
 	}
-	fmt.Println("[Go] Connected.")
+	log.Println("[Go] Connected.")
 
 	// Handler - Zero Copy API
 	client.Handle(func(reqData []byte, resBuf []byte) int {
 		// Expect TransportHeader (8 bytes) + ReqSize
 		if len(reqData) != 8+ReqSize {
-			// fmt.Printf("[Go] Error: Malformed request. Len=%d, Expected=%d\n", len(reqData), 8+ReqSize)
+			// log.Printf("[Go] Error: Malformed request. Len=%d, Expected=%d\n", len(reqData), 8+ReqSize)
 			return 0
 		}
 
@@ -93,10 +93,11 @@ func main() {
 
 	// Start (Blocking)
 	go client.Start()
+	client.WaitReady()
 
 	// Wait
 	client.Wait()
-	fmt.Println("[Go] Received Shutdown. Exiting...")
+	log.Println("[Go] Received Shutdown. Exiting...")
 	client.Close()
 
 	if *memprofile != "" {

@@ -17,11 +17,12 @@ const (
 type Client struct {
 	transport Transport
 	handler   func([]byte, []byte) int
+	ready     chan struct{}
 }
 
 // Transport interface defines the contract for IPC mechanisms.
 type Transport interface {
-	Start(func([]byte, []byte) int)
+	Start(handler func([]byte, []byte) int, ready chan<- struct{})
 	Close()
 	Wait()
 }
@@ -31,12 +32,12 @@ type Transport interface {
 func Connect(name string, mode Mode) (*Client, error) {
 	var t Transport
 	var err error
+	readyChan := make(chan struct{})
 
 	// Retry loop
 	for i := 0; i < 50; i++ {
 		if mode == ModeDirect {
-			// Direct Mode - Defaulting to 256 slots to match C++ Host default
-			t, err = NewDirectGuest(name, 256, 1024*1024)
+			t, err = NewDirectGuest(name)
 		} else {
 			// Queue Mode
 			qTotalSize := uint64(QueueHeaderSize + 32*1024*1024)
@@ -54,7 +55,7 @@ func Connect(name string, mode Mode) (*Client, error) {
 
 					if toQ.Header.Capacity > 0 {
 						t = NewIPCGuest(toQ, fromQ)
-                        _ = hMap
+						_ = hMap
 					} else {
 						err = fmt.Errorf("queue not initialized")
 					}
@@ -65,7 +66,7 @@ func Connect(name string, mode Mode) (*Client, error) {
 		}
 
 		if err == nil {
-			return &Client{transport: t}, nil
+			return &Client{transport: t, ready: readyChan}, nil
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
@@ -76,14 +77,18 @@ func (c *Client) Handle(h func([]byte, []byte) int) {
 	c.handler = h
 }
 
-
 func (c *Client) Start() {
 	if c.handler == nil {
 		panic("Handler not set")
 	}
-    // Pass the handler directly.
-	c.transport.Start(c.handler)
+	// Pass the handler directly.
+	c.transport.Start(c.handler, c.ready)
 }
+
+func (c *Client) WaitReady() {
+	<-c.ready
+}
+
 
 func (c *Client) Wait() {
 	c.transport.Wait()

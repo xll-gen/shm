@@ -41,7 +41,7 @@ func NewIPCGuest[Q IPCQueue](reqQ Q, respQ Q) *IPCGuest[Q] {
 // Implement Transport Interface
 
 // Start listens for requests, calls handler, and sends back response.
-func (c *IPCGuest[Q]) Start(handler func([]byte, []byte) int) {
+func (c *IPCGuest[Q]) Start(handler func([]byte, []byte) int, ready chan<- struct{}) {
 	c.wg.Add(1)
 	go func() {
 		defer c.wg.Done()
@@ -79,6 +79,7 @@ func (c *IPCGuest[Q]) Start(handler func([]byte, []byte) int) {
 			}
 		}
 	}()
+	close(ready)
 }
 
 func (c *IPCGuest[Q]) Close() {

@@ -29,6 +29,7 @@ class IPCHost {
                           std::function<void(std::vector<uint8_t>&&, uint32_t)> cb) = 0;
         virtual void Send(const uint8_t* data, uint32_t size, uint32_t msgId) = 0;
         virtual void Shutdown() = 0;
+        virtual bool IsGuestAlive() { return true; }
 
         // Blocking Request Support
         virtual bool SupportsBlocking() { return false; }
@@ -40,13 +41,7 @@ class IPCHost {
     public:
         bool Init(const std::string& name, uint64_t size,
                   std::function<void(std::vector<uint8_t>&&, uint32_t)> cb) override {
-             // 0 or size means defaults.
-             // DirectHost takes numQueues in Init.
-             // We'll stick to 1 "Queue" (which implies 1 set of slots/thread pool) or use size heuristic.
-             // But DirectHost internal Init now ignores numQueues effectively and uses hardcoded 256 slots?
-             // No, I set it to 256.
-             // Let's pass 1.
-             return impl.Init(name, 1, cb);
+             return impl.Init(name, (uint32_t)size, cb);
         }
         void Send(const uint8_t* data, uint32_t size, uint32_t msgId) override {
             impl.Send(data, size, msgId);
@@ -59,6 +54,7 @@ class IPCHost {
         bool RequestBlocking(const uint8_t* data, uint32_t size, std::vector<uint8_t>& outResp) override {
             return impl.Request(data, size, outResp);
         }
+        bool IsGuestAlive() override { return impl.IsGuestAlive(); }
     };
 
     class QueueWrapper : public HostImpl {
@@ -116,6 +112,13 @@ public:
             impl->Shutdown();
             impl.reset();
         }
+    }
+
+    bool IsGuestAlive() {
+        if (impl) {
+            return impl->IsGuestAlive();
+        }
+        return false;
     }
 
     // Unified Call: Appends Header, Sends, Waits.

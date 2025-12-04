@@ -41,11 +41,24 @@ tasks:
       - task: run:case
         vars: { THREADS: 8, MODE: mpsc }
 
+  run:benchmark_direct:
+    desc: Runs Direct benchmark
+    deps: [build]
+    cmds:
+      - task: run:case
+        vars: { THREADS: 1, MODE: direct }
+      - task: run:case
+        vars: { THREADS: 4, MODE: direct }
+      - task: run:case
+        vars: { THREADS: 8, MODE: direct }
+
   run:case:
     internal: true
     cmds:
       # Cleanup before run
       - task: kill_server
+      - cmd: rm -f server_*.log || true
+        ignore_error: true
       - cmd: rm -f /dev/shm/SimpleIPC* || true
         ignore_error: true
         platforms: [linux]
@@ -53,7 +66,7 @@ tasks:
       # Start Server (pass mode)
       - cmd: './benchmarks/go/server -w {{.THREADS}} -mode {{.MODE}} > server_{{.MODE}}_{{.THREADS}}.log 2>&1 &'
         platforms: [linux]
-      - cmd: 'cmd /c "start /B benchmarks\go\server.exe -w {{.THREADS}} -mode {{.MODE}} > server_{{.MODE}}_{{.THREADS}}.log 2>&1"'
+      - cmd: 'cmd /c "start /B benchmarks\\go\\server.exe -w {{.THREADS}} -mode {{.MODE}} > server_{{.MODE}}_{{.THREADS}}.log 2>&1"'
         platforms: [windows]
 
       # Wait for start
@@ -63,9 +76,9 @@ tasks:
         platforms: [windows]
 
       # Run Client
-      - cmd: './benchmarks/build/shm_benchmark -t {{.THREADS}} -mode {{.MODE}}'
+      - cmd: './benchmarks/build/shm_benchmark -t {{.THREADS}} -mode {{.MODE}} > cpp_client_{{.MODE}}_{{.THREADS}}.log 2>&1'
         platforms: [linux]
-      - cmd: 'benchmarks\build\shm_benchmark.exe -t {{.THREADS}} -mode {{.MODE}}'
+      - cmd: 'benchmarks\\build\\shm_benchmark.exe -t {{.THREADS}} -mode {{.MODE}} > cpp_client_{{.MODE}}_{{.THREADS}}.log 2>&1'
         platforms: [windows]
 
       # Cleanup

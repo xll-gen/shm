@@ -73,7 +73,9 @@ struct ExchangeHeader {
     uint32_t slotSize;
     std::atomic<uint32_t> hostScannerState;
     std::atomic<uint32_t> guestScannerState;
-    uint8_t padding[48]; // Padding to 64 bytes
+    std::atomic<uint64_t> guestHeartbeat;
+    std::atomic<uint64_t> hostHeartbeat;
+    uint8_t padding[32]; // Padding to 64 bytes
 };
 
 }

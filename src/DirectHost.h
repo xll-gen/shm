@@ -10,6 +10,7 @@
 #include <condition_variable>
 #include <atomic>
 #include <mutex>
+#include <chrono>
 #include "Platform.h"
 #include "IPCUtils.h"
 
@@ -41,8 +42,11 @@ class DirectHost {
     std::vector<std::unique_ptr<SlotContext>> slots;
     ExchangeHeader* exchangeHeader;
 
-    // Scanner
+    // Scanner and Heartbeat
     std::thread scannerThread;
+    std::thread heartbeatThread;
+    std::atomic<uint64_t> lastGuestHeartbeat;
+    std::atomic<bool> guestAlive;
 
     std::function<void(std::vector<uint8_t>&&, uint32_t)> onMessage;
 
@@ -58,22 +62,8 @@ public:
               std::function<void(std::vector<uint8_t>&&, uint32_t)> msgHandler) {
         this->shmName = shmName;
         this->onMessage = msgHandler;
-
-        // Interpret numQueues as numSlots for simplicity in this new model?
-        // Or keep 1024 * numQueues?
-        // User asked for "Scanner thread". Managing 1024 slots is fine.
-        // Let's stick to a reasonable number.
-        // If numQueues is small (e.g. 1-16), we might want more slots per queue?
-        // The previous code had 1024 slots per lane.
-        // Let's use 1024 total slots for now to be safe, or 1024 * numQueues.
-        // Let's stick to 1024 * numQueues to be consistent with previous memory size if possible.
-        // But 1024 CVs is a bit much if numQueues is large.
-        // Let's set numSlots = 1024 total for now, ignoring numQueues multiplier if > 1?
-        // No, let's just make it configurable or fixed.
-        // Let's say numSlots = 16 (from client.go default) or 64.
-        // But benchmarks might want more.
-        // Let's use numSlots = 256.
-        this->numSlots = 256;
+        this->numSlots = numQueues;
+        if (this->numSlots == 0) this->numSlots = 1;
 
         this->slotSize = 1024 * 1024; // 1MB
         // Layout: Header + Req + Resp
@@ -101,6 +91,8 @@ public:
             exchangeHeader->slotSize = this->slotSize;
             exchangeHeader->hostScannerState.store(SCANNER_STATE_ACTIVE);
             exchangeHeader->guestScannerState.store(SCANNER_STATE_ACTIVE);
+            exchangeHeader->guestHeartbeat.store(0);
+            exchangeHeader->hostHeartbeat.store(0);
         }
 
         // Global Events
@@ -130,6 +122,7 @@ public:
 
         running = true;
         scannerThread = std::thread(&DirectHost::ScannerLoop, this);
+        heartbeatThread = std::thread(&DirectHost::HeartbeatLoop, this);
 
         return true;
     }
@@ -138,16 +131,21 @@ public:
         if (!running) return;
         running = false;
 
+        // Wake up sleeping requests
+        for (auto& slot : slots) {
+            slot->cv.notify_all();
+        }
+
         // Wake up scanner if sleeping
         Platform::SignalEvent(globalHostEvent);
 
         if (scannerThread.joinable()) scannerThread.join();
+        if (heartbeatThread.joinable()) heartbeatThread.join();
 
         if (shmBase) Platform::CloseShm(hMapFile, shmBase);
         Platform::CloseEvent(globalGuestEvent);
         Platform::CloseEvent(globalHostEvent);
     }
-
     // Blocking Request
     // Returns true on success, false on error/shutdown
     bool Request(const uint8_t* data, uint32_t size, std::vector<uint8_t>& outResp) {
@@ -269,7 +267,41 @@ public:
         return false;
     }
 
+    bool IsGuestAlive() {
+        return guestAlive.load();
+    }
+
 private:
+    void HeartbeatLoop() {
+        uint64_t last_hb = 0;
+        int stale_count = 0;
+        const int stale_threshold = 3; // 3 cycles to declare dead
+
+        while (running) {
+            exchangeHeader->hostHeartbeat++;
+            uint64_t current_hb = exchangeHeader->guestHeartbeat.load(std::memory_order_seq_cst);
+
+            if (current_hb > 0) { // Start checking only after first heartbeat
+                if (current_hb == last_hb) {
+                    stale_count++;
+                } else {
+                    stale_count = 0;
+                }
+            }
+
+            last_hb = current_hb;
+
+            if (stale_count >= stale_threshold) {
+                guestAlive.store(false, std::memory_order_release);
+            } else {
+                guestAlive.store(true, std::memory_order_release);
+            }
+
+            // Check every 2 seconds
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+        }
+    }
+
     void ScannerLoop() {
         // Initialize Scanner State
         exchangeHeader->hostScannerState.store(SCANNER_STATE_ACTIVE);
