@@ -9,6 +9,17 @@
 
 using namespace shm;
 
+/**
+ * @brief Worker function for a single benchmark thread.
+ *
+ * Each worker pairs with a specific slot (via ID) and performs a fixed number of
+ * request-response cycles.
+ *
+ * @param host Pointer to the DirectHost instance.
+ * @param id The thread/slot ID (0 to N-1).
+ * @param iterations Number of operations to perform.
+ * @param[out] outOps Pointer to store the calculated OPS (Operations Per Second) for this worker.
+ */
 void worker(DirectHost* host, int id, int iterations, long long* outOps) {
     std::vector<uint8_t> req(64); // Small payload
     std::vector<uint8_t> resp;
@@ -34,6 +45,19 @@ void worker(DirectHost* host, int id, int iterations, long long* outOps) {
     *outOps = (long long)(iterations / diff.count());
 }
 
+/**
+ * @brief Main entry point for the C++ Benchmark Host.
+ *
+ * Parses command line arguments, initializes the Host, and spawns worker threads.
+ * Calculates and prints the total System Effective OPS.
+ *
+ * Arguments:
+ *   -t <num>: Number of threads (default 1).
+ *
+ * @param argc Argument count.
+ * @param argv Argument vector.
+ * @return int Exit code.
+ */
 int main(int argc, char* argv[]) {
     int numThreads = 1;
     if (argc > 1) {

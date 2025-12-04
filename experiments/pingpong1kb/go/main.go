@@ -1,3 +1,6 @@
+// Package main implements the Guest side of the 1KB Payload experiment.
+//
+// It processes 1KB data packets by performing a bitwise NOT operation, allowing verification of data integrity.
 package main
 
 /*
@@ -38,6 +41,8 @@ const (
 	STATE_DONE       = 3
 )
 
+// Packet represents the shared memory structure for a single worker.
+// Must match the C++ Packet struct layout (1088 bytes).
 type Packet struct {
 	State         uint32
 	ReqId         uint32
@@ -47,6 +52,7 @@ type Packet struct {
 	Pad           [48]byte // 4*4 + 1024 + 48 = 16 + 1072 = 1088 bytes
 }
 
+// worker function handles the processing loop for a single thread.
 func worker(id int, packet *Packet, wg *sync.WaitGroup) {
 	defer wg.Done()
 
@@ -150,6 +156,7 @@ func worker(id int, packet *Packet, wg *sync.WaitGroup) {
 	}
 }
 
+// main entry point.
 func main() {
 	// Verify Packet Struct Size and Offsets
 	expectedSize := uintptr(1088)

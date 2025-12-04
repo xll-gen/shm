@@ -23,8 +23,23 @@
 
 namespace shm {
 
+/**
+ * @class Platform
+ * @brief Abstraction layer for OS-specific synchronization and memory mapping.
+ *
+ * Provides a unified API for Windows and Linux to handle:
+ * - Named Events (Semaphores on Linux, Events on Windows)
+ * - Shared Memory (shm_open/mmap on Linux, CreateFileMapping on Windows)
+ * - CPU relaxation and thread yielding
+ */
 class Platform {
 public:
+    /**
+     * @brief Creates or opens a named synchronization event.
+     *
+     * @param name The name of the event. On Linux, a leading '/' is prepended if missing.
+     * @return EventHandle The handle to the event, or valid handle/pointer on success.
+     */
     static EventHandle CreateNamedEvent(const char* name) {
 #ifdef _WIN32
         std::string evName = "Local\\" + std::string(name);
@@ -40,6 +55,11 @@ public:
 #endif
     }
 
+    /**
+     * @brief Signals the event (sets to signaled state or posts semaphore).
+     *
+     * @param h The event handle.
+     */
     static void SignalEvent(EventHandle h) {
 #ifdef _WIN32
         SetEvent(h);
@@ -48,6 +68,12 @@ public:
 #endif
     }
 
+    /**
+     * @brief Waits for the event to be signaled.
+     *
+     * @param h The event handle.
+     * @param timeoutMs Timeout in milliseconds. Default 0xFFFFFFFF (Infinite).
+     */
     static void WaitEvent(EventHandle h, uint32_t timeoutMs = 0xFFFFFFFF) {
 #ifdef _WIN32
         WaitForSingleObject(h, timeoutMs);
@@ -68,6 +94,11 @@ public:
 #endif
     }
 
+    /**
+     * @brief Closes the event handle.
+     *
+     * @param h The event handle.
+     */
     static void CloseEvent(EventHandle h) {
 #ifdef _WIN32
         CloseHandle(h);
@@ -76,7 +107,15 @@ public:
 #endif
     }
 
-    // Returns mapped address or nullptr
+    /**
+     * @brief Creates or opens a named shared memory region.
+     *
+     * @param name The name of the shared memory region.
+     * @param size The size of the region in bytes.
+     * @param[out] outHandle The native handle for the shared memory (File Mapping or FD).
+     * @param[out] outExists Set to true if the region already existed.
+     * @return void* Pointer to the mapped memory, or nullptr on failure.
+     */
     static void* CreateNamedShm(const char* name, uint64_t size, ShmHandle& outHandle, bool& outExists) {
 #ifdef _WIN32
         std::string shmName = "Local\\" + std::string(name);
@@ -111,6 +150,13 @@ public:
 #endif
     }
 
+    /**
+     * @brief Unmaps and closes shared memory resources.
+     *
+     * @param h The shared memory handle.
+     * @param addr The mapped address.
+     * @param size The size of the mapping.
+     */
     static void CloseShm(ShmHandle h, void* addr, uint64_t size) {
 #ifdef _WIN32
         if (addr) UnmapViewOfFile(addr);
@@ -121,6 +167,9 @@ public:
 #endif
     }
 
+    /**
+     * @brief Yields the current thread's time slice.
+     */
     static void ThreadYield() {
 #ifdef _WIN32
         SwitchToThread();
@@ -129,6 +178,10 @@ public:
 #endif
     }
 
+    /**
+     * @brief Executes a CPU pause instruction (REP NOP / PAUSE).
+     * Used in spin loops to reduce power consumption and pipeline flushing.
+     */
     static void CpuRelax() {
 #ifdef _WIN32
         YieldProcessor();
@@ -137,6 +190,10 @@ public:
 #endif
     }
 
+    /**
+     * @brief Returns the current process ID.
+     * @return int PID.
+     */
     static int GetPid() {
 #ifdef _WIN32
         return (int)GetCurrentProcessId();

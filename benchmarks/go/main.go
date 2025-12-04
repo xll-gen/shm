@@ -1,3 +1,7 @@
+// Package main implements the Benchmark Guest Server.
+//
+// It connects to the shared memory "SimpleIPC" and echoes back any data it receives.
+// This is used in conjunction with the C++ host benchmark.
 package main
 
 import (
@@ -11,9 +15,12 @@ import (
 )
 
 var (
+	// workers defines the number of worker goroutines to spawn.
+    // In Direct Mode, this should match the number of Host slots.
 	workers = flag.Int("w", 1, "Number of workers")
 )
 
+// main is the entry point for the Go Benchmark Guest.
 func main() {
 	flag.Parse()
 

@@ -1,156 +1,116 @@
 # SimpleIPC Library
 
-SimpleIPC is a high-performance, low-latency shared-memory IPC library connecting C++ (Host) and Go (Guest). It supports two operating modes: **Queue** (SPSC Ring Buffer) and **Direct** (Slot-based Exchange), unified under a single API.
+SimpleIPC is a high-performance, low-latency shared-memory IPC library connecting C++ (Host) and Go (Guest). It uses a lock-free, direct slot exchange model to achieve sub-microsecond latency.
 
 ## Features
 
-*   **Unified API:** Write code once, switch between Queue and Direct modes via configuration.
-*   **Low Latency:**
-    *   **Queue Mode:** Lock-free SPSC ring buffers for high-throughput streaming.
-    *   **Direct Mode:** Slot-based atomic CAS operations with adaptive spinning for sub-microsecond latency (1:1 thread mapping).
-*   **Protocol Agnostic:** Transmits raw bytes. A minimal 8-byte `TransportHeader` allows for async request/response matching.
-*   **Cross-Language:** seamless integration between C++ and Go.
+*   **Low Latency**: Uses atomic spin-loops with adaptive backoff (Spin -> Yield -> Sleep) to minimize OS scheduler overhead.
+*   **Direct Mode**: 1:1 Thread-to-Slot mapping eliminates contention and queuing delays.
+*   **Zero Copy**: Data is written directly to shared memory slots.
+*   **Cross-Platform**: Supports Linux (shm_open/sem_open) and Windows (CreateFileMapping/CreateEvent).
+*   **Protocol Agnostic**: Transmits raw bytes with a minimal 8-byte Transport Header for request matching.
 
 ## Architecture
 
-### Modes
-1.  **Queue Mode (`IPCMode::Queue` / `shm.ModeQueue`)**
-    *   Uses two SPSC (Single Producer Single Consumer) ring buffers in shared memory (Request & Response).
-    *   Ideal for streaming data or scenarios with variable message sizes.
+The library operates in **Direct Mode**, where a fixed pool of "Slots" is allocated in shared memory.
 
-2.  **Direct Mode (`IPCMode::Direct` / `shm.ModeDirect`)**
-    *   Uses a fixed set of "Slots" in shared memory.
-    *   Each slot corresponds to a worker thread ("Lane").
-    *   Uses atomic state transitions (`Free` -> `Busy` -> `RespReady`) instead of queues.
-    *   Ideal for request-response patterns where latency is critical.
+*   **Host (C++)**: Creates the shared memory region and manages the slot pool. It acts as the initiator of requests.
+*   **Guest (Go)**: Attaches to the shared memory and processes requests. Each worker goroutine is pinned to a specific slot.
 
-### Protocol
-The library operates on two layers:
+### Memory Layout
 
-1.  **Wire Layer:**
-    *   **MsgId (4 bytes):** Identifies the message type (`Normal`, `Heartbeat`, `Shutdown`).
-    *   **Payload:** Raw bytes.
+The shared memory region consists of:
+1.  **Exchange Header** (64 bytes): Global metadata (number of slots, slot size).
+2.  **Slot Array**: An array of Slots.
 
-2.  **Facade Layer (`IPCHost` / `IPCGuest`):**
-    *   When using the `IPCHost` C++ class and `IPCGuest` Go struct, a **Transport Header** (8 bytes) is prepended to the payload.
-    *   **Header:** `uint64_t req_id`.
-    *   This ID is used to match asynchronous responses to their original requests.
-    *   **Important:** The Guest (Go) must preserve this 8-byte header when sending a response.
+Each **Slot** (128-byte Header + Payload) contains:
+*   **SlotHeader**: Atomic state variables (`State`, `HostState`, `GuestState`) and message metadata (`ReqSize`, `MsgId`).
+*   **Request Buffer**: Area where Host writes data.
+*   **Response Buffer**: Area where Guest writes data.
 
-## C++ Host Usage
+### Synchronization
 
-The `IPCHost` class acts as a facade, handling mode selection and request matching.
+State transitions are handled via `std::atomic` (C++) and `sync/atomic` (Go).
+*   `SLOT_FREE` -> Host claims -> `SLOT_BUSY` -> Host writes -> `SLOT_REQ_READY`
+*   Guest sees `SLOT_REQ_READY` -> Processes -> Writes Response -> `SLOT_RESP_READY`
+*   Host sees `SLOT_RESP_READY` -> Reads Response -> `SLOT_FREE`
+
+If a peer is not responsive (spinning times out), the other peer will wait on a named OS event (Semaphore/Event) to save CPU.
+
+## Usage
+
+### C++ Host
 
 ```cpp
-#include "IPCHost.h"
+#include "DirectHost.h"
 
-int main() {
-    shm::IPCHost host;
-
-    // 1. Initialize
-    // Mode: Queue (32MB Buffer)
-    // bool success = host.Init("MyIPC", shm::IPCMode::Queue, 32 * 1024 * 1024);
-
-    // Mode: Direct (4 Worker Lanes)
-    bool success = host.Init("MyIPC", shm::IPCMode::Direct, 4);
-
-    if (!success) return -1;
-
-    // 2. Call Guest
-    // User Payload: { 0x01, 0x02 }
-    // IPCHost will prepend 8-byte req_id automatically.
-    std::vector<uint8_t> req = { 0x01, 0x02 };
-    std::vector<uint8_t> resp;
-
-    // Call blocks until response is received or timeout (implicit)
-    if (host.Call(req.data(), req.size(), resp)) {
-        // resp contains only User Payload (header is stripped)
-    }
-
-    // 3. Cleanup
-    host.SendShutdown(); // Signal Guest to exit
-    host.Shutdown();     // Close resources
-    return 0;
+shm::DirectHost host;
+if (!host.Init("MyIPC", 4)) { // 4 Worker Slots
+    return -1;
 }
+
+std::vector<uint8_t> resp;
+// Send 4 bytes to any available slot
+// Note: This blocks until response is received.
+host.Send((const uint8_t*)"test", 4, MSG_ID_NORMAL, resp);
 ```
 
-## Go Guest Usage
-
-The Go `IPCGuest` (accessed via `shm.Connect`) acts as the server, processing requests.
-
-**Important:** The handler receives the *full* payload, including the 8-byte `TransportHeader`. You must include the ID in your response.
+### Go Guest
 
 ```go
 package main
 
-import (
-    "encoding/binary"
-    "github.com/xll-gen/shm/go"
-)
+import "github.com/xll-gen/shm/go"
 
 func main() {
-    // 1. Connect to Host
-    // Automatically retries until Host creates shared memory.
-    client, err := shm.Connect("MyIPC", shm.ModeDirect)
-    if err != nil {
-        panic(err)
-    }
+    client, _ := shm.Connect("MyIPC")
 
-    // 2. Register Handler
-    client.Handle(func(req []byte) []byte {
-        if len(req) < 8 {
-            return nil
-        }
-
-        // Read TransportHeader (req_id)
-        reqId := binary.LittleEndian.Uint64(req[0:8])
-
-        // Read User Payload
-        payload := req[8:]
-
-        // Process...
-        result := process(payload)
-
-        // Construct Response
-        // Must start with the SAME req_id
-        resp := make([]byte, 8 + len(result))
-        binary.LittleEndian.PutUint64(resp[0:8], reqId)
-        copy(resp[8:], result)
-
-        return resp
+    client.Handle(func(req []byte, respBuf []byte) uint32 {
+        // Process req, write to respBuf
+        // Return number of bytes written
+        return uint32(copy(respBuf, req)) // Echo
     })
 
-    // 3. Start Processing (Non-blocking usually, but Wait blocks)
-    go client.Start()
-
-    // 4. Wait for Shutdown Signal from Host
+    client.Start()
     client.Wait()
-    client.Close()
 }
 ```
 
-## Building Benchmarks
+## Building
 
-The project includes a benchmark suite to measure round-trip latency.
+### Requirements
+*   **Linux**: Kernel 4.x+, GCC 8+/Clang 10+
+*   **Windows**: MSVC 2019+
+*   **Go**: 1.18+
+*   **CMake**: 3.10+
+
+### Build Steps
 
 ```bash
-# 1. Build C++ Host
-mkdir -p build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
+# Build C++ Benchmarks
+mkdir build && cd build
+cmake ../benchmarks
 make
-cd ..
 
-# 2. Build Go Guest
-cd benchmarks/go
-go build -o guest
-cd ../..
-
-# 3. Run Benchmark (e.g., Direct Mode, 4 Threads)
-# This script usually handles starting both Host and Guest
-task run:benchmark
+# Build Go Benchmark Server
+cd ../benchmarks/go
+go build
 ```
 
-## Requirements
-*   **Linux:** Kernel 4.x+ (supports `memfd_create` or `/dev/shm`), `pthread`.
-*   **Compiler:** GCC 8+ or Clang 10+ (C++17 support).
-*   **Go:** 1.18+ (Generics support).
+## Benchmarks
+
+The `benchmarks` folder contains a latency/throughput test.
+
+```bash
+# Run benchmark (Helper script)
+./benchmarks/run.sh
+```
+
+## Experiments
+
+The `experiments` folder contains standalone latency tests (`pingpong`) used to validate the underlying synchronization primitives without the library overhead.
+
+## Documentation
+
+*   `AGENTS.md`: Developer guidelines and constraints.
+*   Source code is fully documented with Doxygen (C++) and GoDoc (Go) comments.

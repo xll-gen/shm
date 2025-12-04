@@ -1,3 +1,7 @@
+// Package main implements the Guest side of the PingPong experiment.
+//
+// It connects to shared memory and semaphores created by the Host,
+// and processes calculation requests using an adaptive wait strategy.
 package main
 
 /*
@@ -29,6 +33,7 @@ import (
 	"runtime"
 )
 
+// Constants for shared memory and states.
 const (
 	SHM_NAME         = "/pingpong_shm"
 	SHM_SIZE         = 4096 * 4
@@ -38,6 +43,8 @@ const (
 	STATE_DONE       = 3
 )
 
+// Packet represents the shared memory structure for a single worker.
+// Must match the C++ Packet struct layout.
 type Packet struct {
 	State         uint32
 	ReqId         uint32
@@ -49,6 +56,7 @@ type Packet struct {
 	Pad           [24]byte // Matches common.h padding
 }
 
+// worker function handles the processing loop for a single thread.
 func worker(id int, packet *Packet, wg *sync.WaitGroup) {
 	defer wg.Done()
 
@@ -150,6 +158,7 @@ func worker(id int, packet *Packet, wg *sync.WaitGroup) {
 	}
 }
 
+// main entry point.
 func main() {
 	numThreads := 3 // Default to 3
 	if len(os.Args) > 1 {

@@ -8,26 +8,40 @@ import (
 	"unsafe"
 )
 
-// Constants
+// Constants defining slot states and message IDs.
 const (
+	// SlotFree indicates the slot is available for the Host to claim.
 	SlotFree      = 0
+	// SlotReqReady indicates the Host has written a request and it is ready for the Guest.
 	SlotReqReady  = 1
+	// SlotRespReady indicates the Guest has written a response and it is ready for the Host.
 	SlotRespReady = 2
+	// SlotDone is a transient state indicating transaction completion.
 	SlotDone      = 3
+	// SlotBusy indicates the Host has claimed the slot and is writing data.
 	SlotBusy      = 4
 
+	// MsgIdNormal is a standard data payload message.
 	MsgIdNormal        = 0
+	// MsgIdHeartbeatReq is a keep-alive request from the Host.
 	MsgIdHeartbeatReq  = 1
+	// MsgIdHeartbeatResp is the response to a keep-alive request.
 	MsgIdHeartbeatResp = 2
+	// MsgIdShutdown signals the Guest to terminate.
 	MsgIdShutdown      = 3
 
+	// HostStateActive indicates the Host is spinning or processing.
 	HostStateActive  = 0
+	// HostStateWaiting indicates the Host is sleeping on the Response Event.
 	HostStateWaiting = 1
+	// GuestStateActive indicates the Guest is spinning or processing.
 	GuestStateActive = 0
+	// GuestStateWaiting indicates the Guest is sleeping on the Request Event.
 	GuestStateWaiting = 1
 )
 
-// SlotHeader
+// SlotHeader represents the metadata for a single slot in shared memory.
+// It must match the C++ layout exactly (128 bytes).
 type SlotHeader struct {
     _         [64]byte
 	State     uint32
@@ -39,6 +53,8 @@ type SlotHeader struct {
     _         [40]byte
 }
 
+// ExchangeHeader represents the metadata at the start of the shared memory region.
+// It describes the layout of the slot pool.
 type ExchangeHeader struct {
 	NumSlots   uint32
 	SlotSize   uint32
@@ -47,6 +63,7 @@ type ExchangeHeader struct {
 	_          [48]byte
 }
 
+// slotContext holds local runtime state for a slot.
 type slotContext struct {
 	header     *SlotHeader
 	reqBuffer  []byte
@@ -56,6 +73,8 @@ type slotContext struct {
     spinLimit  int
 }
 
+// DirectGuest implements the Guest side of the Direct Mode IPC.
+// It manages multiple workers, each attached to a specific slot.
 type DirectGuest struct {
 	shmBase  uintptr
 	shmSize  uint64
@@ -69,6 +88,12 @@ type DirectGuest struct {
 	wg    sync.WaitGroup
 }
 
+// NewDirectGuest initializes the DirectGuest by attaching to an existing shared memory region.
+//
+// name: The name of the shared memory region.
+// unused1, unused2: Parameters maintained for legacy interface compatibility (ignored).
+//
+// Returns a DirectGuest instance or an error.
 func NewDirectGuest(name string, _ int, _ int) (*DirectGuest, error) {
 	// 1. Map Header
 	const HeaderMapSize = 4096
@@ -151,6 +176,9 @@ func NewDirectGuest(name string, _ int, _ int) (*DirectGuest, error) {
 	return g, nil
 }
 
+// Start launches the worker goroutines.
+//
+// handler: The function to process requests.
 func (g *DirectGuest) Start(handler func(req []byte, resp []byte) uint32) {
 	for i := 0; i < int(g.numSlots); i++ {
 		g.wg.Add(1)
@@ -158,6 +186,7 @@ func (g *DirectGuest) Start(handler func(req []byte, resp []byte) uint32) {
 	}
 }
 
+// Close releases resources.
 func (g *DirectGuest) Close() {
 	// Logic to stop workers?
     // They will likely stop when SHM is closed or via Shutdown msg
@@ -168,10 +197,12 @@ func (g *DirectGuest) Close() {
 	}
 }
 
+// Wait blocks until all workers finish.
 func (g *DirectGuest) Wait() {
     g.wg.Wait()
 }
 
+// workerLoop is the main loop for a single slot worker.
 func (g *DirectGuest) workerLoop(idx int, handler func([]byte, []byte) uint32) {
 	defer g.wg.Done()
 

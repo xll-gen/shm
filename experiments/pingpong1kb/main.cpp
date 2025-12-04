@@ -16,8 +16,13 @@
 
 using namespace pingpong;
 
+/** @brief Default number of threads if not specified. */
 const int DEFAULT_THREADS = 3;
 
+/**
+ * @brief Cleans up shared memory and semaphores from previous runs.
+ * @param num_threads Number of worker threads/semaphores to clean.
+ */
 void cleanup(int num_threads) {
     shm_unlink(SHM_NAME);
     for (int i = 0; i < num_threads; ++i) {
@@ -28,11 +33,25 @@ void cleanup(int num_threads) {
     }
 }
 
+/**
+ * @brief Struct to hold per-worker benchmark results.
+ */
 struct WorkerResult {
     double ops;
     long long operations;
 };
 
+/**
+ * @brief Worker thread function.
+ *
+ * Performs the ping-pong exchange with the paired Guest worker.
+ * Generates random data, sends it, and verifies the bitwise-NOT response.
+ *
+ * @param id Worker ID.
+ * @param packet Pointer to the shared memory packet.
+ * @param iterations Number of iterations to run.
+ * @param[out] result Result structure to populate.
+ */
 void worker(int id, Packet* packet, int iterations, WorkerResult& result) {
     // Open Semaphores
     std::string h_name = "/pp1k_h_" + std::to_string(id);
@@ -144,6 +163,12 @@ void worker(int id, Packet* packet, int iterations, WorkerResult& result) {
     sem_close(sem_guest);
 }
 
+/**
+ * @brief Main entry point.
+ * @param argc Argument count.
+ * @param argv Argument vector.
+ * @return int Exit code.
+ */
 int main(int argc, char* argv[]) {
     int num_threads = DEFAULT_THREADS;
     if (argc > 1) {
