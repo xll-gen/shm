@@ -29,7 +29,7 @@ func NewIPCGuest[Q IPCQueue](reqQ Q, respQ Q) *IPCGuest[Q] {
 		RespQueue: respQ,
 		pool: &sync.Pool{
 			New: func() any {
-				b := make([]byte, 0, 1024)
+				b := make([]byte, 1024) // Default buffer
 				return &b
 			},
 		},
@@ -41,7 +41,7 @@ func NewIPCGuest[Q IPCQueue](reqQ Q, respQ Q) *IPCGuest[Q] {
 // Implement Transport Interface
 
 // Start listens for requests, calls handler, and sends back response.
-func (c *IPCGuest[Q]) Start(handler func([]byte) []byte) {
+func (c *IPCGuest[Q]) Start(handler func([]byte, []byte) int) {
 	c.wg.Add(1)
 	go func() {
 		defer c.wg.Done()
@@ -61,10 +61,21 @@ func (c *IPCGuest[Q]) Start(handler func([]byte) []byte) {
 			}
 
 			if msgId == MsgIdNormal {
-				resp := handler(data)
-                if resp != nil {
-				    c.RespQueue.Enqueue(resp, MsgIdNormal)
+                // Compatibility Adapter for Queue Mode
+                // Queue Mode is NOT Zero-Copy in the same sense as Direct.
+                // We need a buffer for the response.
+                respBufPtr := c.pool.Get().(*[]byte)
+                respBuf := *respBufPtr
+
+                // Call Handler
+				n := handler(data, respBuf)
+
+                if n > 0 {
+                    // Enqueue expects []byte. We slice it.
+                    // This Enqueue will copy it again into the queue.
+				    c.RespQueue.Enqueue(respBuf[:n], MsgIdNormal)
                 }
+                c.pool.Put(respBufPtr)
 			}
 		}
 	}()

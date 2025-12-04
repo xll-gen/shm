@@ -18,9 +18,13 @@
 #define CACHE_LINE_SIZE 64
 #define BLOCK_HEADER_SIZE 16
 
-// Host State constants
+// Host State constants (Legacy per-slot, can be used for debugging)
 #define HOST_STATE_ACTIVE 0
 #define HOST_STATE_WAITING 1
+
+// Scanner State
+#define SCANNER_STATE_ACTIVE 0
+#define SCANNER_STATE_SLEEPING 1
 
 namespace shm {
 
@@ -67,7 +71,9 @@ enum SlotState {
 struct ExchangeHeader {
     uint32_t numSlots;
     uint32_t slotSize;
-    uint8_t padding[56]; // Padding to 64 bytes
+    std::atomic<uint32_t> hostScannerState;
+    std::atomic<uint32_t> guestScannerState;
+    uint8_t padding[48]; // Padding to 64 bytes
 };
 
 }

@@ -53,16 +53,17 @@ func main() {
 	}
 	fmt.Println("[Go] Connected.")
 
-	// Handler - using simple byte slice handler now
-	client.Handle(func(reqData []byte) []byte {
+	// Handler - Zero Copy API
+	client.Handle(func(reqData []byte, resBuf []byte) int {
 		// Expect TransportHeader (8 bytes) + ReqSize
 		if len(reqData) != 8+ReqSize {
-			fmt.Printf("[Go] Error: Malformed request. Len=%d, Expected=%d\n", len(reqData), 8+ReqSize)
-			return nil
+			// fmt.Printf("[Go] Error: Malformed request. Len=%d, Expected=%d\n", len(reqData), 8+ReqSize)
+			return 0
 		}
 
 		// Extract Transport Header (req_id)
-		reqIdHeader := reqData[0:8]
+		// We can read it directly from reqData[0:8]
+		// and write it directly to resBuf[0:8]
 
 		// Parse Request (Little Endian) - Skip 8 bytes header
 		payload := reqData[8:]
@@ -75,14 +76,19 @@ func main() {
 		res := x + y
 
 		// Prepare Response: Header (8) + Resp (16)
-		respData := make([]byte, 8+16)
-		copy(respData[0:8], reqIdHeader)
+		// Total 24 bytes
+		if len(resBuf) < 8+16 {
+			return 0
+		}
+
+		// Copy Header (ReqID)
+		copy(resBuf[0:8], reqData[0:8])
 
 		// C++: struct { int64_t id; double result; }
-		binary.LittleEndian.PutUint64(respData[8:16], uint64(id))
-		binary.LittleEndian.PutUint64(respData[16:24], math.Float64bits(res))
+		binary.LittleEndian.PutUint64(resBuf[8:16], uint64(id))
+		binary.LittleEndian.PutUint64(resBuf[16:24], math.Float64bits(res))
 
-		return respData
+		return 8 + 16
 	})
 
 	// Start (Blocking)

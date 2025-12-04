@@ -34,43 +34,66 @@ const (
 	HostStateWaiting = 1
 )
 
+const (
+	ScannerStateActive   = 0
+	ScannerStateSleeping = 1
+)
+
 // ExchangeHeader matching C++
 type ExchangeHeader struct {
-	NumSlots uint32
-	SlotSize uint32
-	_        [56]byte // Padding
+	NumSlots          uint32
+	SlotSize          uint32
+	HostScannerState  uint32
+	GuestScannerState uint32
+	_                 [48]byte // Padding
 }
 
 type DirectGuest struct {
-	shmBase  uintptr
-	shmSize  uint64
-	handle   ShmHandle
-	numSlots uint32
-	slotSize uint32
+	shmBase        uintptr
+	shmSize        uint64
+	handle         ShmHandle
+	numSlots       uint32
+	slotSize       uint32
+	exchangeHeader *ExchangeHeader
 
 	slots []slotContext
 	wg    sync.WaitGroup
 
-	targetPollers int32 // atomic
-	activePollers int32 // atomic
+	// Channels for waking up workers
+	workerChans []chan bool
+
+	// Global Guest Event (Scanner waits on this)
+	globalEvent EventHandle
+
+	// Global Host Event (Scanner signals this)
+	globalHostEvent EventHandle
+
+	running int32
 }
 
 type slotContext struct {
-	header    *SlotHeader
-	data      []byte
-	event     EventHandle // Req Event
-	respEvent EventHandle // Resp Event
+	header   *SlotHeader
+	reqData  []byte
+	respData []byte
+	// No per-slot event needed for waking up worker, we use channel
 }
 
 func NewDirectGuest(name string, numSlots int, slotSize int) (*DirectGuest, error) {
 	// Calculate size
 	headerSize := uint64(unsafe.Sizeof(ExchangeHeader{}))
-    if headerSize < 64 { headerSize = 64 }
+	if headerSize < 64 {
+		headerSize = 64
+	}
 
-    slotHeaderSize := uint64(unsafe.Sizeof(SlotHeader{}))
-    if slotHeaderSize < 128 { slotHeaderSize = 128 }
+	slotHeaderSize := uint64(unsafe.Sizeof(SlotHeader{}))
+	if slotHeaderSize < 128 {
+		slotHeaderSize = 128
+	}
 
-	perSlotSize := slotHeaderSize + uint64(slotSize)
+	// Separate Req and Resp buffers
+	// Layout: [Header] [ReqData (slotSize)] [RespData (slotSize)]
+	// Total per slot = Header + 2*slotSize
+	perSlotSize := slotHeaderSize + uint64(slotSize)*2
 	totalSize := headerSize + (perSlotSize * uint64(numSlots))
 
 	h, addr, err := OpenShm(name, totalSize)
@@ -78,42 +101,46 @@ func NewDirectGuest(name string, numSlots int, slotSize int) (*DirectGuest, erro
 		return nil, err
 	}
 
-	// Initialize target pollers to max(1, NumCPU/4)
-    target := int32(1) // Force 1 for container safety
-	if target < 1 {
-		target = 1
+	// Open Global Events
+	gEvent, err := OpenEvent(name + "_event_guest")
+	if err != nil {
+		return nil, fmt.Errorf("failed to open global guest event: %v", err)
+	}
+
+	hEvent, err := OpenEvent(name + "_event_host")
+	if err != nil {
+		return nil, fmt.Errorf("failed to open global host event: %v", err)
 	}
 
 	g := &DirectGuest{
-		shmBase:       addr,
-		shmSize:       totalSize,
-		handle:        h,
-		numSlots:      uint32(numSlots),
-		slotSize:      uint32(slotSize),
-		slots:         make([]slotContext, numSlots),
-		targetPollers: target,
+		shmBase:         addr,
+		shmSize:         totalSize,
+		handle:          h,
+		numSlots:        uint32(numSlots),
+		slotSize:        uint32(slotSize),
+		exchangeHeader:  (*ExchangeHeader)(unsafe.Pointer(addr)),
+		slots:           make([]slotContext, numSlots),
+		workerChans:     make([]chan bool, numSlots),
+		globalEvent:     gEvent,
+		globalHostEvent: hEvent,
+		running:         1,
 	}
 
 	ptr := addr + uintptr(headerSize)
 	for i := 0; i < numSlots; i++ {
 		g.slots[i].header = (*SlotHeader)(unsafe.Pointer(ptr))
 
-		dataPtr := unsafe.Pointer(ptr + uintptr(slotHeaderSize))
-		g.slots[i].data = unsafe.Slice((*byte)(dataPtr), slotSize)
+		// Data Pointers
+		// ReqData starts after Header
+		reqPtr := unsafe.Pointer(ptr + uintptr(slotHeaderSize))
+		g.slots[i].reqData = unsafe.Slice((*byte)(reqPtr), slotSize)
 
-		eventName := fmt.Sprintf("%s_slot_%d", name, i)
-		ev, err := OpenEvent(eventName)
-		if err != nil {
-			return nil, err
-		}
-		g.slots[i].event = ev
+		// RespData starts after ReqData
+		respPtr := unsafe.Pointer(ptr + uintptr(slotHeaderSize) + uintptr(slotSize))
+		g.slots[i].respData = unsafe.Slice((*byte)(respPtr), slotSize)
 
-		respName := fmt.Sprintf("%s_slot_%d_resp", name, i)
-		evResp, err := OpenEvent(respName)
-		if err != nil {
-			return nil, err
-		}
-		g.slots[i].respEvent = evResp
+		// Create channel (buffered 1)
+		g.workerChans[i] = make(chan bool, 1)
 
 		ptr += uintptr(perSlotSize)
 	}
@@ -121,145 +148,121 @@ func NewDirectGuest(name string, numSlots int, slotSize int) (*DirectGuest, erro
 	return g, nil
 }
 
-// Implement Transport Interface
-
-func (g *DirectGuest) Send(data []byte) {
-	// Direct mode does not support arbitrary 'Send'.
-	// It only sends 'Response' to the current slot being processed.
-	// However, the unified 'Client' expects to call 'Send' with the response data
-	// AFTER the handler returns.
-	// But 'Start' calls the handler.
-	// In 'DirectGuest', the worker loop calls the handler and writes the response IMMEDIATELY to the slot.
-	// This means DirectGuest CANNOT implement generic 'Send' easily unless 'Start' manages the flow differently.
-
-	// FIX: The 'Client' implementation I wrote calls 'Start' with a wrapper handler that calls 'handler' then 'Send'.
-	// This works for Queue mode (read -> handle -> write).
-	// But for Direct mode, the 'workerLoop' handles the write step implicitly.
-	// Therefore, DirectGuest's 'Start' should take the 'handler' and do everything.
-	// BUT, 'Client' is trying to be generic.
-
-	// Solution: 'DirectGuest.Send' is a no-op or panic because DirectGuest.Start() handles the response writing internally?
-	// No, the 'handler' passed to Start returns void in Client's wrapper?
-	// Client.Start passes `func(data)` to Transport.Start.
-	// This function calls user handler, gets result, and calls Transport.Send(result).
-
-	// This flow breaks DirectGuest which expects handler to return []byte.
-
-	// Refactoring Client:
-	// Let Transport.Start take `func([]byte) []byte`?
-	// If Queue mode, it reads, calls handler, sends result.
-	// If Direct mode, it reads, calls handler, writes result to slot.
-	// This is much better for Direct mode efficiency too (no extra buffer copy/Send call).
-
-	// Let's change the plan for Client slightly.
-	// Transport.Start(handler func([]byte) []byte)
-}
-
-// Start spawns workers. Each worker is pinned to a slot index.
-func (g *DirectGuest) Start(handler func([]byte) []byte) {
+// Start spawns workers and the scanner.
+func (g *DirectGuest) Start(handler func([]byte, []byte) int) {
+	// Start Workers
 	for i := 0; i < int(g.numSlots); i++ {
-        g.wg.Add(1)
+		g.wg.Add(1)
 		go g.workerLoop(i, handler)
 	}
+
+	// Start Scanner
+	g.wg.Add(1)
+	go g.scannerLoop()
 }
 
-// StartWithResponder is an alias for Start
-func (g *DirectGuest) StartWithResponder(handler func([]byte) []byte) {
-    g.Start(handler)
-}
-
-// Wait blocks until all workers have exited (via Shutdown message).
 func (g *DirectGuest) Wait() {
-    g.wg.Wait()
+	g.wg.Wait()
 }
 
 func (g *DirectGuest) Close() {
+	atomic.StoreInt32(&g.running, 0)
 	CloseShm(g.handle, g.shmBase)
-	for _, s := range g.slots {
-		CloseEvent(s.event)
-		CloseEvent(s.respEvent)
+	CloseEvent(g.globalEvent)
+	CloseEvent(g.globalHostEvent)
+}
+
+// scannerLoop polls all slots and wakes up workers
+func (g *DirectGuest) scannerLoop() {
+	defer g.wg.Done()
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	// Initialize Scanner State
+	atomic.StoreUint32(&g.exchangeHeader.GuestScannerState, ScannerStateActive)
+
+	for atomic.LoadInt32(&g.running) == 1 {
+		worked := false
+		// Scan all slots
+		for i := 0; i < int(g.numSlots); i++ {
+			// Check if slot is ReqReady
+			s := atomic.LoadUint32(&g.slots[i].header.State)
+			if s == SlotReqReady {
+				// Signal Worker
+				// Non-blocking send to avoid hanging if worker is already busy (shouldn't happen in correct flow)
+				select {
+				case g.workerChans[i] <- true:
+				default:
+				}
+				worked = true
+			}
+		}
+
+		if !worked {
+			// Adaptive Wait Strategy
+            // 1. Spin Phase
+            foundSpin := false
+            for spin := 0; spin < 10000; spin++ {
+                 runtime.Gosched() // Use Gosched instead of CpuRelax equivalent for Go
+                 for i := 0; i < int(g.numSlots); i++ {
+				    if atomic.LoadUint32(&g.slots[i].header.State) == SlotReqReady {
+					    foundSpin = true
+					    break
+				    }
+			    }
+                if foundSpin { break }
+            }
+            if foundSpin { continue }
+
+			// 2. Set Sleeping
+			atomic.StoreUint32(&g.exchangeHeader.GuestScannerState, ScannerStateSleeping)
+
+			// 3. Check again (Double check pattern)
+			found := false
+			for i := 0; i < int(g.numSlots); i++ {
+				if atomic.LoadUint32(&g.slots[i].header.State) == SlotReqReady {
+					found = true
+					break
+				}
+			}
+
+			if found {
+				atomic.StoreUint32(&g.exchangeHeader.GuestScannerState, ScannerStateActive)
+				continue
+			}
+
+			// 4. Wait
+			WaitForEvent(g.globalEvent, 1) // 1ms timeout for responsiveness
+			atomic.StoreUint32(&g.exchangeHeader.GuestScannerState, ScannerStateActive)
+		} else {
+            // Yield if we did work? No, keep going if we have load.
+            // Maybe cpu relax.
+             runtime.Gosched()
+        }
 	}
 }
 
-func (g *DirectGuest) workerLoop(idx int, handler func([]byte) []byte) {
+func (g *DirectGuest) workerLoop(idx int, handler func([]byte, []byte) int) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	defer g.wg.Done()
 	slot := &g.slots[idx]
 	header := slot.header
+	ch := g.workerChans[idx]
 
 	// Ensure we start fresh
 	atomic.StoreUint32(&header.State, SlotFree)
 
-	for {
-		// Check adaptive logic: Are we allowed to poll?
-		canPoll := false
-		active := atomic.LoadInt32(&g.activePollers)
-		target := atomic.LoadInt32(&g.targetPollers)
+	for atomic.LoadInt32(&g.running) == 1 {
+		// Wait for signal from Scanner
+		<-ch
 
-		if active < target {
-			if atomic.CompareAndSwapInt32(&g.activePollers, active, active+1) {
-				canPoll = true
-			}
-		}
-
-		found := false
-
-		if canPoll {
-			// 1. Enter Polling State
-			// Check if already ReqReady before setting Polling
-			// Using CAS from SlotFree to SlotPolling
-			if !atomic.CompareAndSwapUint32(&header.State, SlotFree, SlotPolling) {
-				// Failed CAS
-				s := atomic.LoadUint32(&header.State)
-				if s == SlotReqReady {
-					found = true
-				}
-			} else {
-				// Successfully transitioned to Polling. Now spin.
-				// 2. Spin wait
-				spins := 0
-				const SpinLimit = 100000
-				for spins < SpinLimit {
-					s := atomic.LoadUint32(&header.State)
-					if s == SlotReqReady {
-						found = true
-						break
-					}
-					spins++
-					if spins%100 == 0 {
-						runtime.Gosched()
-					}
-				}
-
-				// If still not found, try to revert to Free
-				if !found {
-					if !atomic.CompareAndSwapUint32(&header.State, SlotPolling, SlotFree) {
-						// Failed means state changed -> ReqReady
-						found = true
-					}
-				}
-			}
-			atomic.AddInt32(&g.activePollers, -1)
-		}
-
-		if !found {
-			// Robust Wait Loop: Keep waiting until State is ReqReady
-			for {
-				s := atomic.LoadUint32(&header.State)
-				if s == SlotReqReady {
-					break
-				}
-				WaitForEvent(slot.event, 100)
-			}
-		} else {
-             // Found while polling. Just wait for state to be definitely ReqReady
-             for atomic.LoadUint32(&header.State) != SlotReqReady {
-                runtime.Gosched()
-             }
+        // Re-check state (Scanner might have false positive or race)
+        if atomic.LoadUint32(&header.State) != SlotReqReady {
+            continue
         }
 
-		// 3. Process Request
+		// Process Request
 		msgId := header.MsgId
 		if msgId == MsgIdShutdown {
 			return
@@ -268,33 +271,48 @@ func (g *DirectGuest) workerLoop(idx int, handler func([]byte) []byte) {
 		// Handle Heartbeat
 		if msgId == MsgIdHeartbeatReq {
 			header.MsgId = MsgIdHeartbeatResp
-		}
+            header.RespSize = 0
+		} else {
+            // Normal Request
+            reqSize := header.ReqSize
+            // Range check
+            if reqSize > g.slotSize { reqSize = g.slotSize }
 
-		reqSize := header.ReqSize
-		reqData := slot.data[:reqSize]
+            reqData := slot.reqData[:reqSize]
 
-		// Call handler
-		respData := handler(reqData)
+            // Call handler (Zero Copy)
+            // User writes directly to respData
+            n := handler(reqData, slot.respData)
 
-		respLen := uint32(len(respData))
-		if respLen > g.slotSize {
-			respLen = g.slotSize
-		}
+            header.RespSize = uint32(n)
+        }
 
-		copy(slot.data[:respLen], respData)
-		header.RespSize = respLen
-
-		// 4. Signal Ready
+		// 4. Signal Ready (Response Ready)
 		atomic.StoreUint32(&header.State, SlotRespReady)
 
-		// Check if Host is waiting
-		if atomic.LoadUint32(&header.HostState) == HostStateWaiting {
-			SignalEvent(slot.respEvent)
+		// Wake up Host Scanner if sleeping
+        // We read HostScannerState
+        // Note: ExchangeHeader pointer might be nil if not set up correctly, but NewDirectGuest sets it.
+        hostState := atomic.LoadUint32(&g.exchangeHeader.HostScannerState)
+		if hostState == ScannerStateSleeping {
+			SignalEvent(g.globalHostEvent)
 		}
 
-		// 5. Wait for Host Done
+		// 5. Wait for Host Done (Deadlock Fix)
+		// We spin here because Host should be fast.
+        // Fallback to sleep if too long?
+        spins := 0
 		for atomic.LoadUint32(&header.State) != SlotHostDone {
-			runtime.Gosched()
+			spins++
+            if spins > 1000 {
+                 runtime.Gosched()
+                 spins = 0
+            }
+            // Check for shutdown
+            if atomic.LoadInt32(&g.running) == 0 { return }
 		}
+
+        // 6. Set Free
+        atomic.StoreUint32(&header.State, SlotFree)
 	}
 }

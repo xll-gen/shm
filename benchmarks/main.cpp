@@ -96,12 +96,12 @@ void run_benchmark(int numThreads, int iterations, IPCMode mode) {
     double ops = totalOps / diff.count();
     double latency = (diff.count() * 1000000.0) / totalOps;
 
-    std::cout << "Threads: " << numThreads << std::endl;
-    std::cout << "Total Ops: " << (long long)totalOps << std::endl;
-    std::cout << "Time: " << diff.count() << " s" << std::endl;
-    std::cout << "Throughput: " << std::fixed << std::setprecision(2) << ops << " ops/s" << std::endl;
-    std::cout << "Avg Latency: " << latency << " us" << std::endl;
-    std::cout << "------------------------------------------------" << std::endl;
+    std::cerr << "Threads: " << numThreads << std::endl;
+    std::cerr << "Total Ops: " << (long long)totalOps << std::endl;
+    std::cerr << "Time: " << diff.count() << " s" << std::endl;
+    std::cerr << "Throughput: " << std::fixed << std::setprecision(2) << ops << " ops/s" << std::endl;
+    std::cerr << "Avg Latency: " << latency << " us" << std::endl;
+    std::cerr << "------------------------------------------------" << std::endl;
 
     host.SendShutdown();
     host.Shutdown();

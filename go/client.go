@@ -16,12 +16,12 @@ const (
 // It wraps a Transport (Queue or Direct) and handles connection retries.
 type Client struct {
 	transport Transport
-	handler   func([]byte) []byte
+	handler   func([]byte, []byte) int
 }
 
 // Transport interface defines the contract for IPC mechanisms.
 type Transport interface {
-	Start(func([]byte) []byte)
+	Start(func([]byte, []byte) int)
 	Close()
 	Wait()
 }
@@ -35,23 +35,8 @@ func Connect(name string, mode Mode) (*Client, error) {
 	// Retry loop
 	for i := 0; i < 50; i++ {
 		if mode == ModeDirect {
-			// Direct Mode
-            // We need to guess or know the params.
-            // In benchmark, we use -w for threads. Host uses same count.
-            // But NewDirectGuest needs numSlots.
-            // Client.Connect signature doesn't take numSlots.
-            // We'll assume a default or we need to change Connect signature?
-            // For now, let's assume the user of Connect (Benchmark) might need to use NewDirectGuest directly if they want custom slots.
-            // BUT, the existing code had defaults "4, 1MB".
-            // Let's stick to that for now, or better:
-            // The Host creates the SHM. Guest just opens it.
-            // Actually, Guest needs to know numSlots to Open events (slot_0, slot_1).
-            // This is a limitation of the current Connect API.
-            // We will use 4 slots as a fallback if not specified,
-            // but the benchmark passes -w.
-            // The previous client.go had "4". Let's use 64 to be safe?
-            // Or just 16.
-			t, err = NewDirectGuest(name, 16, 1024*1024)
+			// Direct Mode - Defaulting to 256 slots to match C++ Host default
+			t, err = NewDirectGuest(name, 256, 1024*1024)
 		} else {
 			// Queue Mode
 			qTotalSize := uint64(QueueHeaderSize + 32*1024*1024)
@@ -87,7 +72,7 @@ func Connect(name string, mode Mode) (*Client, error) {
 	return nil, fmt.Errorf("failed to connect after retries: %v", err)
 }
 
-func (c *Client) Handle(h func([]byte) []byte) {
+func (c *Client) Handle(h func([]byte, []byte) int) {
 	c.handler = h
 }
 
@@ -96,7 +81,7 @@ func (c *Client) Start() {
 	if c.handler == nil {
 		panic("Handler not set")
 	}
-    // Pass the handler directly. No extra headers.
+    // Pass the handler directly.
 	c.transport.Start(c.handler)
 }
 

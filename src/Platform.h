@@ -2,6 +2,7 @@
 
 #ifdef _WIN32
     #include <windows.h>
+    #include <immintrin.h> // For _mm_pause
     typedef HANDLE EventHandle;
     typedef HANDLE ShmHandle;
 #else
@@ -15,6 +16,7 @@
     #include <string>
     #include <cstring>
     #include <iostream>
+    #include <sched.h> // For sched_yield
 
     typedef sem_t* EventHandle;
     typedef int ShmHandle; // File Descriptor
@@ -133,6 +135,20 @@ public:
         return (int)GetCurrentProcessId();
 #else
         return (int)getpid();
+#endif
+    }
+
+    static void CpuRelax() {
+#ifdef _WIN32
+        _mm_pause();
+#else
+        #if defined(__x86_64__) || defined(__i386__)
+            __builtin_ia32_pause();
+        #elif defined(__aarch64__)
+            asm volatile("yield");
+        #else
+            sched_yield();
+        #endif
 #endif
     }
 };
