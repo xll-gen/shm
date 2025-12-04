@@ -23,6 +23,9 @@ const (
     EVENT_ALL_ACCESS    = 0x1F0003
 )
 
+// implemented in asm_windows_amd64.s
+func rawSyscall(trap, a1, a2, a3 uintptr) (r1, r2, err uintptr)
+
 // createEvent implementation for Windows.
 func createEvent(name string) (EventHandle, error) {
 	n, err := syscall.UTF16PtrFromString("Local\\" + name)
@@ -53,8 +56,8 @@ func openEvent(name string) (EventHandle, error) {
 
 // signalEvent implementation for Windows.
 func signalEvent(h EventHandle) {
-    // SetEvent is non-blocking, so we use RawSyscall to avoid scheduler overhead.
-	syscall.RawSyscall(procSetEvent.Addr(), 1, uintptr(h), 0, 0)
+    // SetEvent is non-blocking, so we use rawSyscall to avoid scheduler overhead.
+	rawSyscall(procSetEvent.Addr(), uintptr(h), 0, 0)
 }
 
 // waitForEvent implementation for Windows.
