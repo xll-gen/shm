@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"runtime"
 	"syscall"
 
 	"github.com/xll-gen/shm/go"
@@ -18,7 +17,7 @@ var (
 func main() {
 	flag.Parse()
 
-	runtime.GOMAXPROCS(*workers + 2) // +2 for runtime/gc
+	// runtime.GOMAXPROCS(*workers + 2) // +2 for runtime/gc
 
 	fmt.Printf("Starting Server with %d workers...\n", *workers)
 

@@ -143,7 +143,7 @@ func NewDirectGuest(name string, _ int, _ int) (*DirectGuest, error) {
 
 		g.slots[i].reqEvent = evReq
 		g.slots[i].respEvent = evResp
-        g.slots[i].spinLimit = 5000
+        g.slots[i].spinLimit = 2000
 
 		ptr += uintptr(perSlotSize)
 	}
@@ -173,8 +173,6 @@ func (g *DirectGuest) Wait() {
 }
 
 func (g *DirectGuest) workerLoop(idx int, handler func([]byte, []byte) uint32) {
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
 	defer g.wg.Done()
 
 	slot := &g.slots[idx]
@@ -187,8 +185,8 @@ func (g *DirectGuest) workerLoop(idx int, handler func([]byte, []byte) uint32) {
 		// Adaptive Wait for REQ_READY
         ready := false
         currentLimit := slot.spinLimit
-        const minSpin = 100
-        const maxSpin = 20000
+        const minSpin = 1
+        const maxSpin = 2000
 
         // 1. Spin
         for i := 0; i < currentLimit; i++ {
@@ -196,12 +194,7 @@ func (g *DirectGuest) workerLoop(idx int, handler func([]byte, []byte) uint32) {
                 ready = true
                 break
             }
-            // Cheap cpu relax logic in Go?
-            // runtime.Gosched is yield, not pause.
-            // Just busy loop or Gosched occasionally.
-            if i % 100 == 0 {
-                runtime.Gosched()
-            }
+            runtime.Gosched()
         }
 
         if ready {
@@ -261,10 +254,6 @@ func (g *DirectGuest) workerLoop(idx int, handler func([]byte, []byte) uint32) {
              // We must NOT process until State becomes REQ_READY again.
              // Host transition: RESP_READY -> FREE -> BUSY -> REQ_READY.
 
-             // Wait for NOT RespReady (i.e. Free or Busy or ReqReady)
-             for atomic.LoadUint32(&header.State) == SlotRespReady {
-                 runtime.Gosched()
-             }
         }
 	}
 }
