@@ -137,11 +137,9 @@ func openShm(name string, size uint64) (ShmHandle, uintptr, error) {
     return ShmHandle(uintptr(fd)), uintptr(addr), nil
 }
 
-func closeShm(h ShmHandle, addr uintptr) {
-	// Note: We need size to unmap correctly in C, but for now we skip unmap or assume caller handles cleanup.
-	// In a real robust lib, we'd store size.
-	// munmap((void*)addr, size)
-
-	// Close FD
+func closeShm(h ShmHandle, addr uintptr, size uint64) {
+	if addr != 0 {
+		C.munmap(unsafe.Pointer(addr), C.size_t(size))
+	}
 	C.close(C.int(h))
 }

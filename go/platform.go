@@ -31,6 +31,6 @@ func OpenShm(name string, size uint64) (ShmHandle, uintptr, error) {
 	return openShm(name, size)
 }
 
-func CloseShm(h ShmHandle, addr uintptr) {
-	closeShm(h, addr)
+func CloseShm(h ShmHandle, addr uintptr, size uint64) {
+	closeShm(h, addr, size)
 }

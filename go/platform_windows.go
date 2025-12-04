@@ -130,7 +130,7 @@ func openShm(name string, size uint64) (ShmHandle, uintptr, error) {
     return ShmHandle(hMap), addr, nil
 }
 
-func closeShm(h ShmHandle, addr uintptr) {
+func closeShm(h ShmHandle, addr uintptr, size uint64) {
 	if addr != 0 {
 		procUnmapViewOfFile.Call(addr)
 	}
