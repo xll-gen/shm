@@ -293,7 +293,9 @@ func (g *DirectGuest) workerLoop(idx int, handler func([]byte) []byte) {
 		}
 
 		// 5. Wait for Host Done
-		for atomic.LoadUint32(&header.State) != SlotHostDone {
+		// Host will change state to SlotFree (or SlotReqReady if reused immediately)
+		// We wait until the state is no longer SlotRespReady.
+		for atomic.LoadUint32(&header.State) == SlotRespReady {
 			runtime.Gosched()
 		}
 	}
