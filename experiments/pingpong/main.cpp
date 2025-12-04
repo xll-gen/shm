@@ -8,12 +8,23 @@
 #include <vector>
 #include <cstring>
 #include <atomic>
+#include <semaphore.h>
+#include <string>
+#include <immintrin.h> // For _mm_pause
 #include "common.h"
 
 using namespace pingpong;
 
-void cleanup() {
+const int DEFAULT_THREADS = 3;
+
+void cleanup(int num_threads) {
     shm_unlink(SHM_NAME);
+    for (int i = 0; i < num_threads; ++i) {
+        std::string h_name = "/pp_h_" + std::to_string(i);
+        std::string g_name = "/pp_g_" + std::to_string(i);
+        sem_unlink(h_name.c_str());
+        sem_unlink(g_name.c_str());
+    }
 }
 
 struct WorkerResult {
@@ -22,10 +33,27 @@ struct WorkerResult {
 };
 
 void worker(int id, Packet* packet, int iterations, WorkerResult& result) {
+    // Open Semaphores
+    std::string h_name = "/pp_h_" + std::to_string(id);
+    std::string g_name = "/pp_g_" + std::to_string(id);
+
+    // Host creates semaphores
+    sem_t* sem_host = sem_open(h_name.c_str(), O_CREAT, 0666, 0);
+    sem_t* sem_guest = sem_open(g_name.c_str(), O_CREAT, 0666, 0);
+
+    if (sem_host == SEM_FAILED || sem_guest == SEM_FAILED) {
+        perror("sem_open worker");
+        exit(1);
+    }
+
     auto start = std::chrono::high_resolution_clock::now();
 
     // Initialize packet state
     packet->state.store(STATE_WAIT_REQ, std::memory_order_relaxed);
+    packet->host_sleeping.store(0);
+    packet->guest_sleeping.store(0);
+
+    const int SPIN_LIMIT = 2000;
 
     for (int i = 0; i < iterations; ++i) {
         packet->val_a = i;
@@ -35,34 +63,74 @@ void worker(int id, Packet* packet, int iterations, WorkerResult& result) {
         // Signal request
         packet->state.store(STATE_REQ_READY, std::memory_order_seq_cst);
 
-        // Busy wait
-        while (packet->state.load(std::memory_order_relaxed) != STATE_RESP_READY) {
-            // Busy loop
+        // Wake guest if sleeping
+        if (packet->guest_sleeping.load(std::memory_order_seq_cst) == 1) {
+            sem_post(sem_guest);
         }
 
-        // Verify (minimal check to save time in loop, but essential for correctness)
+        // Adaptive Wait for Response
+        bool ready = false;
+
+        // 1. Spin Phase
+        for (int spin = 0; spin < SPIN_LIMIT; ++spin) {
+            if (packet->state.load(std::memory_order_acquire) == STATE_RESP_READY) {
+                ready = true;
+                break;
+            }
+            _mm_pause();
+        }
+
+        if (!ready) {
+            // 2. Sleep Phase
+            packet->host_sleeping.store(1, std::memory_order_seq_cst);
+
+            // Double check (Critical to avoid lost wakeups)
+            if (packet->state.load(std::memory_order_seq_cst) == STATE_RESP_READY) {
+                ready = true;
+                packet->host_sleeping.store(0, std::memory_order_relaxed);
+            } else {
+                // Wait loop to handle spurious wakeups
+                while (packet->state.load(std::memory_order_acquire) != STATE_RESP_READY) {
+                    sem_wait(sem_host);
+                }
+                packet->host_sleeping.store(0, std::memory_order_relaxed);
+            }
+        }
+
+        // Verify
         if (packet->sum != (packet->val_a + packet->val_b)) {
             std::cerr << "Mismatch in thread " << id << " at " << i << std::endl;
             exit(1);
         }
 
-        // Reset state for next iteration (logically)
+        // Reset state for next iteration
         packet->state.store(STATE_WAIT_REQ, std::memory_order_relaxed);
     }
 
     auto end = std::chrono::high_resolution_clock::now();
-    packet->state.store(STATE_DONE, std::memory_order_seq_cst); // Signal done to guest worker
+    packet->state.store(STATE_DONE, std::memory_order_seq_cst); // Signal done
+
+    // Wake guest so it can see STATE_DONE
+    if (packet->guest_sleeping.load(std::memory_order_seq_cst) == 1) {
+        sem_post(sem_guest);
+    }
 
     std::chrono::duration<double> diff = end - start;
     result.operations = iterations;
     result.ops = iterations / diff.count();
+
+    sem_close(sem_host);
+    sem_close(sem_guest);
 }
 
 int main(int argc, char* argv[]) {
-    int num_threads = 1;
+    int num_threads = DEFAULT_THREADS;
     if (argc > 1) {
         num_threads = std::atoi(argv[1]);
     }
+
+    // Cleanup old artifacts
+    cleanup(num_threads);
 
     std::cout << "[Host] Threads: " << num_threads << std::endl;
 
@@ -70,13 +138,6 @@ int main(int argc, char* argv[]) {
     int fd = shm_open(SHM_NAME, O_CREAT | O_RDWR, 0666);
     if (fd == -1) {
         perror("shm_open");
-        return 1;
-    }
-
-    // Ensure size covers all threads
-    size_t required_size = sizeof(Packet) * num_threads;
-    if (required_size > SHM_SIZE) {
-        std::cerr << "SHM_SIZE defined in common.h is too small!" << std::endl;
         return 1;
     }
 
@@ -93,14 +154,17 @@ int main(int argc, char* argv[]) {
 
     Packet* packets = (Packet*)ptr;
 
+    // Zero out memory
+    memset(ptr, 0, SHM_SIZE);
+
     // Initialize all packets
     for(int i=0; i<num_threads; ++i) {
-        new (&packets[i]) Packet();
+        new (&packets[i]) Packet(); // placement new
         packets[i].state.store(STATE_WAIT_REQ);
     }
 
     std::cout << "[Host] Waiting for guest..." << std::endl;
-    std::this_thread::sleep_for(std::chrono::seconds(1));
+    std::this_thread::sleep_for(std::chrono::seconds(1)); // Simple sync
 
     std::cout << "[Host] Starting benchmark..." << std::endl;
 
@@ -130,6 +194,6 @@ int main(int argc, char* argv[]) {
 
     munmap(ptr, SHM_SIZE);
     close(fd);
-    cleanup();
+    cleanup(num_threads);
     return 0;
 }
