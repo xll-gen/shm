@@ -6,9 +6,12 @@ This experiment tests the shared memory visibility and raw performance between a
 
 *   **Host (C++)**: Creates shared memory (`/pingpong_shm`), writes request data, sets a `REQ_READY` flag.
 *   **Guest (Go)**: Attaches to shared memory, waits for `REQ_READY`, processes data (sum), sets `RESP_READY`.
-*   **Adaptive Wait Strategy**:
-    *   **Phase 1 (Spin)**: Both Host and Guest spin-loop for 2000 iterations to catch immediate responses (Latency Optimization). Host uses `_mm_pause()`, Guest uses `runtime.Gosched()`.
-    *   **Phase 2 (Sleep)**: If data is not ready, they set a 'Sleeping' flag and block on a POSIX Named Semaphore (CPU Efficiency).
+*   **Adaptive Wait Strategy (Dynamic Spin-Backoff)**:
+    *   **Concept**: Detects CPU contention and dynamically adjusts the behavior per thread.
+    *   **Phase 1 (Spin)**: Attempts to busy-wait for a dynamic `spin_limit` (Range: 1 to 2000).
+        *   **Success**: If data arrives during spin, `spin_limit` increases (+100) to reward low-latency behavior.
+        *   **Failure**: If spin times out, `spin_limit` decreases (-500) to punish "thrashing" and force earlier sleep next time.
+    *   **Phase 2 (Sleep)**: If data is not ready after spinning, threads block on a POSIX Named Semaphore (CPU Efficiency).
 *   **Synchronization**: Atomic flags with Acquire/Release memory ordering to ensure data visibility.
 *   **Multi-threading**: Supports running multiple worker pairs (Host Thread <-> Guest Goroutine) on dedicated slots.
 
@@ -29,32 +32,27 @@ struct Packet {
 };
 ```
 
-## Benchmark Results (Adaptive Wait)
+## Benchmark Results (Dynamic Spin-Backoff)
 
-Test configuration: 100,000 iterations per thread.
+Test configuration: 4-Core CPU, 100,000 iterations per thread.
 
-| Threads | Total OPS (Sum of Thread OPS) | Execution Time (Wall Clock) | System Effective OPS | Note |
-| :--- | :--- | :--- | :--- | :--- |
-| **1** | **2,361,600** | 0.043s | **~2.36 M** | Baseline |
-| **2** | **2,843,630** | 0.078s | **~2.56 M** | **Optimal Efficiency** |
-| **3** | **2,770,710** | 0.120s | **~2.50 M** | Saturation begins |
-| **4** | 1,474,980 | 0.282s | ~1.42 M | **Resource Exhaustion** (Thrashing) |
-| **8** | 4,230,860 | 0.437s | ~1.83 M | **Severe Load Imbalance** |
+| Setting (N) | Active Threads (N*2) | Total OPS | Note |
+| :--- | :--- | :--- | :--- |
+| **1** | 2 | **2.48 M** | Single-thread latency baseline (Spinning active) |
+| **2** | 4 | **2.94 M** | **Optimal Saturation**. Threads == Physical Cores (100% Load) |
+| **3** | 6 | **1.85 M** | **Oversubscription** (150% Load). Graceful degradation. |
+| **4** | 8 | **1.74 M** | **Heavy Load** (200% Load). Stable performance. |
 
-### Resource Exhaustion Analysis
+### Analysis
 
-1.  **Saturation Point (3 Threads)**:
-    *   Throughput plateaus at 3 threads. While the total operations per second remains high, the scaling efficiency drops compared to 1-2 threads.
+1.  **Optimal Saturation (N=2)**:
+    *   Since the benchmark runs pairs of Host and Guest threads, `N=2` creates **4 active threads**.
+    *   On a 4-core system, this achieves perfect 1:1 mapping, resulting in peak throughput (2.94M OPS) with minimal context switching.
 
-2.  **Resource Exhaustion (4 Threads)**:
-    *   Performance drops significantly (System Effective OPS drops to ~1.4M).
-    *   **Cause**: The number of active threads exceeds the available physical CPU cores (likely 2 cores in the test environment). This forces frequent context switches.
-    *   The "Spin" phase of the adaptive strategy becomes detrimental here, as threads waste quantum spinning instead of yielding immediately to the thread that holds the lock/data.
-
-3.  **Load Imbalance (8 Threads)**:
-    *   The "Total OPS" metric (4.2M) is misleading. It is the sum of individual thread speeds.
-    *   Some threads finish very quickly (high OPS) while others starve (low OPS).
-    *   The **System Effective OPS** (1.83M) confirms that the overall job completion time is slower than the 1-thread case. This confirms severe contention and scheduler thrashing.
+2.  **Graceful Degradation (N=3, N=4)**:
+    *   When threads exceed physical cores (e.g., N=3 creates 6 threads on 4 cores), standard spinning causes "Thrashing" (threads waste CPU waiting for descheduled partners).
+    *   The **Dynamic Spin-Backoff** algorithm detects this contention (spin failures) and automatically reduces the `spin_limit`.
+    *   Excess threads switch to "Immediate Sleep" mode, acting like standard mutexes. This prevents the system from locking up and maintains steady throughput (~1.7-1.8M OPS) even under 200% load.
 
 ## How to Run
 
