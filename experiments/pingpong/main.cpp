@@ -53,7 +53,10 @@ void worker(int id, Packet* packet, int iterations, WorkerResult& result) {
     packet->host_sleeping.store(0);
     packet->guest_sleeping.store(0);
 
-    const int SPIN_LIMIT = 2000;
+    // Dynamic adaptation state
+    int spin_limit = 2000;
+    const int MIN_SPIN = 1;
+    const int MAX_SPIN = 2000;
 
     for (int i = 0; i < iterations; ++i) {
         packet->val_a = i;
@@ -72,7 +75,7 @@ void worker(int id, Packet* packet, int iterations, WorkerResult& result) {
         bool ready = false;
 
         // 1. Spin Phase
-        for (int spin = 0; spin < SPIN_LIMIT; ++spin) {
+        for (int spin = 0; spin < spin_limit; ++spin) {
             if (packet->state.load(std::memory_order_acquire) == STATE_RESP_READY) {
                 ready = true;
                 break;
@@ -80,7 +83,15 @@ void worker(int id, Packet* packet, int iterations, WorkerResult& result) {
             _mm_pause();
         }
 
-        if (!ready) {
+        if (ready) {
+            // Case A: Success - Increase spin limit (reward)
+            if (spin_limit < MAX_SPIN) spin_limit += 100;
+            if (spin_limit > MAX_SPIN) spin_limit = MAX_SPIN;
+        } else {
+            // Case B: Failure - Decrease spin limit (punish)
+            if (spin_limit > MIN_SPIN) spin_limit -= 500;
+            if (spin_limit < MIN_SPIN) spin_limit = MIN_SPIN;
+
             // 2. Sleep Phase
             packet->host_sleeping.store(1, std::memory_order_seq_cst);
 

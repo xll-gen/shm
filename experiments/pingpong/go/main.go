@@ -36,7 +36,6 @@ const (
 	STATE_REQ_READY  = 1
 	STATE_RESP_READY = 2
 	STATE_DONE       = 3
-	SPIN_LIMIT       = 2000
 )
 
 type Packet struct {
@@ -79,12 +78,16 @@ func worker(id int, packet *Packet, wg *sync.WaitGroup) {
 	defer C.sem_close(semHost)
 	defer C.sem_close(semGuest)
 
+	spinLimit := 2000
+	const minSpin = 1
+	const maxSpin = 2000
+
 	for {
 		// Adaptive Wait for Request
 		ready := false
 
 		// 1. Spin Phase
-		for i := 0; i < SPIN_LIMIT; i++ {
+		for i := 0; i < spinLimit; i++ {
 			s := atomic.LoadUint32(&packet.State)
 			if s == STATE_REQ_READY || s == STATE_DONE {
 				ready = true
@@ -93,7 +96,23 @@ func worker(id int, packet *Packet, wg *sync.WaitGroup) {
 			runtime.Gosched()
 		}
 
-		if !ready {
+		if ready {
+			// Case A: Success - Increase spin limit
+			if spinLimit < maxSpin {
+				spinLimit += 100
+			}
+			if spinLimit > maxSpin {
+				spinLimit = maxSpin
+			}
+		} else {
+			// Case B: Failure - Decrease spin limit
+			if spinLimit > minSpin {
+				spinLimit -= 500
+			}
+			if spinLimit < minSpin {
+				spinLimit = minSpin
+			}
+
 			// 2. Sleep Phase
 			atomic.StoreUint32(&packet.GuestSleeping, 1)
 
