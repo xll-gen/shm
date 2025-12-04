@@ -21,7 +21,7 @@ const (
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	workers := flag.Int("w", 1, "Number of worker threads")
-	mode := flag.String("mode", "spsc", "Queue mode: spsc, mpsc, or direct")
+	mode := flag.String("mode", "spsc", "Queue mode: spsc or direct")
 	cpuprofile := flag.String("cpuprofile", "", "write cpu profile to file")
 	memprofile := flag.String("memprofile", "", "write memory profile to file")
 	flag.Parse()
