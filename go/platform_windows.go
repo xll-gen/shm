@@ -6,24 +6,26 @@ import (
 )
 
 var (
-	kernel32               = syscall.NewLazyDLL("kernel32.dll")
-	procCreateEventW       = kernel32.NewProc("CreateEventW")
-	procOpenEventW         = kernel32.NewProc("OpenEventW")
-	procSetEvent           = kernel32.NewProc("SetEvent")
-	procWaitForSingleObject= kernel32.NewProc("WaitForSingleObject")
-	procCloseHandle        = kernel32.NewProc("CloseHandle")
-	procCreateFileMappingW = kernel32.NewProc("CreateFileMappingW")
-	procOpenFileMappingW   = kernel32.NewProc("OpenFileMappingW")
-	procMapViewOfFile      = kernel32.NewProc("MapViewOfFile")
-	procUnmapViewOfFile    = kernel32.NewProc("UnmapViewOfFile")
+	kernel32                = syscall.NewLazyDLL("kernel32.dll")
+	procCreateEventW        = kernel32.NewProc("CreateEventW")
+	procOpenEventW          = kernel32.NewProc("OpenEventW")
+	procSetEvent            = kernel32.NewProc("SetEvent")
+	procWaitForSingleObject = kernel32.NewProc("WaitForSingleObject")
+	procCloseHandle         = kernel32.NewProc("CloseHandle")
+	procCreateFileMappingW  = kernel32.NewProc("CreateFileMappingW")
+	procOpenFileMappingW    = kernel32.NewProc("OpenFileMappingW")
+	procMapViewOfFile       = kernel32.NewProc("MapViewOfFile")
+	procUnmapViewOfFile     = kernel32.NewProc("UnmapViewOfFile")
 )
 
 const (
 	FILE_MAP_ALL_ACCESS = 0xF001F
-    EVENT_ALL_ACCESS    = 0x1F0003
+	EVENT_ALL_ACCESS    = 0x1F0003
 )
 
 // implemented in asm_windows_amd64.s
+//
+//go:noescape
 func rawSyscall(trap, a1, a2, a3 uintptr) (r1, r2, err uintptr)
 
 // createEvent implementation for Windows.
@@ -42,21 +44,21 @@ func createEvent(name string) (EventHandle, error) {
 
 // openEvent implementation for Windows.
 func openEvent(name string) (EventHandle, error) {
-    n, err := syscall.UTF16PtrFromString("Local\\" + name)
-    if err != nil {
-        return 0, err
-    }
-    // OpenEventW(dwDesiredAccess, bInheritHandle, lpName)
-    r1, _, err := procOpenEventW.Call(uintptr(EVENT_ALL_ACCESS), 0, uintptr(unsafe.Pointer(n)))
-    if r1 == 0 {
-        return 0, err
-    }
-    return EventHandle(r1), nil
+	n, err := syscall.UTF16PtrFromString("Local\\" + name)
+	if err != nil {
+		return 0, err
+	}
+	// OpenEventW(dwDesiredAccess, bInheritHandle, lpName)
+	r1, _, err := procOpenEventW.Call(uintptr(EVENT_ALL_ACCESS), 0, uintptr(unsafe.Pointer(n)))
+	if r1 == 0 {
+		return 0, err
+	}
+	return EventHandle(r1), nil
 }
 
 // signalEvent implementation for Windows.
 func signalEvent(h EventHandle) {
-    // SetEvent is non-blocking, so we use rawSyscall to avoid scheduler overhead.
+	// SetEvent is non-blocking, so we use rawSyscall to avoid scheduler overhead.
 	rawSyscall(procSetEvent.Addr(), uintptr(h), 0, 0)
 }
 
@@ -83,8 +85,8 @@ func createShm(name string, size uint64) (ShmHandle, uintptr, error) {
 		uintptr(syscall.InvalidHandle),
 		0,
 		uintptr(syscall.PAGE_READWRITE),
-		uintptr(size >> 32),
-		uintptr(size & 0xFFFFFFFF),
+		uintptr(size>>32),
+		uintptr(size&0xFFFFFFFF),
 		uintptr(unsafe.Pointer(n)),
 	)
 	if hMap == 0 {
@@ -109,22 +111,22 @@ func createShm(name string, size uint64) (ShmHandle, uintptr, error) {
 
 // openShm implementation for Windows.
 func openShm(name string, size uint64) (ShmHandle, uintptr, error) {
-    n, err := syscall.UTF16PtrFromString("Local\\" + name)
-    if err != nil {
-        return 0, 0, err
-    }
+	n, err := syscall.UTF16PtrFromString("Local\\" + name)
+	if err != nil {
+		return 0, 0, err
+	}
 
-    // OpenFileMappingW(dwDesiredAccess, bInheritHandle, lpName)
-    hMap, _, err := procOpenFileMappingW.Call(
-        uintptr(FILE_MAP_ALL_ACCESS),
-        0,
-        uintptr(unsafe.Pointer(n)),
-    )
-    if hMap == 0 {
-        return 0, 0, err
-    }
+	// OpenFileMappingW(dwDesiredAccess, bInheritHandle, lpName)
+	hMap, _, err := procOpenFileMappingW.Call(
+		uintptr(FILE_MAP_ALL_ACCESS),
+		0,
+		uintptr(unsafe.Pointer(n)),
+	)
+	if hMap == 0 {
+		return 0, 0, err
+	}
 
-    // MapViewOfFile
+	// MapViewOfFile
 	addr, _, err := procMapViewOfFile.Call(
 		hMap,
 		uintptr(FILE_MAP_ALL_ACCESS),
@@ -137,7 +139,7 @@ func openShm(name string, size uint64) (ShmHandle, uintptr, error) {
 		return 0, 0, err
 	}
 
-    return ShmHandle(hMap), addr, nil
+	return ShmHandle(hMap), addr, nil
 }
 
 // closeShm implementation for Windows.

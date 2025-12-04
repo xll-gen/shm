@@ -73,7 +73,7 @@ int main(int argc, char* argv[]) {
 
     DirectHost host;
     // Align slots with threads for 1:1
-    if (!host.Init("/SimpleIPC", numThreads, 4096)) {
+    if (!host.Init("SimpleIPC", numThreads, 4096)) {
         std::cerr << "Failed to init host" << std::endl;
         return 1;
     }

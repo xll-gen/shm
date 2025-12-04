@@ -2,6 +2,7 @@
 
 #ifdef _WIN32
     #include <windows.h>
+    #include <string>
     typedef HANDLE EventHandle;
     typedef HANDLE ShmHandle;
 #else
@@ -42,8 +43,10 @@ public:
      */
     static EventHandle CreateNamedEvent(const char* name) {
 #ifdef _WIN32
-        std::string evName = "Local\\" + std::string(name);
-        return CreateEventA(NULL, FALSE, FALSE, evName.c_str());
+        std::string s_name(name);
+        std::wstring w_name(s_name.begin(), s_name.end());
+        std::wstring final_ev_name = L"Local\\" + w_name;
+        return CreateEventW(NULL, FALSE, FALSE, final_ev_name.c_str());
 #else
         std::string evName = "/" + std::string(name);
         EventHandle sem = sem_open(evName.c_str(), O_CREAT, 0644, 0);
@@ -118,9 +121,11 @@ public:
      */
     static void* CreateNamedShm(const char* name, uint64_t size, ShmHandle& outHandle, bool& outExists) {
 #ifdef _WIN32
-        std::string shmName = "Local\\" + std::string(name);
-        outHandle = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
-            (DWORD)(size >> 32), (DWORD)size, shmName.c_str());
+        std::string s_name(name);
+        std::wstring w_name(s_name.begin(), s_name.end());
+        std::wstring final_shm_name = L"Local\\" + w_name;
+        outHandle = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
+            (DWORD)(size >> 32), (DWORD)size, final_shm_name.c_str());
 
         if (!outHandle) return nullptr;
 
