@@ -46,3 +46,18 @@ The benchmark evaluates the "System Effective OPS" (Total successful operations 
 *   **Performance**: The Direct Mode significantly outperforms the legacy SPSC implementation (approx 20x-170x improvement).
 *   **Scaling**: Throughput peaks at 4 threads in this environment. The drop at 8 threads is expected due to CPU resource contention in the sandbox environment (oversubscription of available physical cores).
 *   **Stability**: The 8-thread test passed successfully, demonstrating the robustness of the adaptive wait strategy even under heavy contention.
+
+## Guest Call Scenario
+
+This scenario validates the bidirectional communication capability where the Guest triggers a call back to the Host during request processing (Nested Call: Host -> Guest -> Host -> Guest -> Host).
+
+**Environment:** Sandbox (Containerized)
+**Payload:** 64 bytes (Ping-Pong) + Guest Call (Small Payload)
+
+### 1 Thread
+*   **Throughput**: 1,110,302 ops/s
+*   **Avg Latency (RTT)**: 0.90 us
+
+### 2 Threads
+*   **Throughput**: 1,084,854 ops/s
+*   **Avg Latency (RTT)**: 1.84 us
