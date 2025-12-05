@@ -270,7 +270,10 @@ func (g *DirectGuest) SendGuestCall(data []byte, msgId uint32) ([]byte, error) {
 			ready = true
 			break
 		}
-		runtime.Gosched()
+		// Yield less frequently
+		if i&0x3F == 0 {
+			runtime.Gosched()
+		}
 	}
 
 	if !ready {
@@ -337,7 +340,10 @@ func (g *DirectGuest) workerLoop(idx int, handler func([]byte, []byte, uint32) i
                 ready = true
                 break
             }
-            runtime.Gosched()
+            // Yield less frequently to reduce scheduler overhead (every 64 iterations)
+            if i&0x3F == 0 {
+                runtime.Gosched()
+            }
         }
 
         if ready {

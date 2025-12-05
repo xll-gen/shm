@@ -74,7 +74,7 @@ class DirectHost {
         bool ready = false;
         int currentLimit = slot->spinLimit;
         const int MIN_SPIN = 100;
-        const int MAX_SPIN = 20000;
+        const int MAX_SPIN = 50000;
 
         for (int i = 0; i < currentLimit; ++i) {
             if (slot->header->state.load(std::memory_order_acquire) == SLOT_RESP_READY) {
@@ -85,9 +85,9 @@ class DirectHost {
         }
 
         if (ready) {
-            if (currentLimit < MAX_SPIN) currentLimit += 100;
+            if (currentLimit < MAX_SPIN) currentLimit += 200;
         } else {
-            if (currentLimit > MIN_SPIN) currentLimit -= 500;
+            if (currentLimit > MIN_SPIN) currentLimit -= 100;
             if (currentLimit < MIN_SPIN) currentLimit = MIN_SPIN;
 
             slot->header->hostState.store(HOST_STATE_WAITING, std::memory_order_seq_cst);
