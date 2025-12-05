@@ -69,6 +69,13 @@ if (!host.Init("MyIPC", 4)) { // 4 Worker Slots
     return -1;
 }
 
+/*
+// To enable Async Guest Calls (Guest -> Host), use the 4th argument:
+if (!host.Init("MyIPC", 4, 1024*1024, 2)) { // 4 Worker Slots, 1MB Slot Size, 2 Async Slots
+    return -1;
+}
+*/
+
 std::vector<uint8_t> resp;
 // Send 4 bytes to any available slot
 // Note: This blocks until response is received.
