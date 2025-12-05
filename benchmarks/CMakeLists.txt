@@ -24,10 +24,13 @@ set(SOURCES
 
 # Executable
 add_executable(shm_benchmark ${SOURCES})
+add_executable(guest_call_test ../tests/guest_call_test.cpp)
 
 # Libraries
 if(WIN32)
     target_link_libraries(shm_benchmark PRIVATE ws2_32)
+    target_link_libraries(guest_call_test PRIVATE ws2_32)
 else()
     target_link_libraries(shm_benchmark PRIVATE pthread rt)
+    target_link_libraries(guest_call_test PRIVATE pthread rt)
 endif()

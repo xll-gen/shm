@@ -125,6 +125,37 @@ func main() {
 }
 ```
 
+### Guest Call (Async)
+
+The library supports Guest-initiated calls (e.g., for async callbacks). Specific slots are reserved for this purpose.
+
+**C++ Host (Listener):**
+
+```cpp
+// Init with 4 Host Slots and 2 Guest Slots
+host.Init("MyIPC", 4, 1024*1024, 2);
+
+// In a background thread:
+while (running) {
+    host.ProcessGuestCalls([](const uint8_t* req, uint8_t* resp, uint32_t msgId) -> int32_t {
+        if (msgId == MSG_ID_GUEST_CALL) {
+             // Process Guest Request
+        }
+        return 0; // Return response size
+    });
+    // Sleep/Yield to avoid 100% CPU if polling
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+}
+```
+
+**Go Guest (Caller):**
+
+```go
+// Send Guest Call
+// msgId can be shm.MsgIdGuestCall or custom
+resp, err := client.SendGuestCall([]byte("AsyncData"), shm.MsgIdGuestCall)
+```
+
 ## Building
 
 ### Requirements

@@ -113,4 +113,5 @@ The C++ Host library is **header-only**. All source code must reside in `include
 ### 6.2. Direct Exchange Mode
 The project exclusively uses the 'Direct Exchange' model (1:1 Slot Mapping).
 -   **Queues/Lanes:** Concepts like "Queues" or "Lanes" are deprecated. Use "Slots".
+-   **Guest Call Slots:** Specific slots (indices `NumSlots` to `NumSlots + NumGuestSlots`) are reserved for Guest-initiated calls (Guest->Host).
 -   **ZeroCopySlot:** Use `DirectHost::GetZeroCopySlot()` for zero-copy message construction.

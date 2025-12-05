@@ -31,6 +31,8 @@ const (
 	MsgIdShutdown      = 3
 	// MsgIdFlatbuffer indicates a Zero-Copy FlatBuffer payload.
 	MsgIdFlatbuffer    = 10
+	// MsgIdGuestCall indicates a Guest Call payload.
+	MsgIdGuestCall     = 11
 
 	// HostStateActive indicates the Host is spinning or processing.
 	HostStateActive  = 0
@@ -58,11 +60,12 @@ type SlotHeader struct {
 // ExchangeHeader represents the metadata at the start of the shared memory region.
 // It describes the layout of the slot pool.
 type ExchangeHeader struct {
-	NumSlots   uint32
-	SlotSize   uint32
-	ReqOffset  uint32
-	RespOffset uint32
-	_          [48]byte
+	NumSlots      uint32
+	NumGuestSlots uint32
+	SlotSize      uint32
+	ReqOffset     uint32
+	RespOffset    uint32
+	_             [44]byte
 }
 
 // slotContext holds local runtime state for a slot.
@@ -78,13 +81,14 @@ type slotContext struct {
 // DirectGuest implements the Guest side of the Direct Mode IPC.
 // It manages multiple workers, each attached to a specific slot.
 type DirectGuest struct {
-	shmBase  uintptr
-	shmSize  uint64
-	handle   ShmHandle
-	numSlots uint32
-	slotSize uint32
-    reqOffset uint32
-    respOffset uint32
+	shmBase       uintptr
+	shmSize       uint64
+	handle        ShmHandle
+	numSlots      uint32
+	numGuestSlots uint32
+	slotSize      uint32
+	reqOffset     uint32
+	respOffset    uint32
 
 	slots []slotContext
 	wg    sync.WaitGroup
@@ -106,9 +110,10 @@ func NewDirectGuest(name string, _ int, _ int) (*DirectGuest, error) {
 
 	header := (*ExchangeHeader)(unsafe.Pointer(addr))
 	numSlots := header.NumSlots
+	numGuestSlots := header.NumGuestSlots
 	slotSize := header.SlotSize
-    reqOffset := header.ReqOffset
-    respOffset := header.RespOffset
+	reqOffset := header.ReqOffset
+	respOffset := header.RespOffset
 
 	if numSlots == 0 || slotSize == 0 {
 		CloseShm(h, addr, HeaderMapSize)
@@ -118,14 +123,19 @@ func NewDirectGuest(name string, _ int, _ int) (*DirectGuest, error) {
 	CloseShm(h, addr, HeaderMapSize)
 
 	// 2. Map Full
-    headerSize := uint64(unsafe.Sizeof(ExchangeHeader{}))
-    if headerSize < 64 { headerSize = 64 }
+	headerSize := uint64(unsafe.Sizeof(ExchangeHeader{}))
+	if headerSize < 64 {
+		headerSize = 64
+	}
 
-    slotHeaderSize := uint64(unsafe.Sizeof(SlotHeader{})) // Should be 128
-    if slotHeaderSize < 128 { slotHeaderSize = 128 }
+	slotHeaderSize := uint64(unsafe.Sizeof(SlotHeader{})) // Should be 128
+	if slotHeaderSize < 128 {
+		slotHeaderSize = 128
+	}
 
-    perSlotSize := slotHeaderSize + uint64(slotSize)
-    totalSize := headerSize + (perSlotSize * uint64(numSlots))
+	perSlotSize := slotHeaderSize + uint64(slotSize)
+	totalSlots := numSlots + numGuestSlots
+	totalSize := headerSize + (perSlotSize * uint64(totalSlots))
 
 	h, addr, err = OpenShm(name, totalSize)
 	if err != nil {
@@ -133,18 +143,19 @@ func NewDirectGuest(name string, _ int, _ int) (*DirectGuest, error) {
 	}
 
 	g := &DirectGuest{
-		shmBase:   addr,
-		shmSize:   totalSize,
-		handle:    h,
-		numSlots:  numSlots,
-		slotSize:  slotSize,
-        reqOffset: reqOffset,
-        respOffset: respOffset,
-		slots:     make([]slotContext, numSlots),
+		shmBase:       addr,
+		shmSize:       totalSize,
+		handle:        h,
+		numSlots:      numSlots,
+		numGuestSlots: numGuestSlots,
+		slotSize:      slotSize,
+		reqOffset:     reqOffset,
+		respOffset:    respOffset,
+		slots:         make([]slotContext, totalSlots),
 	}
 
 	ptr := addr + uintptr(headerSize)
-	for i := 0; i < int(numSlots); i++ {
+	for i := 0; i < int(totalSlots); i++ {
 		g.slots[i].header = (*SlotHeader)(unsafe.Pointer(ptr))
 
         dataBase := ptr + uintptr(slotHeaderSize)
@@ -202,6 +213,105 @@ func (g *DirectGuest) Close() {
 // Wait blocks until all workers finish.
 func (g *DirectGuest) Wait() {
     g.wg.Wait()
+}
+
+// SendGuestCall sends a request to the Host using a Guest Slot.
+// It blocks until a response is received or a timeout occurs.
+func (g *DirectGuest) SendGuestCall(data []byte, msgId uint32) ([]byte, error) {
+	if g.numGuestSlots == 0 {
+		return nil, fmt.Errorf("no guest slots available")
+	}
+
+	startIdx := int(g.numSlots)
+	endIdx := int(g.numSlots + g.numGuestSlots)
+
+	var slot *slotContext
+	// Simple scan
+	for i := startIdx; i < endIdx; i++ {
+		s := &g.slots[i]
+		if atomic.CompareAndSwapUint32(&s.header.State, SlotFree, SlotBusy) {
+			slot = s
+			break
+		}
+	}
+
+	if slot == nil {
+		return nil, fmt.Errorf("all guest slots busy")
+	}
+
+	// Write Data
+	if len(data) > len(slot.reqBuffer) {
+		atomic.StoreUint32(&slot.header.State, SlotFree)
+		return nil, fmt.Errorf("data too large")
+	}
+
+	if msgId == MsgIdFlatbuffer {
+		// End-aligned for Zero-Copy FlatBuffers
+		offset := len(slot.reqBuffer) - len(data)
+		copy(slot.reqBuffer[offset:], data)
+		slot.header.ReqSize = -int32(len(data))
+	} else {
+		copy(slot.reqBuffer, data)
+		slot.header.ReqSize = int32(len(data))
+	}
+
+	slot.header.MsgId = msgId
+
+	// Signal Ready
+	atomic.StoreUint32(&slot.header.State, SlotReqReady)
+	SignalEvent(slot.reqEvent)
+
+	// Wait for Response
+	ready := false
+	currentLimit := 2000
+
+	for i := 0; i < currentLimit; i++ {
+		if atomic.LoadUint32(&slot.header.State) == SlotRespReady {
+			ready = true
+			break
+		}
+		runtime.Gosched()
+	}
+
+	if !ready {
+		atomic.StoreUint32(&slot.header.GuestState, GuestStateWaiting)
+		if atomic.LoadUint32(&slot.header.State) == SlotRespReady {
+			ready = true
+			atomic.StoreUint32(&slot.header.GuestState, GuestStateActive)
+		} else {
+			WaitForEvent(slot.respEvent, 2000) // 2s timeout
+			if atomic.LoadUint32(&slot.header.State) == SlotRespReady {
+				ready = true
+			}
+			atomic.StoreUint32(&slot.header.GuestState, GuestStateActive)
+		}
+	}
+
+	if !ready {
+		// Timeout - DO NOT free, Host might process late.
+		// Returning error will likely cause caller to retry or fail.
+		return nil, fmt.Errorf("timeout waiting for host")
+	}
+
+	// Read Response
+	respSize := slot.header.RespSize
+	var respData []byte
+
+	if respSize >= 0 {
+		if int(respSize) > len(slot.respBuffer) {
+			respSize = int32(len(slot.respBuffer))
+		}
+		respData = make([]byte, respSize)
+		copy(respData, slot.respBuffer[:respSize])
+	} else {
+		// End aligned support could be added here
+		respData = make([]byte, 0)
+	}
+
+	// Release Slot
+	atomic.StoreUint32(&slot.header.State, SlotFree)
+
+	return respData, nil
 }
 
 // workerLoop is the main loop for a single slot worker.

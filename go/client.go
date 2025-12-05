@@ -63,6 +63,11 @@ func (c *Client) Wait() {
 	c.guest.Wait()
 }
 
+// SendGuestCall sends a message to the Host (Guest Call).
+func (c *Client) SendGuestCall(data []byte, msgId uint32) ([]byte, error) {
+	return c.guest.SendGuestCall(data, msgId)
+}
+
 // Close releases all resources associated with the client.
 // It closes shared memory handles and event handles.
 func (c *Client) Close() {

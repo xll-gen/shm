@@ -27,6 +27,7 @@ class DirectHost {
     void* shmBase;
     std::string shmName;
     uint32_t numSlots;
+    uint32_t numGuestSlots;
     uint64_t totalShmSize;
     ShmHandle hMapFile;
     bool running;
@@ -271,9 +272,10 @@ public:
      * @param dataSize The total size of the data payload per slot (split between Req/Resp). Default 1MB.
      * @return true if initialization succeeded, false otherwise.
      */
-    bool Init(const std::string& shmName, uint32_t numQueues, uint32_t dataSize = 1024 * 1024) {
+    bool Init(const std::string& shmName, uint32_t numHostSlots, uint32_t dataSize = 1024 * 1024, uint32_t numGuestSlots = 0) {
         this->shmName = shmName;
-        this->numSlots = numQueues; // Interpret numQueues as numSlots (1:1 workers)
+        this->numSlots = numHostSlots; // Host -> Guest slots
+        this->numGuestSlots = numGuestSlots; // Guest -> Host slots
         this->slotSize = dataSize;
 
         // Split strategy: 50/50
@@ -297,7 +299,8 @@ public:
         // Should be 128
 
         size_t perSlotTotal = slotHeaderSize + slotSize;
-        size_t totalSize = exchangeHeaderSize + (perSlotTotal * numSlots);
+        size_t totalSlots = numSlots + numGuestSlots;
+        size_t totalSize = exchangeHeaderSize + (perSlotTotal * totalSlots);
         this->totalShmSize = totalSize;
 
         bool exists = false;
@@ -310,14 +313,15 @@ public:
         // Write ExchangeHeader
         ExchangeHeader* exHeader = (ExchangeHeader*)shmBase;
         exHeader->numSlots = numSlots;
+        exHeader->numGuestSlots = numGuestSlots;
         exHeader->slotSize = slotSize;
         exHeader->reqOffset = reqOffset;
         exHeader->respOffset = respOffset;
 
-        slots.resize(numSlots);
+        slots.resize(totalSlots);
         uint8_t* ptr = (uint8_t*)shmBase + exchangeHeaderSize;
 
-        for (uint32_t i = 0; i < numSlots; ++i) {
+        for (uint32_t i = 0; i < totalSlots; ++i) {
             slots[i].header = (SlotHeader*)ptr;
             uint8_t* dataBase = ptr + slotHeaderSize;
             slots[i].reqBuffer = dataBase + reqOffset;
@@ -559,6 +563,60 @@ public:
             memcpy(GetReqBuffer(idx), data, size);
         }
         return SendAcquired(idx, size, msgId, outResp);
+    }
+
+    /**
+     * @brief Processes any pending Guest Calls (Guest -> Host).
+     * This method is intended to be called in a loop by a background thread.
+     *
+     * @param handler A function to process the request.
+     *                Args: reqData, respBuffer, msgId.
+     *                Returns: respSize.
+     * @return int Number of requests processed.
+     */
+    int ProcessGuestCalls(std::function<int32_t(const uint8_t*, uint8_t*, uint32_t)> handler) {
+        if (!running) return 0;
+        int processed = 0;
+
+        for (uint32_t i = numSlots; i < numSlots + numGuestSlots; ++i) {
+            Slot* slot = &slots[i];
+
+            // Check for REQ_READY (Guest wrote request)
+            if (slot->header->state.load(std::memory_order_acquire) == SLOT_REQ_READY) {
+                // Read Request
+                int32_t reqSize = slot->header->reqSize;
+                const uint8_t* reqData = nullptr;
+                int32_t absReqSize = reqSize;
+
+                if (reqSize >= 0) {
+                     reqData = slot->reqBuffer;
+                } else {
+                     absReqSize = -reqSize;
+                     if ((uint32_t)absReqSize <= slot->maxReqSize) {
+                         uint32_t offset = slot->maxReqSize - absReqSize;
+                         reqData = slot->reqBuffer + offset;
+                     }
+                }
+
+                // Invoke Handler
+                int32_t respSize = 0;
+                if (handler) {
+                    respSize = handler(reqData, slot->respBuffer, slot->header->msgId);
+                }
+
+                // Write Response Metadata
+                slot->header->respSize = respSize;
+
+                // State Transition: REQ_READY -> RESP_READY
+                slot->header->state.store(SLOT_RESP_READY, std::memory_order_seq_cst);
+
+                // Signal Guest (Guest waits on RespEvent)
+                Platform::SignalEvent(slot->hRespEvent);
+
+                processed++;
+            }
+        }
+        return processed;
     }
 };
 
