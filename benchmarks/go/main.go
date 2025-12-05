@@ -16,8 +16,9 @@ import (
 
 var (
 	// workers defines the number of worker goroutines to spawn.
-    // In Direct Mode, this should match the number of Host slots.
-	workers = flag.Int("w", 1, "Number of workers")
+	// In Direct Mode, this should match the number of Host slots.
+	workers   = flag.Int("w", 1, "Number of workers")
+	guestCall = flag.Bool("guest-call", false, "Enable guest call scenario")
 )
 
 // main is the entry point for the Go Benchmark Guest.
@@ -27,6 +28,9 @@ func main() {
 	// runtime.GOMAXPROCS(*workers + 2) // +2 for runtime/gc
 
 	fmt.Printf("Starting Server with %d workers...\n", *workers)
+	if *guestCall {
+		fmt.Println("Guest Call scenario enabled.")
+	}
 
 	client, err := shm.Connect("SimpleIPC")
 	if err != nil {
@@ -37,6 +41,16 @@ func main() {
 
 	// Zero-copy Echo Handler
 	client.Handle(func(req []byte, respBuf []byte, msgId uint32) int32 {
+		if *guestCall {
+			// Trigger a Guest Call to the Host
+			callData := []byte("callback")
+			_, err := client.SendGuestCall(callData, shm.MsgIdGuestCall)
+			if err != nil {
+				// Log error but continue to reply to original request
+				//fmt.Printf("Guest call failed: %v\n", err)
+			}
+		}
+
 		// Simple Echo
 		n := copy(respBuf, req)
 		return int32(n)
