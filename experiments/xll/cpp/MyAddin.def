@@ -1,0 +1,7 @@
+LIBRARY   MyXLL_ZeroCopy
+EXPORTS
+    xlAutoOpen          PRIVATE
+    xlAutoClose         PRIVATE
+    xlAddInManagerInfo  PRIVATE
+    MYADD               PRIVATE
+    MYRAND              PRIVATE

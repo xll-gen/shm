@@ -1,0 +1,50 @@
+// rpc.fbs
+namespace MyIPC;
+
+table AddRequest {
+  x: double;
+  y: double;
+}
+
+table AddResponse {
+  result: double;
+}
+
+table RandRequest {
+  // No fields needed
+}
+
+table RandResponse {
+  result: double;
+}
+
+union RequestBody {
+  AddRequest,
+  RandRequest,
+}
+
+union ResponseBody {
+  AddResponse,
+  RandResponse,
+}
+
+table Request {
+  body: RequestBody;
+}
+
+table Response {
+  body: ResponseBody;
+}
+
+// A root table that can be either a request or a response.
+// This allows us to use the same schema for both directions.
+union Message {
+  Request,
+  Response,
+}
+
+table Root {
+  message: Message;
+}
+
+root_type Root;

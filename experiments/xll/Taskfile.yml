@@ -1,0 +1,70 @@
+version: '3'
+
+vars:
+  GO_SRC: ./go
+  CPP_SRC: ./cpp
+  BUILD_DIR: ./build
+  FBS_FILE: ./rpc.fbs
+
+tasks:
+  default:
+    desc: "Builds all components: FlatBuffers, Go server, and C++ XLL."
+    cmds:
+      - task: flatc
+      - task: build:go
+      - task: build:cpp
+
+  flatc:
+    desc: "Generates C++ and Go code from the FlatBuffers schema."
+    cmds:
+      - flatc --cpp -o {{.CPP_SRC}}/generated {{.FBS_FILE}}
+      - flatc --go -o {{.GO_SRC}}/generated {{.FBS_FILE}}
+    sources:
+      - "{{.FBS_FILE}}"
+    generates:
+      - "{{.CPP_SRC}}/generated/rpc_generated.h"
+      - "{{.GO_SRC}}/generated/MyIPC/Root.go"
+
+  build:go:
+    desc: "Builds the Go server executable."
+    dir: "{{.GO_SRC}}"
+    cmds:
+      - go build -o ../build/go-server.exe .
+    sources:
+      - "**/*.go"
+      - "../rpc.fbs"
+    generates:
+      - "{{.BUILD_DIR}}/go-server.exe"
+
+  build:cpp:
+    desc: "Builds the C++ XLL add-in."
+    dir: "{{.CPP_SRC}}"
+    cmds:
+      - |
+        if [ ! -d "build" ]; then
+          mkdir build
+        fi
+      - cd build && cmake ..
+      - cd build && cmake --build . --config Release
+    sources:
+      - "**/*.cpp"
+      - "**/*.h"
+      - "CMakeLists.txt"
+      - "../rpc.fbs"
+    generates:
+      - "{{.BUILD_DIR}}/MyXLL_ZeroCopy.xll"
+
+  clean:
+    desc: "Removes build artifacts."
+    cmds:
+      - rm -rf {{.BUILD_DIR}}
+      - rm -rf {{.CPP_SRC}}/build
+      - rm -rf {{.CPP_SRC}}/generated
+      - rm -rf {{.GO_SRC}}/generated
+
+  run:
+    desc: "Builds and runs the Go server for testing."
+    deps: [build:go]
+    dir: "{{.BUILD_DIR}}"
+    cmds:
+      - ./go-server.exe

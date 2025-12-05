@@ -66,3 +66,8 @@ tasks:
         platforms: [linux]
       - cmd: taskkill /F /IM server.exe || true
         platforms: [windows]
+
+  xll:default:
+    desc: "Builds all components for the XLL experiment."
+    cmds:
+      - task -f ./experiments/xll/Taskfile.yml default
