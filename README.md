@@ -173,6 +173,15 @@ resp, err := client.SendGuestCall([]byte("AsyncData"), shm.MsgIdGuestCall)
 
 ### Build Steps
 
+The project uses `Taskfile` for automation (requires [Task](https://taskfile.dev/)).
+
+```bash
+# Run all benchmarks (Builds C++ and Go, runs tests)
+task run:benchmark
+```
+
+If you need to build manually:
+
 ```bash
 # Build C++ Benchmarks
 mkdir build && cd build
