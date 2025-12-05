@@ -9,10 +9,10 @@
 #include <sstream>
 
 #include "external/EXCELSDK/include/XLCALL.H"
-#include "generated/rpc_generated.h"
+#include "generated/rpc_generated.h" 
 #include "logger.h"
 #include "PascalString.h"
-#include "shm/DirectHost.h"
+#include "shm/DirectHost.h" 
 
 #pragma comment(lib, "user32.lib")
 
@@ -48,7 +48,7 @@ extern "C" __declspec(dllexport) int WINAPI xlAutoOpen(void) {
             TempStr12(L"B$"), TempStr12(L"MYRAND"), TempStr12(L"    "),
             TempStr12(L"1"), TempStr12(L"MyCategory"),
             TempStr12(L"Returns a random number from Go server"));
-
+    
     Excel12(xlFree, 0, 1, &xDll);
 
     g_directHost = new DirectHost();
@@ -120,9 +120,9 @@ LPXLOPER12 WINAPI MYADD(double num1, double num2) {
         }
 
         flatbuffers::FlatBufferBuilder builder(0, slot.GetReqBuffer(), slot.GetMaxReqSize());
-
+        
         auto addReq = MyIPC::CreateAddRequest(builder, num1, num2);
-
+        
         MyIPC::RequestBuilder req_builder(builder);
         req_builder.add_body_type(MyIPC::RequestBody_AddRequest);
         req_builder.add_body(addReq.Union());
@@ -182,9 +182,9 @@ LPXLOPER12 WINAPI MYRAND(void) {
         auto root_offset = root_builder.Finish();
 
         builder.Finish(root_offset);
-
+        
         slot.SendFlatBuffer(builder.GetSize());
-
+        
         const auto* respRoot = flatbuffers::GetRoot<MyIPC::Root>(slot.GetRespBuffer());
         if (respRoot && respRoot->message_type() == MyIPC::Message_Response) {
             const auto* response = respRoot->message_as_Response();
@@ -219,7 +219,7 @@ static bool LaunchGoServer() {
     std::wstring serverPath = dirPath + L"\\go-server.exe";
 
     STARTUPINFOW si = { sizeof(si) };
-
+    
     std::wstring cmdLine = L"\"" + serverPath + L"\" " + std::to_wstring(GetCurrentProcessId()) + L" " + std::to_wstring(std::thread::hardware_concurrency());
 
     LOG(L"Launching Go server with cmd: " + cmdLine);
@@ -228,7 +228,7 @@ static bool LaunchGoServer() {
         LOG(L"CreateProcessW for Go server failed. Error: " + std::to_wstring(GetLastError()));
         return false;
     }
-
+    
     CloseHandle(g_goServerProcess.hThread);
     LOG(L"Go server launched. PID: " + std::to_wstring(g_goServerProcess.dwProcessId));
     return true;

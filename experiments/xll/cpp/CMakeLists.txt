@@ -26,8 +26,8 @@ set(SOURCES
 add_library(MyXLL_ZeroCopy SHARED ${SOURCES})
 
 # Set the output file name and extension to .xll
-set_target_properties(MyXLL_ZeroCopy PROPERTIES
-    PREFIX ""
+set_target_properties(MyXLL_ZeroCopy PROPERTIES 
+    PREFIX "" 
     SUFFIX ".xll"
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../build"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../build"

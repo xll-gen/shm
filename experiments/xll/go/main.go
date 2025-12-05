@@ -27,11 +27,11 @@ const (
 	slOT_BUSY        = 4 // C++ client locks it
 	slOT_REQ_READY   = 1
 	slOT_RESP_READY  = 2
-
+	
 	// GuestState
 	gUEST_STATE_ACTIVE  = 0
 	gUEST_STATE_WAITING = 1
-
+	
 	// HostState
 	hOST_STATE_ACTIVE = 0
 	hOST_STATE_WAITING = 1
@@ -52,12 +52,12 @@ type ExchangeHeader struct {
 
 type SlotHeader struct {
 	PrePad      [64]byte
-	State       uint32
+	State       uint32 
 	ReqSize     int32
 	RespSize    int32
 	MsgId       uint32
-	HostState   uint32
-	GuestState  uint32
+	HostState   uint32 
+	GuestState  uint32 
 	Padding     [40]byte
 }
 
@@ -106,9 +106,9 @@ func main() {
 	addr, err = syscall.MapViewOfFile(syscall.Handle(hMap), syscall.FILE_MAP_ALL_ACCESS, 0, 0, totalShmSize)
 	if addr == 0 { log.Fatalf("MapViewOfFile for full SHM failed: %v", err) }
 	defer syscall.UnmapViewOfFile(addr)
-
+	
 	log.Printf("SHM Mapped. Total size: %d, NumSlots: %d, SlotSize: %d", totalShmSize, exHeader.NumSlots, exHeader.SlotSize)
-
+	
 	slotBasePtr := uintptr(addr) + unsafe.Sizeof(ExchangeHeader{})
 	for i := 0; i < int(exHeader.NumSlots); i++ {
 		slotPtr := slotBasePtr + uintptr(i)*slotTotalSize
@@ -116,7 +116,7 @@ func main() {
 	}
 
 	log.Println("All workers started.")
-
+	
 	// Monitor parent process
 	if len(os.Args) > 1 {
 		if pid64, err := strconv.ParseUint(os.Args[1], 10, 32); err == nil {
@@ -173,7 +173,7 @@ func worker(slotPtr uintptr, id int, exHeader *ExchangeHeader) {
 			absSize := -reqSize
 			offset := len(reqBuf) - int(absSize)
 			reqData := reqBuf[offset:]
-
+			
 			root := MyIPC.GetRootAsRoot(reqData, 0)
 			req := new(MyIPC.Request)
 			req.Init(root.Message(req).Table().Bytes, root.Message(req).Table().Pos)

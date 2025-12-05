@@ -6,7 +6,7 @@
 **  Description:    Code file for Excel callbacks
 **  Platform:       Microsoft Windows
 **
-**  This file defines the entry points
+**  This file defines the entry points 
 **  which are used in the Microsoft Excel C API.
 **
 */
@@ -59,7 +59,7 @@ __forceinline void FetchExcel12EntryPt(void)
 */
 #ifdef __cplusplus
 extern "C"
-#endif
+#endif	
 __declspec(dllexport)
 void pascal SetExcel12EntryPt(EXCEL12PROC pexcel12New)
 {
@@ -98,7 +98,7 @@ int _cdecl Excel12(int xlfn, LPXLOPER12 operRes, int count, ...)
 		}
 	}
 	return(mdRet);
-
+	
 }
 
 int pascal Excel12v(int xlfn, LPXLOPER12 operRes, int count, LPXLOPER12 opers[])
