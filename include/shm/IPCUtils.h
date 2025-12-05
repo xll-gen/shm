@@ -32,6 +32,11 @@
  */
 #define MSG_ID_FLATBUFFER 10
 
+/**
+ * @brief Message ID for Guest Call (Guest -> Host).
+ */
+#define MSG_ID_GUEST_CALL 11
+
 // Host/Guest Sleeping States
 
 /**
@@ -140,8 +145,10 @@ enum SlotState {
  * to map the memory correctly.
  */
 struct ExchangeHeader {
-    /** @brief Number of slots in the pool. */
+    /** @brief Number of slots in the pool (Host -> Guest). */
     uint32_t numSlots;
+    /** @brief Number of Guest Call slots (Guest -> Host). */
+    uint32_t numGuestSlots;
     /** @brief Total size of each slot in bytes. */
     uint32_t slotSize;
     /** @brief Offset of the Request buffer within a slot. */
@@ -149,7 +156,7 @@ struct ExchangeHeader {
     /** @brief Offset of the Response buffer within a slot. */
     uint32_t respOffset;
     /** @brief Padding to align to 64 bytes. */
-    uint8_t padding[48];
+    uint8_t padding[44];
 };
 
 }

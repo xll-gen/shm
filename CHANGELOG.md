@@ -1,5 +1,13 @@
 # Changelog
 
+## [v0.2.0] - 2025-12-05
+
+### Features
+- **Guest Call**: Allows Go Guest to initiate calls to C++ Host (Async/Callback pattern).
+- **Protocol Update**: Added `NumGuestSlots` to `ExchangeHeader` and `MSG_ID_GUEST_CALL`.
+- **Zero-Copy Support for Guest Calls**: Guest can send FlatBuffers end-aligned.
+- **Listener API**: `DirectHost::ProcessGuestCalls` for polling Guest requests.
+
 ## [v0.1.0] - 2025-12-05
 
 First stable release of the Shared Memory IPC library.
