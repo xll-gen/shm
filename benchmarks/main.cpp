@@ -104,7 +104,7 @@ int main(int argc, char* argv[]) {
     if (enableGuestCall) {
         guestCallThread = std::thread([&](){
             while(!stopGuestCall) {
-                host.ProcessGuestCalls([](const uint8_t* req, uint8_t* resp, uint32_t msgId) -> int32_t {
+                host.ProcessGuestCalls([](const uint8_t* req, int32_t reqSize, uint8_t* resp, uint32_t msgId) -> int32_t {
                     // Simple ACK/Echo for guest call
                     // We assume small payload
                     const char* ack = "OK";
