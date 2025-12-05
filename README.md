@@ -10,6 +10,26 @@ SimpleIPC is a high-performance, low-latency shared-memory IPC library connectin
 *   **Cross-Platform**: Supports Linux (shm_open/sem_open) and Windows (CreateFileMapping/CreateEvent).
 *   **Protocol Agnostic**: Transmits raw bytes with a minimal 8-byte Transport Header for request matching.
 
+## Performance Highlights
+
+The project's "Direct Exchange" IPC mode significantly outperforms traditional methods, showcasing sub-microsecond latency and high throughput. This is achieved through a 1:1 thread-to-slot mapping, zero-copy operations, and adaptive hybrid waiting.
+
+On an AMD Ryzen 9 3900x system (Bare-metal), the benchmark demonstrated:
+*   **1 Thread**:
+    *   **Throughput**: 1,736,783.51 ops/s
+    *   **Avg Latency (RTT)**: 0.575 us
+*   **4 Threads**:
+    *   **Throughput**: 1,931,987.29 ops/s
+    *   **Avg Latency (RTT)**: 0.517 us
+*   **8 Threads**:
+    *   **Throughput**: 1,323,987.09 ops/s
+    *   **Avg Latency (RTT)**: 0.755 us
+*   **12 Threads**:
+    *   **Throughput**: 1,325,149.50 ops/s
+    *   **Avg Latency (RTT)**: 0.754 us
+
+For detailed benchmark results and methodology, including Sandbox (Containerized) results, please refer to [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md).
+
 ## Architecture
 
 The library operates in **Direct Mode**, where a fixed pool of "Slots" is allocated in shared memory.
