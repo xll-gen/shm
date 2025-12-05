@@ -16,8 +16,8 @@ The benchmark evaluates the "System Effective OPS" (Total successful operations 
 *   **Avg Latency (RTT)**: 0.59 us
 
 ### 4 Threads
-*   **Throughput**: 2,149,286 ops/s
-*   **Avg Latency (RTT)**: 1.86 us
+*   **Throughput**: 2,781,209 ops/s
+*   **Avg Latency (RTT)**: 1.44 us
 
 ### 8 Threads
 *   **Throughput**: 1,824,485 ops/s
