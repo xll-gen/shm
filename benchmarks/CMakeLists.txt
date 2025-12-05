@@ -13,7 +13,6 @@ endif()
 
 # Include directories
 include_directories(${CMAKE_SOURCE_DIR}/../include) # shm/include
-include_directories(${CMAKE_SOURCE_DIR}/../src)     # shm/src
 include_directories(${CMAKE_SOURCE_DIR}/include)    # benchmarks/include (generated headers)
 include_directories(${CMAKE_SOURCE_DIR}/external)
 

@@ -62,7 +62,7 @@ If a peer is not responsive (spinning times out), the other peer will wait on a 
 ### C++ Host
 
 ```cpp
-#include "DirectHost.h"
+#include <shm/DirectHost.h>
 
 shm::DirectHost host;
 if (!host.Init("MyIPC", 4)) { // 4 Worker Slots
