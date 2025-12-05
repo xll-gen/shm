@@ -20,7 +20,7 @@ using namespace shm;
  * @param iterations Number of operations to perform.
  * @param[out] outOps Pointer to store the calculated OPS (Operations Per Second) for this worker.
  */
-void worker(DirectHost* host, int id, int iterations, long long* outOps) {
+void worker(DirectHost* host, int id, int iterations, long long* outOps, bool verbose) {
     std::vector<uint8_t> req(64); // Small payload
     std::vector<uint8_t> resp;
     // Fill req
@@ -28,6 +28,9 @@ void worker(DirectHost* host, int id, int iterations, long long* outOps) {
 
     auto start = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < iterations; ++i) {
+        if (verbose && (i % 100 == 0)) {
+            std::cout << "[Thread " << id << "] Op " << i << std::endl;
+        }
         // Send To Slot Explicitly (1:1 Affinity)
         int read = host->SendToSlot(id, req.data(), (int32_t)req.size(), MSG_ID_NORMAL, resp);
         if (read < 0) {
@@ -60,16 +63,23 @@ void worker(DirectHost* host, int id, int iterations, long long* outOps) {
  */
 int main(int argc, char* argv[]) {
     int numThreads = 1;
+    bool verbose = false;
+
     if (argc > 1) {
-        // Parse -t
+        // Parse args
         for(int i=1; i<argc; i++) {
             if (std::string(argv[i]) == "-t" && i+1 < argc) {
                 numThreads = std::atoi(argv[i+1]);
+            } else if (std::string(argv[i]) == "-v") {
+                verbose = true;
             }
         }
     }
 
     std::cout << "Starting Benchmark with " << numThreads << " threads..." << std::endl;
+    if (verbose) {
+        std::cout << "Verbose mode enabled (logging every 100 ops)" << std::endl;
+    }
 
     DirectHost host;
     // Align slots with threads for 1:1
@@ -97,7 +107,7 @@ int main(int argc, char* argv[]) {
     auto startTotal = std::chrono::high_resolution_clock::now();
 
     for(int i=0; i<numThreads; ++i) {
-        threads.emplace_back(worker, &host, i, iterations, &threadOps[i]);
+        threads.emplace_back(worker, &host, i, iterations, &threadOps[i], verbose);
     }
 
     long long totalOpsSum = 0;

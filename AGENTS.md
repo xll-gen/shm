@@ -59,7 +59,15 @@ The memory layout is manually synchronized between C++ and Go. **Any mismatch wi
 
 ---
 
-## 3. Development Guidelines
+## 3. Benchmark Guidelines
+
+To ensure consistent and debuggable results:
+
+1.  **Strict Timeout:** All benchmarks must have a strict 60-second timeout. The typical run time is ~1 second. If it takes longer, it is considered a hang/failure.
+2.  **Debug Logging:** The benchmark tool must support an optional verbose mode (e.g., `-v`) that logs progress every 100 operations. This allows identifying the exact point of failure during a hang.
+    *   *Note:* Do not enable this during performance measurement runs as it degrades throughput.
+
+## 4. Development Guidelines
 
 ### 3.1. Code Modifications
 -   **Cross-Language Changes:** If you change a header in `include/`, you **MUST** change the corresponding struct in `go/`.
@@ -80,7 +88,7 @@ task run:benchmark
 
 If the benchmark hangs or produces "ID Mismatch" errors, you have broken the memory layout or synchronization logic.
 
-## 4. Common Pitfalls
+## 5. Common Pitfalls
 
 1.  **Padding drift:** Adding a field to structs without adjusting padding.
 2.  **Zombie Semaphores (Linux):** If the benchmark crashes, shared memory files (`/dev/shm/*`) may remain. Use `rm /dev/shm/SimpleIPC*` to clean up.
