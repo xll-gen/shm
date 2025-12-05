@@ -56,6 +56,7 @@ void worker(DirectHost* host, int id, int iterations, long long* outOps, bool ve
  *
  * Arguments:
  *   -t <num>: Number of threads (default 1).
+ *   --guest-call: Enable Guest Call scenario (Host triggers Guest, Guest triggers Host).
  *
  * @param argc Argument count.
  * @param argv Argument vector.
@@ -64,6 +65,7 @@ void worker(DirectHost* host, int id, int iterations, long long* outOps, bool ve
 int main(int argc, char* argv[]) {
     int numThreads = 1;
     bool verbose = false;
+    bool enableGuestCall = false;
 
     if (argc > 1) {
         // Parse args
@@ -72,20 +74,46 @@ int main(int argc, char* argv[]) {
                 numThreads = std::atoi(argv[i+1]);
             } else if (std::string(argv[i]) == "-v") {
                 verbose = true;
+            } else if (std::string(argv[i]) == "--guest-call") {
+                enableGuestCall = true;
             }
         }
     }
 
     std::cout << "Starting Benchmark with " << numThreads << " threads..." << std::endl;
+    if (enableGuestCall) {
+        std::cout << "Guest Call scenario enabled." << std::endl;
+    }
     if (verbose) {
         std::cout << "Verbose mode enabled (logging every 100 ops)" << std::endl;
     }
 
     DirectHost host;
     // Align slots with threads for 1:1
-    if (!host.Init("SimpleIPC", numThreads, 4096)) {
+    // If Guest Call enabled, we allocate guest slots equal to host slots (threads)
+    uint32_t numGuestSlots = enableGuestCall ? numThreads : 0;
+
+    if (!host.Init("SimpleIPC", numThreads, 4096, numGuestSlots)) {
         std::cerr << "Failed to init host" << std::endl;
         return 1;
+    }
+
+    // Background thread for processing Guest Calls
+    std::atomic<bool> stopGuestCall{false};
+    std::thread guestCallThread;
+    if (enableGuestCall) {
+        guestCallThread = std::thread([&](){
+            while(!stopGuestCall) {
+                host.ProcessGuestCalls([](const uint8_t* req, uint8_t* resp, uint32_t msgId) -> int32_t {
+                    // Simple ACK/Echo for guest call
+                    // We assume small payload
+                    const char* ack = "OK";
+                    memcpy(resp, ack, 2);
+                    return 2;
+                });
+                Platform::CpuRelax();
+            }
+        });
     }
 
     // Warmup / Wait for guest
@@ -95,6 +123,8 @@ int main(int argc, char* argv[]) {
     // Try to send one message to verify connection
     if (host.Send(&data, 1, MSG_ID_NORMAL, resp) < 0) {
          std::cerr << "Warmup failed (Guest not ready?)" << std::endl;
+         stopGuestCall = true;
+         if (guestCallThread.joinable()) guestCallThread.join();
          return 1;
     }
 
@@ -119,6 +149,10 @@ int main(int argc, char* argv[]) {
     auto endTotal = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> totalTime = endTotal - startTotal;
 
+    // Stop guest call thread
+    stopGuestCall = true;
+    if (guestCallThread.joinable()) guestCallThread.join();
+
     // System Effective OPS = Total Operations / Total Time
     long long totalOperations = (long long)iterations * numThreads;
     double systemOps = totalOperations / totalTime.count();
@@ -126,6 +160,7 @@ int main(int argc, char* argv[]) {
     std::cout << "Done. Total Time: " << totalTime.count() << "s" << std::endl;
     std::cout << "System Effective OPS: " << std::fixed << std::setprecision(2) << systemOps << std::endl;
 
+    host.SendShutdown();
     host.Shutdown();
     return 0;
 }
