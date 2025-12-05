@@ -594,7 +594,7 @@ public:
      *                Returns: respSize.
      * @return int Number of requests processed.
      */
-    int ProcessGuestCalls(std::function<int32_t(const uint8_t*, uint8_t*, uint32_t)> handler) {
+    int ProcessGuestCalls(std::function<int32_t(const uint8_t*, int32_t, uint8_t*, uint32_t)> handler) {
         if (!running) return 0;
         int processed = 0;
 
@@ -606,22 +606,30 @@ public:
                 // Read Request
                 int32_t reqSize = slot->header->reqSize;
                 const uint8_t* reqData = nullptr;
-                int32_t absReqSize = reqSize;
+                int32_t absReqSize = reqSize < 0 ? -reqSize : reqSize;
+
+                // Validate Size
+                if ((uint32_t)absReqSize > slot->maxReqSize) {
+                    // Invalid size. Clear slot and signal empty response to prevent crash.
+                    slot->header->respSize = 0;
+                    slot->header->state.store(SLOT_RESP_READY, std::memory_order_seq_cst);
+                    Platform::SignalEvent(slot->hRespEvent);
+                    processed++;
+                    continue;
+                }
 
                 if (reqSize >= 0) {
                      reqData = slot->reqBuffer;
                 } else {
-                     absReqSize = -reqSize;
-                     if ((uint32_t)absReqSize <= slot->maxReqSize) {
-                         uint32_t offset = slot->maxReqSize - absReqSize;
-                         reqData = slot->reqBuffer + offset;
-                     }
+                     // End-aligned (Zero-Copy Guest)
+                     uint32_t offset = slot->maxReqSize - absReqSize;
+                     reqData = slot->reqBuffer + offset;
                 }
 
                 // Invoke Handler
                 int32_t respSize = 0;
                 if (handler) {
-                    respSize = handler(reqData, slot->respBuffer, slot->header->msgId);
+                    respSize = handler(reqData, absReqSize, slot->respBuffer, slot->header->msgId);
                 }
 
                 // Write Response Metadata

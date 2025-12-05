@@ -20,10 +20,14 @@ int main() {
     bool received = false;
     int timeout = 0;
     while (!received && timeout < 1000) { // 10s roughly
-        int processed = host.ProcessGuestCalls([&](const uint8_t* req, uint8_t* resp, uint32_t msgId) -> int32_t {
-            std::cout << "Received Guest Call! ID: " << msgId << std::endl;
-            std::string s((const char*)req, 4);
-            std::cout << "Data: " << s << std::endl;
+        int processed = host.ProcessGuestCalls([&](const uint8_t* req, int32_t reqSize, uint8_t* resp, uint32_t msgId) -> int32_t {
+            std::cout << "Received Guest Call! ID: " << msgId << " Size: " << reqSize << std::endl;
+            if (reqSize >= 4) {
+                std::string s((const char*)req, 4);
+                std::cout << "Data: " << s << std::endl;
+            } else {
+                std::cout << "Data too small" << std::endl;
+            }
 
             // Write response
             std::string reply = "ACK";
