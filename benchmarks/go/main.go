@@ -36,7 +36,7 @@ func main() {
 	defer client.Close()
 
 	// Zero-copy Echo Handler
-	client.Handle(func(req []byte, respBuf []byte) int32 {
+	client.Handle(func(req []byte, respBuf []byte, msgId uint32) int32 {
 		// Simple Echo
 		n := copy(respBuf, req)
 		return int32(n)

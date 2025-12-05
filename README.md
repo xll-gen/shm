@@ -87,10 +87,17 @@ import "github.com/xll-gen/shm/go"
 func main() {
     client, _ := shm.Connect("MyIPC")
 
-    client.Handle(func(req []byte, respBuf []byte) uint32 {
+    // Handler now receives msgId
+    client.Handle(func(req []byte, respBuf []byte, msgId uint32) int32 {
+        if msgId == shm.MsgIdFlatbuffer {
+            // "req" automatically points to the FlatBuffer data
+            // (even if it was sent with negative size alignment)
+            // processFlatBuffer(req)
+        }
+
         // Process req, write to respBuf
         // Return number of bytes written
-        return uint32(copy(respBuf, req)) // Echo
+        return int32(copy(respBuf, req)) // Echo
     })
 
     client.Start()
