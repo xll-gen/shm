@@ -584,60 +584,6 @@ public:
         return SendAcquired(idx, size, msgId, outResp);
     }
 
-    /**
-     * @brief Sends a shutdown signal to all worker slots.
-     * This signals the Guest workers to exit their loops.
-     * It attempts to acquire each slot and send MSG_ID_SHUTDOWN.
-     * It does NOT wait for a response.
-     */
-    void SendShutdown() {
-        if (!running) return;
-
-        // Iterate only Host slots (Guest slots are for Guest->Host calls)
-        for (uint32_t i = 0; i < numSlots; ++i) {
-             Slot* slot = &slots[i];
-
-             // Try to acquire slot to ensure we don't clobber active transaction
-             // But since we are shutting down, we can be aggressive or just wait a bit.
-             // We use a simplified acquire loop here.
-             int retries = 0;
-             bool acquired = false;
-             while(retries < 1000) {
-                 uint32_t expected = SLOT_FREE;
-                 if (slot->header->state.compare_exchange_strong(expected, SLOT_BUSY, std::memory_order_acquire)) {
-                     acquired = true;
-                     break;
-                 }
-                 Platform::CpuRelax();
-                 retries++;
-             }
-
-             if (!acquired) {
-                 // Force acquire if timeout?
-                 // If slot is stuck in REQ_READY or RESP_READY, Guest might be stuck.
-                 // We force state to BUSY to write Shutdown.
-                 slot->header->state.store(SLOT_BUSY, std::memory_order_seq_cst);
-             }
-
-             // Write Shutdown Message
-             slot->header->msgId = MSG_ID_SHUTDOWN;
-             slot->header->reqSize = 0;
-
-             // Reset Host State
-             slot->header->hostState.store(HOST_STATE_ACTIVE, std::memory_order_relaxed);
-
-             // Signal Ready
-             slot->header->state.store(SLOT_REQ_READY, std::memory_order_seq_cst);
-
-             // Wake Guest
-             if (slot->header->guestState.load(std::memory_order_seq_cst) == GUEST_STATE_WAITING) {
-                 Platform::SignalEvent(slot->hReqEvent);
-             }
-
-             // Do NOT wait for response. Guest will exit.
-             // We leave the slot in REQ_READY state.
-        }
-    }
 
     /**
      * @brief Processes any pending Guest Calls (Guest -> Host).
