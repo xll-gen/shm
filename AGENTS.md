@@ -66,6 +66,14 @@ To ensure consistent and debuggable results:
 2.  **Debug Logging:** The benchmark tool must support an optional verbose mode (e.g., `-v`) that logs progress every 100 operations. This allows identifying the exact point of failure during a hang.
     *   *Note:* Do not enable this during performance measurement runs as it degrades throughput.
 
+## 4. Development Guidelines
+
+To ensure consistent and debuggable results:
+
+1.  **Strict Timeout:** All benchmarks must have a strict 60-second timeout. The typical run time is ~1 second. If it takes longer, it is considered a hang/failure.
+2.  **Debug Logging:** The benchmark tool must support an optional verbose mode (e.g., `-v`) that logs progress every 100 operations. This allows identifying the exact point of failure during a hang.
+    *   *Note:* Do not enable this during performance measurement runs as it degrades throughput.
+
 ---
 
 ## 4. Development Guidelines
