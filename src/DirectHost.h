@@ -51,7 +51,205 @@ class DirectHost {
     // Config
     uint32_t slotSize; // Total payload size per slot
 
+    /**
+     * @brief Internal helper to wait for a response on a specific slot.
+     * Contains the adaptive spin/yield/wait logic.
+     * @param slot Pointer to the slot to wait on.
+     * @return true if response is ready, false if error/timeout.
+     */
+    bool WaitResponse(Slot* slot) {
+        // Reset Host State
+        slot->header->hostState.store(HOST_STATE_ACTIVE, std::memory_order_relaxed);
+
+        // Signal Ready
+        slot->header->state.store(SLOT_REQ_READY, std::memory_order_seq_cst);
+
+        // Wake Guest if waiting
+        if (slot->header->guestState.load(std::memory_order_seq_cst) == GUEST_STATE_WAITING) {
+            Platform::SignalEvent(slot->hReqEvent);
+        }
+
+        // Adaptive Wait for Response
+        bool ready = false;
+        int currentLimit = slot->spinLimit;
+        const int MIN_SPIN = 100;
+        const int MAX_SPIN = 20000;
+
+        for (int i = 0; i < currentLimit; ++i) {
+            if (slot->header->state.load(std::memory_order_acquire) == SLOT_RESP_READY) {
+                ready = true;
+                break;
+            }
+            Platform::CpuRelax();
+        }
+
+        if (ready) {
+            if (currentLimit < MAX_SPIN) currentLimit += 100;
+        } else {
+            if (currentLimit > MIN_SPIN) currentLimit -= 500;
+            if (currentLimit < MIN_SPIN) currentLimit = MIN_SPIN;
+
+            slot->header->hostState.store(HOST_STATE_WAITING, std::memory_order_seq_cst);
+
+            if (slot->header->state.load(std::memory_order_acquire) == SLOT_RESP_READY) {
+                ready = true;
+                slot->header->hostState.store(HOST_STATE_ACTIVE, std::memory_order_relaxed);
+            } else {
+                 while (slot->header->state.load(std::memory_order_acquire) != SLOT_RESP_READY) {
+                    Platform::WaitEvent(slot->hRespEvent, 100);
+                 }
+                 ready = true;
+                 slot->header->hostState.store(HOST_STATE_ACTIVE, std::memory_order_relaxed);
+            }
+        }
+        slot->spinLimit = currentLimit;
+        return ready;
+    }
+
 public:
+    /**
+     * @brief Helper class for managing a Zero-Copy slot.
+     *
+     * This class acts as a smart wrapper around a slot index. It allows:
+     * 1. Direct access to the request buffer (for building FlatBuffers).
+     * 2. Sending messages without manually managing the slot index.
+     * 3. Automatic release of the slot when the object goes out of scope (RAII).
+     * 4. Zero-copy access to the response buffer.
+     */
+    class ZeroCopySlot {
+        DirectHost* host;
+        int32_t slotIdx;
+
+    public:
+        /**
+         * @brief Constructs a ZeroCopySlot.
+         * @param h Pointer to the DirectHost.
+         * @param idx The index of the acquired slot.
+         */
+        ZeroCopySlot(DirectHost* h, int32_t idx) : host(h), slotIdx(idx) {}
+
+        /**
+         * @brief Destructor. Releases the slot if not already moved.
+         */
+        ~ZeroCopySlot() {
+            if (host && slotIdx >= 0) {
+                // Ensure slot is released if user didn't call Send?
+                // Actually, Send does NOT release the slot in this design (user reads response after Send).
+                // So Destructor MUST release the slot.
+                host->slots[slotIdx].header->state.store(SLOT_FREE, std::memory_order_release);
+            }
+        }
+
+        // Move-only semantics
+        ZeroCopySlot(ZeroCopySlot&& other) noexcept : host(other.host), slotIdx(other.slotIdx) {
+            other.host = nullptr;
+            other.slotIdx = -1;
+        }
+
+        ZeroCopySlot& operator=(ZeroCopySlot&& other) noexcept {
+             if (this != &other) {
+                 // Release current if valid
+                 if (host && slotIdx >= 0) {
+                     host->slots[slotIdx].header->state.store(SLOT_FREE, std::memory_order_release);
+                 }
+                 host = other.host;
+                 slotIdx = other.slotIdx;
+                 other.host = nullptr;
+                 other.slotIdx = -1;
+             }
+             return *this;
+        }
+
+        // Disable copying
+        ZeroCopySlot(const ZeroCopySlot&) = delete;
+        ZeroCopySlot& operator=(const ZeroCopySlot&) = delete;
+
+        /**
+         * @brief Checks if the slot is valid.
+         * @return true if valid, false otherwise.
+         */
+        bool IsValid() const { return host && slotIdx >= 0; }
+
+        /**
+         * @brief Gets the pointer to the Request Buffer.
+         * Use this to write your data (e.g. build a FlatBuffer).
+         * @return Pointer to the buffer.
+         */
+        uint8_t* GetReqBuffer() {
+            if (!IsValid()) return nullptr;
+            return host->slots[slotIdx].reqBuffer;
+        }
+
+        /**
+         * @brief Gets the maximum size of the Request Buffer.
+         * @return Size in bytes.
+         */
+        int32_t GetMaxReqSize() {
+             if (!IsValid()) return 0;
+             return host->slots[slotIdx].maxReqSize;
+        }
+
+        /**
+         * @brief Sends the FlatBuffer request.
+         *
+         * This method:
+         * 1. Sets the message ID to MSG_ID_FLATBUFFER.
+         * 2. Sets the request size to negative (indicating end-aligned Zero-Copy).
+         * 3. Signals the Guest and waits for completion.
+         *
+         * @param size The size of the FlatBuffer data (positive integer).
+         *             The method automatically negates it for the protocol.
+         */
+        void SendFlatBuffer(int32_t size) {
+            if (!IsValid()) return;
+
+            Slot* slot = &host->slots[slotIdx];
+
+            // Bounds check
+            int32_t absSize = size;
+            if ((uint32_t)absSize > slot->maxReqSize) {
+                absSize = (int32_t)slot->maxReqSize;
+            }
+
+            // Zero-Copy convention: Negative size
+            slot->header->reqSize = -absSize;
+            slot->header->msgId = MSG_ID_FLATBUFFER;
+
+            host->WaitResponse(slot);
+            // Do NOT release slot here. User might want to read response.
+        }
+
+        /**
+         * @brief Gets the pointer to the Response Buffer.
+         * Call this AFTER SendFlatBuffer() returns.
+         *
+         * @return Pointer to the response data.
+         */
+        uint8_t* GetRespBuffer() {
+             if (!IsValid()) return nullptr;
+             Slot* slot = &host->slots[slotIdx];
+             int32_t rSize = slot->header->respSize;
+
+             // If positive, start-aligned. If negative, end-aligned.
+             if (rSize >= 0) return slot->respBuffer;
+
+             // End-aligned: Calculate offset
+             uint32_t absRSize = (uint32_t)(-rSize);
+             uint32_t offset = slot->maxRespSize - absRSize;
+             return slot->respBuffer + offset;
+        }
+
+        /**
+         * @brief Gets the size of the Response data.
+         * @return Size in bytes.
+         */
+        int32_t GetRespSize() {
+             if (!IsValid()) return 0;
+             int32_t rSize = host->slots[slotIdx].header->respSize;
+             return rSize < 0 ? -rSize : rSize;
+        }
+    };
+
     /**
      * @brief Default constructor.
      */
@@ -211,6 +409,17 @@ public:
     }
 
     /**
+     * @brief Acquires a ZeroCopySlot wrapper.
+     * Use this for convenient Zero-Copy FlatBuffer operations.
+     *
+     * @return ZeroCopySlot object. Check .IsValid() before use.
+     */
+    ZeroCopySlot GetZeroCopySlot() {
+        int32_t idx = AcquireSlot();
+        return ZeroCopySlot(this, idx);
+    }
+
+    /**
      * @brief Acquires a specific slot.
      * @param slotIdx The index of the slot to acquire.
      * @return The slot index (same as input), or -1 if failed.
@@ -280,51 +489,8 @@ public:
         slot->header->reqSize = size;
         slot->header->msgId = msgId;
 
-        // Reset Host State
-        slot->header->hostState.store(HOST_STATE_ACTIVE, std::memory_order_relaxed);
-
-        // Signal Ready
-        slot->header->state.store(SLOT_REQ_READY, std::memory_order_seq_cst);
-
-        // Wake Guest if waiting
-        if (slot->header->guestState.load(std::memory_order_seq_cst) == GUEST_STATE_WAITING) {
-            Platform::SignalEvent(slot->hReqEvent);
-        }
-
-        // Adaptive Wait for Response
-        bool ready = false;
-        int currentLimit = slot->spinLimit;
-        const int MIN_SPIN = 100;
-        const int MAX_SPIN = 20000;
-
-        for (int i = 0; i < currentLimit; ++i) {
-            if (slot->header->state.load(std::memory_order_acquire) == SLOT_RESP_READY) {
-                ready = true;
-                break;
-            }
-            Platform::CpuRelax();
-        }
-
-        if (ready) {
-            if (currentLimit < MAX_SPIN) currentLimit += 100;
-        } else {
-            if (currentLimit > MIN_SPIN) currentLimit -= 500;
-            if (currentLimit < MIN_SPIN) currentLimit = MIN_SPIN;
-
-            slot->header->hostState.store(HOST_STATE_WAITING, std::memory_order_seq_cst);
-
-            if (slot->header->state.load(std::memory_order_acquire) == SLOT_RESP_READY) {
-                ready = true;
-                slot->header->hostState.store(HOST_STATE_ACTIVE, std::memory_order_relaxed);
-            } else {
-                 while (slot->header->state.load(std::memory_order_acquire) != SLOT_RESP_READY) {
-                    Platform::WaitEvent(slot->hRespEvent, 100);
-                 }
-                 ready = true;
-                 slot->header->hostState.store(HOST_STATE_ACTIVE, std::memory_order_relaxed);
-            }
-        }
-        slot->spinLimit = currentLimit;
+        // Perform Signal and Wait
+        bool ready = WaitResponse(slot);
 
         // Read Response
         int resultSize = 0;

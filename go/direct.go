@@ -29,6 +29,8 @@ const (
 	MsgIdHeartbeatResp = 2
 	// MsgIdShutdown signals the Guest to terminate.
 	MsgIdShutdown      = 3
+	// MsgIdFlatbuffer indicates a Zero-Copy FlatBuffer payload.
+	MsgIdFlatbuffer    = 10
 
 	// HostStateActive indicates the Host is spinning or processing.
 	HostStateActive  = 0
@@ -179,7 +181,7 @@ func NewDirectGuest(name string, _ int, _ int) (*DirectGuest, error) {
 // Start launches the worker goroutines.
 //
 // handler: The function to process requests.
-func (g *DirectGuest) Start(handler func(req []byte, resp []byte) int32) {
+func (g *DirectGuest) Start(handler func(req []byte, resp []byte, msgId uint32) int32) {
 	for i := 0; i < int(g.numSlots); i++ {
 		g.wg.Add(1)
 		go g.workerLoop(i, handler)
@@ -203,7 +205,7 @@ func (g *DirectGuest) Wait() {
 }
 
 // workerLoop is the main loop for a single slot worker.
-func (g *DirectGuest) workerLoop(idx int, handler func([]byte, []byte) int32) {
+func (g *DirectGuest) workerLoop(idx int, handler func([]byte, []byte, uint32) int32) {
 	defer g.wg.Done()
 
 	slot := &g.slots[idx]
@@ -277,7 +279,7 @@ func (g *DirectGuest) workerLoop(idx int, handler func([]byte, []byte) int32) {
                      reqData = slot.reqBuffer[offset:]
                  }
 
-                 respSize := handler(reqData, slot.respBuffer)
+                 respSize := handler(reqData, slot.respBuffer, msgId)
                  header.RespSize = respSize
              }
 

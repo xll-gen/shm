@@ -64,6 +64,7 @@ The memory layout is manually synchronized between C++ and Go. **Any mismatch wi
 ### 3.1. Code Modifications
 -   **Cross-Language Changes:** If you change a header in `include/`, you **MUST** change the corresponding struct in `go/`.
 -   **Platform:** Keep `Platform` implementations (Linux/Windows) consistent in behavior.
+-   **Feature Parity:** Supported languages (C++ and Go) must achieve functional parity. If a feature is added to the Host (C++), the Guest (Go) must expose the necessary API to interact with it.
 
 ### 3.2. Performance
 -   **No Logging in Loops:** Never put `fmt.Println` or `std::cout` in the critical path. It invalidates benchmarks.

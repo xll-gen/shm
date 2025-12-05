@@ -26,6 +26,12 @@
  */
 #define MSG_ID_SHUTDOWN 3
 
+/**
+ * @brief Message ID for FlatBuffer payload.
+ * Used when sending Zero-Copy FlatBuffers where the data is aligned to the end of the buffer.
+ */
+#define MSG_ID_FLATBUFFER 10
+
 // Host/Guest Sleeping States
 
 /**
