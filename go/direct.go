@@ -368,6 +368,11 @@ func (g *DirectGuest) workerLoop(idx int, handler func([]byte, []byte, uint32) i
              // Process
              msgId := header.MsgId
              if msgId == MsgIdShutdown {
+                 header.RespSize = 0
+                 atomic.StoreUint32(&header.State, SlotRespReady)
+                 if atomic.LoadUint32(&header.HostState) == HostStateWaiting {
+                     SignalEvent(slot.respEvent)
+                 }
                  return
              }
 

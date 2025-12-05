@@ -350,6 +350,19 @@ public:
     }
 
     /**
+     * @brief Sends shutdown signal to all guest workers.
+     * Blocks until all slots have been signaled.
+     */
+    void SendShutdown() {
+        if (!running) return;
+
+        for (uint32_t i = 0; i < numSlots; ++i) {
+            std::vector<uint8_t> dummy;
+            SendToSlot(i, nullptr, 0, MSG_ID_SHUTDOWN, dummy);
+        }
+    }
+
+    /**
      * @brief Shuts down the host, closing all handles and unmapping memory.
      */
     void Shutdown() {
