@@ -55,6 +55,28 @@ std::vector<uint8_t> resp;
 host.Send((const uint8_t*)"test", 4, MSG_ID_NORMAL, resp);
 ```
 
+### Zero-Copy (FlatBuffers)
+
+To send FlatBuffers without copying the data, use the `ZeroCopySlot` helper:
+
+```cpp
+// 1. Acquire a Zero-Copy Slot
+auto slot = host.GetZeroCopySlot();
+
+// 2. Build FlatBuffer directly in shared memory
+// slot.GetReqBuffer() returns the pointer to the buffer
+flatbuffers::FlatBufferBuilder builder(slot.GetMaxReqSize(), nullptr, false, slot.GetReqBuffer());
+// ... build your object ...
+
+// 3. Send Request
+// Signals MSG_ID_FLATBUFFER and handles negative size internally
+slot.SendFlatBuffer(builder.GetSize());
+
+// 4. Access Response Directly (Zero-Copy)
+uint8_t* respData = slot.GetRespBuffer();
+int32_t respSize = slot.GetRespSize();
+```
+
 ### Go Guest
 
 ```go
