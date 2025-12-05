@@ -23,6 +23,25 @@ The benchmark evaluates the "System Effective OPS" (Total successful operations 
 *   **Throughput**: 1,824,485 ops/s
 *   **Avg Latency (RTT)**: 4.38 us
 
+## Environment: AMD Ryzen 9 3900x (Bare-metal)
+**Payload:** 64 bytes (Ping-Pong)
+
+### 1 Thread
+*   **Throughput**: 1,736,783.51 ops/s
+*   **Avg Latency (RTT)**: 0.575 us
+
+### 4 Threads
+*   **Throughput**: 1,931,987.29 ops/s
+*   **Avg Latency (RTT)**: 0.517 us
+
+### 8 Threads
+*   **Throughput**: 1,323,987.09 ops/s
+*   **Avg Latency (RTT)**: 0.755 us
+
+### 12 Threads
+*   **Throughput**: 1,325,149.50 ops/s
+*   **Avg Latency (RTT)**: 0.754 us
+
 ## Notes
 *   **Performance**: The Direct Mode significantly outperforms the legacy SPSC implementation (approx 20x-170x improvement).
 *   **Scaling**: Throughput peaks at 4 threads in this environment. The drop at 8 threads is expected due to CPU resource contention in the sandbox environment (oversubscription of available physical cores).
