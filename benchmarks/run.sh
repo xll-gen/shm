@@ -39,8 +39,14 @@ run_case() {
     sleep 1
 
     # Run Client with Timeout
-    # Use timeout to prevent hangs
-    if timeout 60s ./benchmarks/build/shm_benchmark -t $THREADS; then
+    # Use timeout to prevent hangs. Normal run is ~1s.
+    # To enable verbose logging (every 100 ops), set VERBOSE=1
+    ARGS="-t $THREADS"
+    if [ "$VERBOSE" == "1" ]; then
+        ARGS="$ARGS -v"
+    fi
+
+    if timeout 60s ./benchmarks/build/shm_benchmark $ARGS; then
         echo "Success."
     else
         RET=$?
