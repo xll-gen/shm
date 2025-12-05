@@ -34,6 +34,11 @@ func CloseEvent(h EventHandle) {
 	closeEvent(h)
 }
 
+// UnlinkEvent removes the named event from the system.
+func UnlinkEvent(name string) {
+	unlinkEvent(name)
+}
+
 // CreateShm creates a new named shared memory region of the specified size.
 // Returns the handle, the mapped address, and any error.
 func CreateShm(name string, size uint64) (ShmHandle, uintptr, error) {
@@ -50,4 +55,9 @@ func OpenShm(name string, size uint64) (ShmHandle, uintptr, error) {
 // CloseShm unmaps the shared memory and closes the handle.
 func CloseShm(h ShmHandle, addr uintptr, size uint64) {
 	closeShm(h, addr, size)
+}
+
+// UnlinkShm removes the named shared memory region from the system.
+func UnlinkShm(name string) {
+	unlinkShm(name)
 }

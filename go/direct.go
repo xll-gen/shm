@@ -81,6 +81,7 @@ type slotContext struct {
 // DirectGuest implements the Guest side of the Direct Mode IPC.
 // It manages multiple workers, each attached to a specific slot.
 type DirectGuest struct {
+	name          string
 	shmBase       uintptr
 	shmSize       uint64
 	handle        ShmHandle
@@ -143,6 +144,7 @@ func NewDirectGuest(name string, _ int, _ int) (*DirectGuest, error) {
 	}
 
 	g := &DirectGuest{
+		name:          name,
 		shmBase:       addr,
 		shmSize:       totalSize,
 		handle:        h,
@@ -204,9 +206,16 @@ func (g *DirectGuest) Close() {
 	// Logic to stop workers?
     // They will likely stop when SHM is closed or via Shutdown msg
 	CloseShm(g.handle, g.shmBase, g.shmSize)
-	for _, s := range g.slots {
+	UnlinkShm(g.name)
+
+	for i, s := range g.slots {
         if s.reqEvent != 0 { CloseEvent(s.reqEvent) }
         if s.respEvent != 0 { CloseEvent(s.respEvent) }
+
+		reqName := fmt.Sprintf("%s_slot_%d", g.name, i)
+		respName := fmt.Sprintf("%s_slot_%d_resp", g.name, i)
+		UnlinkEvent(reqName)
+		UnlinkEvent(respName)
 	}
 }
 
@@ -368,6 +377,11 @@ func (g *DirectGuest) workerLoop(idx int, handler func([]byte, []byte, uint32) i
              // Process
              msgId := header.MsgId
              if msgId == MsgIdShutdown {
+                 header.RespSize = 0
+                 atomic.StoreUint32(&header.State, SlotRespReady)
+                 if atomic.LoadUint32(&header.HostState) == HostStateWaiting {
+                     SignalEvent(slot.respEvent)
+                 }
                  return
              }
 
