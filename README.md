@@ -1,4 +1,4 @@
-# SimpleIPC Library
+# xll-gen/shm
 
 SimpleIPC is a high-performance, low-latency shared-memory IPC library connecting C++ (Host) and Go (Guest). It uses a lock-free, direct slot exchange model to achieve sub-microsecond latency.
 
