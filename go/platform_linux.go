@@ -48,6 +48,14 @@ long get_file_size(int fd) {
     if (fstat(fd, &st) == -1) return -1;
     return st.st_size;
 }
+
+int unlink_sem(const char* name) {
+    return sem_unlink(name);
+}
+
+int unlink_shm(const char* name) {
+    return shm_unlink(name);
+}
 */
 import "C"
 import (
@@ -92,6 +100,13 @@ func waitForEvent(h EventHandle, timeoutMs uint32) {
 // closeEvent implementation for Linux.
 func closeEvent(h EventHandle) {
 	C.sem_close((*C.sem_t)(unsafe.Pointer(h)))
+}
+
+// unlinkEvent implementation for Linux.
+func unlinkEvent(name string) {
+	cName := C.CString("/" + name)
+	defer C.free(unsafe.Pointer(cName))
+	C.unlink_sem(cName)
 }
 
 // createShm implementation for Linux (using shm_open/mmap).
@@ -150,4 +165,11 @@ func closeShm(h ShmHandle, addr uintptr, size uint64) {
 		C.munmap(unsafe.Pointer(addr), C.size_t(size))
 	}
 	C.close(C.int(h))
+}
+
+// unlinkShm implementation for Linux.
+func unlinkShm(name string) {
+	cName := C.CString("/" + name)
+	defer C.free(unsafe.Pointer(cName))
+	C.unlink_shm(cName)
 }
