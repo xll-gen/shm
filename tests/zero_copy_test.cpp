@@ -3,7 +3,7 @@
 #include <cstring>
 #include <atomic>
 #include <vector>
-#include "DirectHost.h"
+#include <shm/DirectHost.h>
 
 using namespace shm;
 

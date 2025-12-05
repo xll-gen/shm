@@ -5,7 +5,7 @@
 #include <atomic>
 #include <cstring>
 #include <iomanip>
-#include "DirectHost.h"
+#include <shm/DirectHost.h>
 
 using namespace shm;
 

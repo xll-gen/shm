@@ -13,8 +13,7 @@ This project implements a high-performance, lock-free Shared Memory IPC (Inter-P
 
 ### Directory Structure
 
--   `src/`: C++ Host implementation (`DirectHost`, `Platform`).
--   `include/`: Shared C++ headers (`IPCUtils.h` - **CRITICAL**).
+-   `include/shm/`: C++ Header-only library (`DirectHost.h`, `Platform.h`, `IPCUtils.h`, etc.).
 -   `go/`: Go Guest implementation (`direct.go`, `platform.go`, `client.go`).
 -   `benchmarks/`: C++ client and Go server for performance testing.
 -   `Taskfile.yaml`: Automation for building and running benchmarks.
@@ -34,7 +33,7 @@ The memory layout is manually synchronized between C++ and Go. **Any mismatch wi
 4.  **Memory Ordering:** Critical state transitions must use `seq_cst`.
 
 #### SlotHeader Layout (Direct Mode)
-*Reference: `include/IPCUtils.h` (C++) and `go/direct.go` (Go)*
+*Reference: `include/shm/IPCUtils.h` (C++) and `go/direct.go` (Go)*
 
 | Field | Size (Bytes) | Notes |
 | :--- | :--- | :--- |
@@ -62,7 +61,7 @@ The memory layout is manually synchronized between C++ and Go. **Any mismatch wi
 ## 3. Development Guidelines
 
 ### 3.1. Code Modifications
--   **Cross-Language Changes:** If you change a header in `include/`, you **MUST** change the corresponding struct in `go/`.
+-   **Cross-Language Changes:** If you change a header in `include/shm/`, you **MUST** change the corresponding struct in `go/`.
 -   **Platform:** Keep `Platform` implementations (Linux/Windows) consistent in behavior.
 -   **Feature Parity:** Supported languages (C++ and Go) must achieve functional parity. If a feature is added to the Host (C++), the Guest (Go) must expose the necessary API to interact with it.
 
@@ -85,3 +84,15 @@ If the benchmark hangs or produces "ID Mismatch" errors, you have broken the mem
 1.  **Padding drift:** Adding a field to structs without adjusting padding.
 2.  **Zombie Semaphores (Linux):** If the benchmark crashes, shared memory files (`/dev/shm/*`) may remain. Use `rm /dev/shm/SimpleIPC*` to clean up.
 3.  **SeqCst:** Use `std::memory_order_seq_cst` for `State` transitions to ensure visibility.
+
+## 5. Architectural Standards
+
+### 5.1. Header-Only C++ Library
+The C++ Host library is **header-only**. All source code must reside in `include/shm/`.
+-   **Do not** add `.cpp` files to the library core.
+-   **Include Path:** Consumers must add the parent `include/` directory to their path and include via `#include <shm/File.h>`.
+
+### 5.2. Direct Exchange Mode
+The project exclusively uses the 'Direct Exchange' model (1:1 Slot Mapping).
+-   **Queues/Lanes:** Concepts like "Queues" or "Lanes" are deprecated. Use "Slots".
+-   **ZeroCopySlot:** Use `DirectHost::GetZeroCopySlot()` for zero-copy message construction.
