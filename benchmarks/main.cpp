@@ -126,6 +126,7 @@ int main(int argc, char* argv[]) {
     std::cout << "Done. Total Time: " << totalTime.count() << "s" << std::endl;
     std::cout << "System Effective OPS: " << std::fixed << std::setprecision(2) << systemOps << std::endl;
 
+    host.SendShutdown();
     host.Shutdown();
     return 0;
 }

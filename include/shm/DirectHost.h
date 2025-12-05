@@ -350,17 +350,36 @@ public:
     }
 
     /**
+     * @brief Sends shutdown signal to all guest workers.
+     * Blocks until all slots have been signaled.
+     */
+    void SendShutdown() {
+        if (!running) return;
+
+        for (uint32_t i = 0; i < numSlots; ++i) {
+            std::vector<uint8_t> dummy;
+            SendToSlot(i, nullptr, 0, MSG_ID_SHUTDOWN, dummy);
+        }
+    }
+
+    /**
      * @brief Shuts down the host, closing all handles and unmapping memory.
      */
     void Shutdown() {
         if (!running) return;
 
-        for (auto& slot : slots) {
-             Platform::CloseEvent(slot.hReqEvent);
-             Platform::CloseEvent(slot.hRespEvent);
+        for (uint32_t i = 0; i < slots.size(); ++i) {
+             Platform::CloseEvent(slots[i].hReqEvent);
+             Platform::CloseEvent(slots[i].hRespEvent);
+
+             std::string reqName = shmName + "_slot_" + std::to_string(i);
+             std::string respName = shmName + "_slot_" + std::to_string(i) + "_resp";
+             Platform::UnlinkNamedEvent(reqName.c_str());
+             Platform::UnlinkNamedEvent(respName.c_str());
         }
 
         if (shmBase) Platform::CloseShm(hMapFile, shmBase, totalShmSize);
+        Platform::UnlinkShm(shmName.c_str());
         running = false;
     }
 

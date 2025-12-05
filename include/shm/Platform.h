@@ -111,6 +111,21 @@ public:
     }
 
     /**
+     * @brief Unlinks the named event (removes it from the system).
+     *
+     * @param name The name of the event.
+     */
+    static void UnlinkNamedEvent(const char* name) {
+#ifdef _WIN32
+        // Windows objects are ref-counted and destroyed when last handle is closed.
+        // No explicit unlink needed for Local\ events.
+#else
+        std::string evName = "/" + std::string(name);
+        sem_unlink(evName.c_str());
+#endif
+    }
+
+    /**
      * @brief Creates or opens a named shared memory region.
      *
      * @param name The name of the shared memory region.
@@ -169,6 +184,20 @@ public:
 #else
         if (addr) munmap(addr, size);
         if (h >= 0) close(h);
+#endif
+    }
+
+    /**
+     * @brief Unlinks the shared memory region (removes it from the system).
+     *
+     * @param name The name of the shared memory region.
+     */
+    static void UnlinkShm(const char* name) {
+#ifdef _WIN32
+        // Windows pagefile-backed SHM is destroyed when last handle is closed.
+#else
+        std::string shmName = "/" + std::string(name);
+        shm_unlink(shmName.c_str());
 #endif
     }
 

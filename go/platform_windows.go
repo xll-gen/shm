@@ -72,6 +72,11 @@ func closeEvent(h EventHandle) {
 	procCloseHandle.Call(uintptr(h))
 }
 
+// unlinkEvent implementation for Windows.
+func unlinkEvent(name string) {
+	// No-op on Windows (objects are ref-counted)
+}
+
 // createShm implementation for Windows.
 func createShm(name string, size uint64) (ShmHandle, uintptr, error) {
 	n, err := syscall.UTF16PtrFromString("Local\\" + name)
@@ -150,4 +155,9 @@ func closeShm(h ShmHandle, addr uintptr, size uint64) {
 	if h != 0 {
 		procCloseHandle.Call(uintptr(h))
 	}
+}
+
+// unlinkShm implementation for Windows.
+func unlinkShm(name string) {
+	// No-op on Windows
 }
