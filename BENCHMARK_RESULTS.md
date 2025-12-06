@@ -12,16 +12,16 @@ The benchmark evaluates the "System Effective OPS" (Total successful operations 
 **Payload:** 64 bytes (Ping-Pong)
 
 ### 1 Thread
-*   **Throughput**: 1,707,047 ops/s
-*   **Avg Latency (RTT)**: 0.59 us
+*   **Throughput**: 1,899,812 ops/s
+*   **Avg Latency (RTT)**: 0.53 us
 
 ### 4 Threads
-*   **Throughput**: 2,781,209 ops/s
-*   **Avg Latency (RTT)**: 1.44 us
+*   **Throughput**: 2,731,300 ops/s
+*   **Avg Latency (RTT)**: 1.46 us
 
 ### 8 Threads
-*   **Throughput**: 1,824,485 ops/s
-*   **Avg Latency (RTT)**: 4.38 us
+*   **Throughput**: 2,031,359 ops/s
+*   **Avg Latency (RTT)**: 3.94 us
 
 ## Environment: AMD Ryzen 9 3900x (Bare-metal)
 **Payload:** 64 bytes (Ping-Pong)

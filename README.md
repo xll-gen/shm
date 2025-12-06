@@ -144,7 +144,7 @@ host.Init("MyIPC", 4, 1024*1024, 2);
 
 // In a background thread:
 while (running) {
-    host.ProcessGuestCalls([](const uint8_t* req, uint8_t* resp, uint32_t msgId) -> int32_t {
+    host.ProcessGuestCalls([](const uint8_t* req, int32_t reqSize, uint8_t* resp, uint32_t msgId) -> int32_t {
         if (msgId == MSG_ID_GUEST_CALL) {
              // Process Guest Request
         }
