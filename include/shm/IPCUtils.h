@@ -37,6 +37,13 @@
  */
 #define MSG_ID_GUEST_CALL 11
 
+/**
+ * @brief Start of User Message IDs.
+ * IDs below 128 are reserved for internal protocol use.
+ * Users should start their custom message IDs from this value.
+ */
+#define MSG_ID_USER_START 128
+
 // Host/Guest Sleeping States
 
 /**

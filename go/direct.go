@@ -33,6 +33,9 @@ const (
 	MsgIdFlatbuffer    = 10
 	// MsgIdGuestCall indicates a Guest Call payload.
 	MsgIdGuestCall     = 11
+	// MsgIdUserStart is the start of user-defined message IDs.
+	// IDs below 128 are reserved for internal protocol use.
+	MsgIdUserStart     = 128
 
 	// HostStateActive indicates the Host is spinning or processing.
 	HostStateActive  = 0

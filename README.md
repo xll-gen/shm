@@ -132,6 +132,34 @@ func main() {
 }
 ```
 
+### Custom Message IDs
+
+You can use custom message IDs to multiplex different types of operations on the same connection.
+The system reserves IDs `0` through `127`. User-defined IDs should start at `MSG_ID_USER_START` (128).
+
+**C++ Host:**
+```cpp
+#include <shm/IPCUtils.h>
+
+// Define your custom ID
+const uint32_t MY_OP_ID = MSG_ID_USER_START + 1;
+
+// Send
+host.Send(payload, size, MY_OP_ID, resp);
+```
+
+**Go Guest:**
+```go
+const MyOpId = shm.MsgIdUserStart + 1
+
+client.Handle(func(req []byte, respBuf []byte, msgId uint32) int32 {
+    if msgId == MyOpId {
+        // Handle custom op
+    }
+    // ...
+})
+```
+
 ### Guest Call (Async)
 
 The library supports Guest-initiated calls (e.g., for async callbacks). Specific slots are reserved for this purpose.
