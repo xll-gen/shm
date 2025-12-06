@@ -194,7 +194,7 @@ public:
          * @brief Sends the FlatBuffer request.
          *
          * This method:
-         * 1. Sets the message ID to MSG_ID_FLATBUFFER.
+         * 1. Sets the message Type to MSG_TYPE_FLATBUFFER.
          * 2. Sets the request size to negative (indicating end-aligned Zero-Copy).
          * 3. Signals the Guest and waits for completion.
          *
@@ -214,7 +214,7 @@ public:
 
             // Zero-Copy convention: Negative size
             slot->header->reqSize = -absSize;
-            slot->header->msgId = MSG_ID_FLATBUFFER;
+            slot->header->msgType = MSG_TYPE_FLATBUFFER;
 
             host->WaitResponse(slot);
             // Do NOT release slot here. User might want to read response.
@@ -358,7 +358,7 @@ public:
 
         for (uint32_t i = 0; i < numSlots; ++i) {
             std::vector<uint8_t> dummy;
-            SendToSlot(i, nullptr, 0, MSG_ID_SHUTDOWN, dummy);
+            SendToSlot(i, nullptr, 0, MSG_TYPE_SHUTDOWN, dummy);
         }
     }
 
@@ -492,11 +492,11 @@ public:
      *
      * @param slotIdx The index of the acquired slot.
      * @param size Size of the data. Negative means End-Aligned (Zero-Copy).
-     * @param msgId The message ID.
+     * @param msgType The message Type.
      * @param[out] outResp Vector to store the response data.
      * @return int Bytes read (response size), or -1 on error.
      */
-    int SendAcquired(int32_t slotIdx, int32_t size, uint32_t msgId, std::vector<uint8_t>& outResp) {
+    int SendAcquired(int32_t slotIdx, int32_t size, uint32_t msgType, std::vector<uint8_t>& outResp) {
         if (slotIdx < 0 || slotIdx >= (int32_t)numSlots) return -1;
         Slot* slot = &slots[slotIdx];
 
@@ -510,7 +510,7 @@ public:
         }
 
         slot->header->reqSize = size;
-        slot->header->msgId = msgId;
+        slot->header->msgType = msgType;
 
         // Perform Signal and Wait
         bool ready = WaitResponse(slot);
@@ -548,11 +548,11 @@ public:
      * @param slotIdx The index of the slot to use.
      * @param data Pointer to the request data.
      * @param size Size of the request data.
-     * @param msgId The message ID.
+     * @param msgType The message Type.
      * @param[out] outResp Vector to store the response data.
      * @return int Bytes read (response size), or -1 on error.
      */
-    int SendToSlot(uint32_t slotIdx, const uint8_t* data, int32_t size, uint32_t msgId, std::vector<uint8_t>& outResp) {
+    int SendToSlot(uint32_t slotIdx, const uint8_t* data, int32_t size, uint32_t msgType, std::vector<uint8_t>& outResp) {
         int32_t idx = AcquireSpecificSlot((int32_t)slotIdx);
         if (idx < 0) return -1;
 
@@ -561,18 +561,18 @@ public:
             if (size > max) size = max;
             memcpy(GetReqBuffer(idx), data, size);
         }
-        return SendAcquired(idx, size, msgId, outResp);
+        return SendAcquired(idx, size, msgType, outResp);
     }
 
     /**
      * @brief Sends a request using any available slot.
      * @param data Pointer to the request data.
      * @param size Size of the request data.
-     * @param msgId The message ID.
+     * @param msgType The message Type.
      * @param[out] outResp Vector to store the response data.
      * @return int Bytes read (response size), or -1 on error.
      */
-    int Send(const uint8_t* data, int32_t size, uint32_t msgId, std::vector<uint8_t>& outResp) {
+    int Send(const uint8_t* data, int32_t size, uint32_t msgType, std::vector<uint8_t>& outResp) {
         int32_t idx = AcquireSlot();
         if (idx < 0) return -1;
 
@@ -581,7 +581,7 @@ public:
             if (size > max) size = max;
             memcpy(GetReqBuffer(idx), data, size);
         }
-        return SendAcquired(idx, size, msgId, outResp);
+        return SendAcquired(idx, size, msgType, outResp);
     }
 
 
@@ -590,7 +590,7 @@ public:
      * This method is intended to be called in a loop by a background thread.
      *
      * @param handler A function to process the request.
-     *                Args: reqData, respBuffer, msgId.
+     *                Args: reqData, respBuffer, msgType.
      *                Returns: respSize.
      * @return int Number of requests processed.
      */
@@ -629,7 +629,7 @@ public:
                 // Invoke Handler
                 int32_t respSize = 0;
                 if (handler) {
-                    respSize = handler(reqData, absReqSize, slot->respBuffer, slot->header->msgId);
+                    respSize = handler(reqData, absReqSize, slot->respBuffer, slot->header->msgType);
                 }
 
                 // Write Response Metadata

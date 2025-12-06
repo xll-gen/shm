@@ -40,11 +40,11 @@ func main() {
 	defer client.Close()
 
 	// Zero-copy Echo Handler
-	client.Handle(func(req []byte, respBuf []byte, msgId uint32) int32 {
+	client.Handle(func(req []byte, respBuf []byte, msgType shm.MsgType) (int32, shm.MsgType) {
 		if *guestCall {
 			// Trigger a Guest Call to the Host
 			callData := []byte("callback")
-			_, err := client.SendGuestCall(callData, shm.MsgIdGuestCall)
+			_, err := client.SendGuestCall(callData, shm.MsgTypeGuestCall)
 			if err != nil {
 				// Log error but continue to reply to original request
 				//fmt.Printf("Guest call failed: %v\n", err)
@@ -53,7 +53,7 @@ func main() {
 
 		// Simple Echo
 		n := copy(respBuf, req)
-		return int32(n)
+		return int32(n), msgType
 	})
 
 	fmt.Println("Server ready.")

@@ -8,7 +8,11 @@ import (
 	"unsafe"
 )
 
-// Constants defining slot states and message IDs.
+// MsgType represents the type of the message (command).
+// It is distinct from the Message ID (Sequence ID).
+type MsgType uint32
+
+// Constants defining slot states and message Types.
 const (
 	// SlotFree indicates the slot is available for the Host to claim.
 	SlotFree      = 0
@@ -21,21 +25,21 @@ const (
 	// SlotBusy indicates the Host has claimed the slot and is writing data.
 	SlotBusy      = 4
 
-	// MsgIdNormal is a standard data payload message.
-	MsgIdNormal        = 0
-	// MsgIdHeartbeatReq is a keep-alive request from the Host.
-	MsgIdHeartbeatReq  = 1
-	// MsgIdHeartbeatResp is the response to a keep-alive request.
-	MsgIdHeartbeatResp = 2
-	// MsgIdShutdown signals the Guest to terminate.
-	MsgIdShutdown      = 3
-	// MsgIdFlatbuffer indicates a Zero-Copy FlatBuffer payload.
-	MsgIdFlatbuffer    = 10
-	// MsgIdGuestCall indicates a Guest Call payload.
-	MsgIdGuestCall     = 11
-	// MsgIdUserStart is the start of user-defined message IDs.
-	// IDs below 128 are reserved for internal protocol use.
-	MsgIdUserStart     = 128
+	// MsgTypeNormal is a standard data payload message.
+	MsgTypeNormal        MsgType = 0
+	// MsgTypeHeartbeatReq is a keep-alive request from the Host.
+	MsgTypeHeartbeatReq  MsgType = 1
+	// MsgTypeHeartbeatResp is the response to a keep-alive request.
+	MsgTypeHeartbeatResp MsgType = 2
+	// MsgTypeShutdown signals the Guest to terminate.
+	MsgTypeShutdown      MsgType = 3
+	// MsgTypeFlatbuffer indicates a Zero-Copy FlatBuffer payload.
+	MsgTypeFlatbuffer    MsgType = 10
+	// MsgTypeGuestCall indicates a Guest Call payload.
+	MsgTypeGuestCall     MsgType = 11
+	// MsgTypeAppStart is the start of Application Specific message types.
+	// Types below 128 are reserved for internal protocol use.
+	MsgTypeAppStart      MsgType = 128
 
 	// HostStateActive indicates the Host is spinning or processing.
 	HostStateActive  = 0
@@ -52,12 +56,13 @@ const (
 type SlotHeader struct {
     _         [64]byte
 	State     uint32
-	ReqSize   int32
-	RespSize  int32
-	MsgId     uint32
 	HostState uint32
 	GuestState uint32
-    _         [40]byte
+	MsgId     uint32
+    MsgType   MsgType
+	ReqSize   int32
+	RespSize  int32
+    _         [36]byte
 }
 
 // ExchangeHeader represents the metadata at the start of the shared memory region.
@@ -202,7 +207,7 @@ func NewDirectGuest(name string, _ int, _ int) (*DirectGuest, error) {
 // Start launches the worker goroutines.
 //
 // handler: The function to process requests.
-func (g *DirectGuest) Start(handler func(req []byte, resp []byte, msgId uint32) int32) {
+func (g *DirectGuest) Start(handler func(req []byte, resp []byte, msgType MsgType) (int32, MsgType)) {
 	for i := 0; i < int(g.numSlots); i++ {
 		g.wg.Add(1)
 		go g.workerLoop(i, handler)
@@ -242,7 +247,7 @@ func (g *DirectGuest) Wait() {
 
 // SendGuestCall sends a request to the Host using a Guest Slot.
 // It blocks until a response is received or a timeout occurs.
-func (g *DirectGuest) SendGuestCall(data []byte, msgId uint32) ([]byte, error) {
+func (g *DirectGuest) SendGuestCall(data []byte, msgType MsgType) ([]byte, error) {
 	if g.numGuestSlots == 0 {
 		return nil, fmt.Errorf("no guest slots available")
 	}
@@ -270,7 +275,7 @@ func (g *DirectGuest) SendGuestCall(data []byte, msgId uint32) ([]byte, error) {
 		return nil, fmt.Errorf("data too large")
 	}
 
-	if msgId == MsgIdFlatbuffer {
+	if msgType == MsgTypeFlatbuffer {
 		// End-aligned for Zero-Copy FlatBuffers
 		offset := len(slot.reqBuffer) - len(data)
 		copy(slot.reqBuffer[offset:], data)
@@ -280,7 +285,7 @@ func (g *DirectGuest) SendGuestCall(data []byte, msgId uint32) ([]byte, error) {
 		slot.header.ReqSize = int32(len(data))
 	}
 
-	slot.header.MsgId = msgId
+	slot.header.MsgType = msgType
 
 	// Signal Ready
 	atomic.StoreUint32(&slot.header.State, SlotReqReady)
@@ -343,7 +348,7 @@ func (g *DirectGuest) SendGuestCall(data []byte, msgId uint32) ([]byte, error) {
 }
 
 // workerLoop is the main loop for a single slot worker.
-func (g *DirectGuest) workerLoop(idx int, handler func([]byte, []byte, uint32) int32) {
+func (g *DirectGuest) workerLoop(idx int, handler func([]byte, []byte, MsgType) (int32, MsgType)) {
 	defer g.wg.Done()
 
     // Recover from panic (caused by SHM unmap during Close)
@@ -430,8 +435,8 @@ func (g *DirectGuest) workerLoop(idx int, handler func([]byte, []byte, uint32) i
 
         if ready {
              // Process
-             msgId := header.MsgId
-             if msgId == MsgIdShutdown {
+             msgType := header.MsgType
+             if msgType == MsgTypeShutdown {
                  header.RespSize = 0
                  atomic.StoreUint32(&header.State, SlotRespReady)
                  if atomic.LoadUint32(&header.HostState) == HostStateWaiting {
@@ -440,8 +445,8 @@ func (g *DirectGuest) workerLoop(idx int, handler func([]byte, []byte, uint32) i
                  return
              }
 
-             if msgId == MsgIdHeartbeatReq {
-                 header.MsgId = MsgIdHeartbeatResp
+             if msgType == MsgTypeHeartbeatReq {
+                 header.MsgType = MsgTypeHeartbeatResp
                  header.RespSize = 0
              } else {
                  reqSize := header.ReqSize
@@ -458,8 +463,9 @@ func (g *DirectGuest) workerLoop(idx int, handler func([]byte, []byte, uint32) i
                      reqData = slot.reqBuffer[offset:]
                  }
 
-                 respSize := handler(reqData, slot.respBuffer, msgId)
+                 respSize, respType := handler(reqData, slot.respBuffer, msgType)
                  header.RespSize = respSize
+                 header.MsgType = respType
              }
 
              // Signal Ready

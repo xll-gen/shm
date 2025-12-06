@@ -9,7 +9,7 @@ import (
 // It wraps DirectGuest and handles connection retries and lifecycle management.
 type Client struct {
 	guest   *DirectGuest
-	handler func([]byte, []byte, uint32) int32
+	handler func([]byte, []byte, MsgType) (int32, MsgType)
 }
 
 // Connect attempts to establish a connection to the Host with the given shared memory name.
@@ -38,12 +38,12 @@ func Connect(name string) (*Client, error) {
 
 // Handle registers the request handler function.
 //
-// h: A function that takes a request buffer, response buffer, and message ID.
+// h: A function that takes a request buffer, response buffer, and message Type.
 //    It should process the request, write the response to the response buffer,
-//    and return the size of the response written (negative for End-Aligned).
+//    and return the size of the response written (negative for End-Aligned) and the response MsgType.
 //
 // The handler must be thread-safe as it may be called concurrently by multiple workers.
-func (c *Client) Handle(h func(req []byte, respBuf []byte, msgId uint32) int32) {
+func (c *Client) Handle(h func(req []byte, respBuf []byte, msgType MsgType) (int32, MsgType)) {
 	c.handler = h
 }
 
@@ -64,8 +64,8 @@ func (c *Client) Wait() {
 }
 
 // SendGuestCall sends a message to the Host (Guest Call).
-func (c *Client) SendGuestCall(data []byte, msgId uint32) ([]byte, error) {
-	return c.guest.SendGuestCall(data, msgId)
+func (c *Client) SendGuestCall(data []byte, msgType MsgType) ([]byte, error) {
+	return c.guest.SendGuestCall(data, msgType)
 }
 
 // Close releases all resources associated with the client.

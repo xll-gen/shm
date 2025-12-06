@@ -32,7 +32,7 @@ void worker(DirectHost* host, int id, int iterations, long long* outOps, bool ve
             std::cout << "[Thread " << id << "] Op " << i << std::endl;
         }
         // Send To Slot Explicitly (1:1 Affinity)
-        int read = host->SendToSlot(id, req.data(), (int32_t)req.size(), MSG_ID_NORMAL, resp);
+        int read = host->SendToSlot(id, req.data(), (int32_t)req.size(), MSG_TYPE_NORMAL, resp);
         if (read < 0) {
             std::cerr << "Send failed at " << i << std::endl;
             break;
@@ -104,7 +104,7 @@ int main(int argc, char* argv[]) {
     if (enableGuestCall) {
         guestCallThread = std::thread([&](){
             while(!stopGuestCall) {
-                host.ProcessGuestCalls([](const uint8_t* req, int32_t reqSize, uint8_t* resp, uint32_t msgId) -> int32_t {
+                host.ProcessGuestCalls([](const uint8_t* req, int32_t reqSize, uint8_t* resp, uint32_t msgType) -> int32_t {
                     // Simple ACK/Echo for guest call
                     // We assume small payload
                     const char* ack = "OK";
@@ -121,7 +121,7 @@ int main(int argc, char* argv[]) {
     std::vector<uint8_t> resp;
     uint8_t data = 0;
     // Try to send one message to verify connection
-    if (host.Send(&data, 1, MSG_ID_NORMAL, resp) < 0) {
+    if (host.Send(&data, 1, MSG_TYPE_NORMAL, resp) < 0) {
          std::cerr << "Warmup failed (Guest not ready?)" << std::endl;
          stopGuestCall = true;
          if (guestCallThread.joinable()) guestCallThread.join();
