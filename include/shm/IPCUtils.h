@@ -41,6 +41,10 @@
  * @brief Start of Application Specific message types.
  * IDs below 128 are reserved for internal protocol use.
  * Users should start their custom message types from this value.
+ *
+ * Example:
+ *   const uint32_t MY_MSG_LOGIN  = MSG_TYPE_APP_START + 0;
+ *   const uint32_t MY_MSG_UPDATE = MSG_TYPE_APP_START + 1;
  */
 #define MSG_TYPE_APP_START 128
 

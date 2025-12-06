@@ -113,4 +113,4 @@ The project exclusively uses the 'Direct Exchange' model (1:1 Slot Mapping).
 ### 6.3. Message Typing
 -   **MsgId:** Used strictly as a Sequence ID to match Request/Response pairs. Echoed by Guest.
 -   **MsgType:** Used to indicate the type/command of the message (e.g., `MSG_TYPE_NORMAL`, `MSG_TYPE_FLATBUFFER`).
--   **App Types:** Application-specific message types should start from `MSG_TYPE_APP_START` (128).
+-   **App Types:** Application-specific message types must start from `MSG_TYPE_APP_START` (128). The range 0-127 is strictly reserved for internal protocol use.
