@@ -3,46 +3,46 @@
 #include <stdint.h>
 #include <atomic>
 
-// Message IDs for control messages
+// Message Types for control messages
 
 /**
- * @brief Message ID for normal data payload.
+ * @brief Message Type for normal data payload.
  */
-#define MSG_ID_NORMAL 0
+#define MSG_TYPE_NORMAL 0
 
 /**
- * @brief Message ID for heartbeat request (keep-alive).
+ * @brief Message Type for heartbeat request (keep-alive).
  */
-#define MSG_ID_HEARTBEAT_REQ 1
+#define MSG_TYPE_HEARTBEAT_REQ 1
 
 /**
- * @brief Message ID for heartbeat response.
+ * @brief Message Type for heartbeat response.
  */
-#define MSG_ID_HEARTBEAT_RESP 2
+#define MSG_TYPE_HEARTBEAT_RESP 2
 
 /**
- * @brief Message ID for shutdown signal.
+ * @brief Message Type for shutdown signal.
  * Used to signal the Guest to terminate its worker loop.
  */
-#define MSG_ID_SHUTDOWN 3
+#define MSG_TYPE_SHUTDOWN 3
 
 /**
- * @brief Message ID for FlatBuffer payload.
+ * @brief Message Type for FlatBuffer payload.
  * Used when sending Zero-Copy FlatBuffers where the data is aligned to the end of the buffer.
  */
-#define MSG_ID_FLATBUFFER 10
+#define MSG_TYPE_FLATBUFFER 10
 
 /**
- * @brief Message ID for Guest Call (Guest -> Host).
+ * @brief Message Type for Guest Call (Guest -> Host).
  */
-#define MSG_ID_GUEST_CALL 11
+#define MSG_TYPE_GUEST_CALL 11
 
 /**
- * @brief Start of User Message IDs.
+ * @brief Start of Application Specific message types.
  * IDs below 128 are reserved for internal protocol use.
- * Users should start their custom message IDs from this value.
+ * Users should start their custom message types from this value.
  */
-#define MSG_ID_USER_START 128
+#define MSG_TYPE_APP_START 128
 
 // Host/Guest Sleeping States
 
@@ -90,6 +90,30 @@ struct SlotHeader {
     std::atomic<uint32_t> state;
 
     /**
+     * @brief State of the Host (Active/Waiting).
+     * Used by the Guest to determine whether to signal the Host.
+     */
+    std::atomic<uint32_t> hostState;
+
+    /**
+     * @brief State of the Guest (Active/Waiting).
+     * Used by the Host to determine whether to signal the Guest.
+     */
+    std::atomic<uint32_t> guestState;
+
+    /**
+     * @brief Message Sequence ID.
+     * Unique identifier for the transaction, echoed back by the receiver.
+     */
+    uint32_t msgId;
+
+    /**
+     * @brief Message Type (e.g., MSG_TYPE_NORMAL, MSG_TYPE_SHUTDOWN).
+     * Describes the content/command of the message.
+     */
+    uint32_t msgType;
+
+    /**
      * @brief Size of the request payload in bytes.
      * Positive: Data starts at offset 0.
      * Negative: Data starts at end (size = -reqSize).
@@ -104,26 +128,11 @@ struct SlotHeader {
     int32_t respSize;
 
     /**
-     * @brief Message ID (e.g., MSG_ID_NORMAL, MSG_ID_SHUTDOWN).
-     */
-    uint32_t msgId;
-
-    /**
-     * @brief State of the Host (Active/Waiting).
-     * Used by the Guest to determine whether to signal the Host.
-     */
-    std::atomic<uint32_t> hostState;
-
-    /**
-     * @brief State of the Guest (Active/Waiting).
-     * Used by the Host to determine whether to signal the Guest.
-     */
-    std::atomic<uint32_t> guestState;
-
-    /**
      * @brief Padding to align the struct to 128 bytes total size.
+     * 64 (pre_pad) + 4 (state) + 4 (hostState) + 4 (guestState) + 4 (msgId) + 4 (msgType) + 4 (reqSize) + 4 (respSize) = 92 bytes.
+     * 128 - 92 = 36 bytes padding.
      */
-    uint8_t padding[40];
+    uint8_t padding[36];
 };
 
 // Slot State Constants

@@ -50,7 +50,7 @@ The shared memory region consists of:
 2.  **Slot Array**: An array of Slots.
 
 Each **Slot** (128-byte Header + Payload) contains:
-*   **SlotHeader**: Atomic state variables (`State`, `HostState`, `GuestState`) and message metadata (`ReqSize`, `MsgId`).
+*   **SlotHeader**: Atomic state variables (`State`, `HostState`, `GuestState`) and message metadata (`ReqSize`, `MsgId`, `MsgType`).
 *   **Request Buffer**: Area where Host writes data.
 *   **Response Buffer**: Area where Guest writes data.
 
@@ -85,7 +85,7 @@ if (!host.Init("MyIPC", 4, 1024*1024, 2)) { // 4 Worker Slots, 1MB Slot Size, 2 
 std::vector<uint8_t> resp;
 // Send 4 bytes to any available slot
 // Note: This blocks until response is received.
-host.Send((const uint8_t*)"test", 4, MSG_ID_NORMAL, resp);
+host.Send((const uint8_t*)"test", 4, MSG_TYPE_NORMAL, resp);
 ```
 
 ### Zero-Copy (FlatBuffers)
@@ -102,7 +102,7 @@ flatbuffers::FlatBufferBuilder builder(slot.GetMaxReqSize(), nullptr, false, slo
 // ... build your object ...
 
 // 3. Send Request
-// Signals MSG_ID_FLATBUFFER and handles negative size internally
+// Signals MSG_TYPE_FLATBUFFER and handles negative size internally
 slot.SendFlatBuffer(builder.GetSize());
 
 // 4. Access Response Directly (Zero-Copy)
@@ -120,17 +120,17 @@ import "github.com/xll-gen/shm/go"
 func main() {
     client, _ := shm.Connect("MyIPC")
 
-    // Handler now receives msgId
-    client.Handle(func(req []byte, respBuf []byte, msgId uint32) int32 {
-        if msgId == shm.MsgIdFlatbuffer {
+    // Handler now receives msgType and returns msgType
+    client.Handle(func(req []byte, respBuf []byte, msgType shm.MsgType) (int32, shm.MsgType) {
+        if msgType == shm.MsgTypeFlatbuffer {
             // "req" automatically points to the FlatBuffer data
             // (even if it was sent with negative size alignment)
             // processFlatBuffer(req)
         }
 
         // Process req, write to respBuf
-        // Return number of bytes written
-        return int32(copy(respBuf, req)) // Echo
+        // Return number of bytes written and the response type
+        return int32(copy(respBuf, req)), msgType // Echo Type
     })
 
     client.Start()
@@ -138,29 +138,30 @@ func main() {
 }
 ```
 
-### Custom Message IDs
+### Application Specific Message Types
 
-You can use custom message IDs to multiplex different types of operations on the same connection.
-The system reserves IDs `0` through `127`. User-defined IDs should start at `MSG_ID_USER_START` (128).
+You can use custom message types to multiplex different types of operations on the same connection.
+The system reserves types `0` through `127`. User-defined types should start at `MSG_TYPE_APP_START` (128).
 
 **C++ Host:**
 ```cpp
 #include <shm/IPCUtils.h>
 
-// Define your custom ID
-const uint32_t MY_OP_ID = MSG_ID_USER_START + 1;
+// Define your custom Type
+const uint32_t MY_OP_TYPE = MSG_TYPE_APP_START + 1;
 
 // Send
-host.Send(payload, size, MY_OP_ID, resp);
+host.Send(payload, size, MY_OP_TYPE, resp);
 ```
 
 **Go Guest:**
 ```go
-const MyOpId = shm.MsgIdUserStart + 1
+const MyOpType = shm.MsgTypeAppStart + 1
 
-client.Handle(func(req []byte, respBuf []byte, msgId uint32) int32 {
-    if msgId == MyOpId {
+client.Handle(func(req []byte, respBuf []byte, msgType shm.MsgType) (int32, shm.MsgType) {
+    if msgType == MyOpType {
         // Handle custom op
+        return 0, MyOpType
     }
     // ...
 })
@@ -178,8 +179,8 @@ host.Init("MyIPC", 4, 1024*1024, 2);
 
 // In a background thread:
 while (running) {
-    host.ProcessGuestCalls([](const uint8_t* req, int32_t reqSize, uint8_t* resp, uint32_t msgId) -> int32_t {
-        if (msgId == MSG_ID_GUEST_CALL) {
+    host.ProcessGuestCalls([](const uint8_t* req, int32_t reqSize, uint8_t* resp, uint32_t msgType) -> int32_t {
+        if (msgType == MSG_TYPE_GUEST_CALL) {
              // Process Guest Request
         }
         return 0; // Return response size
@@ -193,8 +194,8 @@ while (running) {
 
 ```go
 // Send Guest Call
-// msgId can be shm.MsgIdGuestCall or custom
-resp, err := client.SendGuestCall([]byte("AsyncData"), shm.MsgIdGuestCall)
+// msgType can be shm.MsgTypeGuestCall or custom
+resp, err := client.SendGuestCall([]byte("AsyncData"), shm.MsgTypeGuestCall)
 ```
 
 ## Building

@@ -39,12 +39,13 @@ The memory layout is manually synchronized between C++ and Go. **Any mismatch wi
 | :--- | :--- | :--- |
 | `pre_pad` | 64 | **Padding to avoid false sharing** |
 | `State` | 4 | Atomic |
-| `ReqSize` | 4 | int32 (Negative = End-aligned) |
-| `RespSize` | 4 | int32 (Negative = End-aligned) |
-| `MsgId` | 4 | |
 | `HostState` | 4 | Atomic |
 | `GuestState` | 4 | Atomic |
-| `padding` | 40 | **Aligns struct to 128 bytes** |
+| `MsgId` | 4 | Sequence ID |
+| `MsgType` | 4 | Command Type |
+| `ReqSize` | 4 | int32 (Negative = End-aligned) |
+| `RespSize` | 4 | int32 (Negative = End-aligned) |
+| `padding` | 36 | **Aligns struct to 128 bytes** |
 
 ### 2.2. Synchronization Primitives
 
@@ -65,6 +66,7 @@ To ensure consistent and debuggable results:
 1.  **Strict Timeout:** All benchmarks must have a strict 60-second timeout. The typical run time is ~1 second. If it takes longer, it is considered a hang/failure.
 2.  **Debug Logging:** The benchmark tool must support an optional verbose mode (e.g., `-v`) that logs progress every 100 operations. This allows identifying the exact point of failure during a hang.
     *   *Note:* Do not enable this during performance measurement runs as it degrades throughput.
+3.  **Clean Artifacts:** Always delete binary artifacts (`.o`, `.exe`, build directories) after running benchmarks. Do not commit them.
 
 ---
 
@@ -107,3 +109,8 @@ The project exclusively uses the 'Direct Exchange' model (1:1 Slot Mapping).
 -   **Queues/Lanes:** Concepts like "Queues" or "Lanes" are deprecated. Use "Slots".
 -   **Guest Call Slots:** Specific slots (indices `NumSlots` to `NumSlots + NumGuestSlots`) are reserved for Guest-initiated calls (Guest->Host).
 -   **ZeroCopySlot:** Use `DirectHost::GetZeroCopySlot()` for zero-copy message construction.
+
+### 6.3. Message Typing
+-   **MsgId:** Used strictly as a Sequence ID to match Request/Response pairs. Echoed by Guest.
+-   **MsgType:** Used to indicate the type/command of the message (e.g., `MSG_TYPE_NORMAL`, `MSG_TYPE_FLATBUFFER`).
+-   **App Types:** Application-specific message types should start from `MSG_TYPE_APP_START` (128).

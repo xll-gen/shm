@@ -24,7 +24,7 @@ func main() {
 
     // Send Guest Call
     fmt.Println("Sending Guest Call...")
-    resp, err := client.SendGuestCall([]byte("PING"), shm.MsgIdGuestCall)
+    resp, err := client.SendGuestCall([]byte("PING"), shm.MsgTypeGuestCall)
     if err != nil {
         panic(err)
     }
