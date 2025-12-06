@@ -10,6 +10,9 @@ import (
 
 // MsgType represents the type of the message (command).
 // It is distinct from the Message ID (Sequence ID).
+//
+// We use a distinct type definition (not an alias) to ensure type safety,
+// preventing accidental mixing with other uint32 values like MsgId or sizes.
 type MsgType uint32
 
 // Constants defining slot states and message Types.
@@ -39,6 +42,13 @@ const (
 	MsgTypeGuestCall     MsgType = 11
 	// MsgTypeAppStart is the start of Application Specific message types.
 	// Types below 128 are reserved for internal protocol use.
+	// Applications should define their own message types starting from this value.
+	//
+	// Example:
+	//   const (
+	//       MyMsgLogin  = shm.MsgTypeAppStart + 0
+	//       MyMsgUpdate = shm.MsgTypeAppStart + 1
+	//   )
 	MsgTypeAppStart      MsgType = 128
 
 	// HostStateActive indicates the Host is spinning or processing.
