@@ -2,6 +2,12 @@
 
 SimpleIPC is a high-performance, low-latency shared-memory IPC library connecting C++ (Host) and Go (Guest). It uses a lock-free, direct slot exchange model to achieve sub-microsecond latency.
 
+> **⚠️ WARNING: EXPERIMENTAL STATUS**
+>
+> This project is currently in an **experimental stage** and is under active development.
+> It is **NOT** recommended for use in production environments at this time.
+> APIs and memory layouts are subject to change without notice.
+
 ## Features
 
 *   **Low Latency**: Uses atomic spin-loops with adaptive backoff (Spin -> Yield -> Sleep) to minimize OS scheduler overhead.
