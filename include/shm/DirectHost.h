@@ -216,7 +216,7 @@ public:
             // Zero-Copy convention: Negative size
             slot->header->reqSize = -absSize;
             slot->header->msgType = MSG_TYPE_FLATBUFFER;
-            slot->header->msgId = slot->msgSeq++;
+            slot->header->msgSeq = slot->msgSeq++;
 
             host->WaitResponse(slot);
             // Do NOT release slot here. User might want to read response.
@@ -521,7 +521,7 @@ public:
 
         slot->header->reqSize = size;
         slot->header->msgType = msgType;
-        slot->header->msgId = slot->msgSeq++;
+        slot->header->msgSeq = slot->msgSeq++;
 
         // Perform Signal and Wait
         bool ready = WaitResponse(slot);
