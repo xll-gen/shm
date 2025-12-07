@@ -83,22 +83,19 @@ int main() {
     }
 
     int32_t respSize = guestSlotHeader->respSize;
-    if (respSize != -4) {
-        std::cerr << "Expected respSize -4, got " << respSize << std::endl;
+    if (respSize != 4) {
+        std::cerr << "Expected respSize 4 (Start Aligned), got " << respSize << std::endl;
         host.Shutdown();
         Platform::CloseShm(hMapFile, shmBase, 4096);
         return 1;
     }
 
-    // Guest reads from END
-    uint32_t absSize = 4;
-    uint32_t offset = maxRespSize - absSize;
-    char* dataAtEnd = (char*)(guestRespBuf + offset);
+    // Guest reads from START (Host flipped sign to avoid memmove)
     char* dataAtStart = (char*)guestRespBuf;
 
     // We don't print logic here, just check.
     bool success = false;
-    if (strncmp(dataAtEnd, "DONE", 4) == 0) {
+    if (strncmp(dataAtStart, "DONE", 4) == 0) {
         success = true;
     }
 

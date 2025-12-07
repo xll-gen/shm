@@ -691,18 +691,14 @@ public:
 
                 // Handle Zero-Copy Response (End-Aligned)
                 // If handler returns negative size, it implies it wrote to the buffer but expects it to be at the end.
-                // Since handler receives pointer to Start, we must move it to End.
+                // However, the handler wrote to the start. To avoid expensive memmove, we simply treat it as Start-Aligned
+                // by flipping the size to positive. The client will read from the start.
                 if (respSize < 0) {
                     int32_t absRespSize = -respSize;
                     if ((uint32_t)absRespSize > slot->maxRespSize) {
                         absRespSize = (int32_t)slot->maxRespSize;
-                        respSize = -absRespSize; // Clamp
                     }
-
-                    uint32_t offset = slot->maxRespSize - absRespSize;
-                    // Move data from Start to End
-                    // We use memmove to handle potential overlap (though unlikely if small)
-                    memmove(slot->respBuffer + offset, slot->respBuffer, absRespSize);
+                    respSize = absRespSize; // Flip to positive
                 }
 
                 // Write Response Metadata
