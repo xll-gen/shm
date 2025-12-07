@@ -1,116 +1,38 @@
-# AGENTS.md
+# AI Agent Instructions for xll-gen/shm
 
-This document provides context, rules, and guidelines for AI Agents working on this codebase.
-**CRITICAL:** If you modify code that affects architecture, memory layout, or build processes, you **MUST** update this file and `README.md` to reflect those changes.
+This file contains instructions for AI Agents working on this repository.
 
-## 1. Project Overview
+## **Codebase Authority**
 
-This project implements a high-performance, lock-free Shared Memory IPC (Inter-Process Communication) library between **C++ (Host)** and **Go (Guest)**.
+*   **SPECIFICATION.md:** This file is the **single source of truth** for the protocol, memory layout, and architecture. Always consult `SPECIFICATION.md` before making changes to the core IPC logic.
+*   **Feature Parity:** All features must be implemented in both C++ (Host) and Go (Guest). If you add a feature to one, you **must** add it to the other.
+*   **Tests:** New features must include regression tests.
 
--   **Host (C++):** Creates shared memory, acts as the server/initiator.
--   **Guest (Go):** Attaches to shared memory.
--   **Philosophy:** Zero-copy (where possible), cache-line aligned, direct slot exchange, adaptive hybrid wait.
+## **Project Structure**
 
-### Directory Structure
+*   **include/shm/**: C++ Header-only library. **Do not create .cpp files for the library.**
+*   **go/**: Go library. **Do not use external dependencies (go.mod should be minimal).**
+*   **benchmarks/**: Performance tests and examples.
 
--   `include/shm/`: C++ Header-only library (`DirectHost.h`, `Platform.h`, `IPCUtils.h`, etc.).
--   `go/`: Go Guest implementation (`direct.go`, `platform.go`, `client.go`).
--   `benchmarks/`: C++ client and Go server for performance testing.
--   `Taskfile.yaml`: Automation for building and running benchmarks.
+## **Coding Standards**
 
----
+*   **C++:**
+    *   Header-only architecture.
+    *   Use `doxygen` style comments (`/** ... */`).
+    *   Strict memory alignment (cache-line friendly).
+*   **Go:**
+    *   Use `cgo` only when necessary for OS primitives (e.g. `sem_open`).
+    *   Use `go fmt`.
+    *   Follow standard Go idioms.
 
-## 2. Critical Constraints (DO NOT BREAK)
+## **Verification**
 
-### 2.1. Memory Layout & Alignment
+*   **Byte Alignment:** When modifying structs, verify that C++ and Go structs match exactly in size and padding.
+*   **Benchmarks:** Run `task run:benchmark` to verify performance regressions.
+*   **Pre-commit:** Always verify your changes with `read_file` or `ls` before submitting.
 
-The memory layout is manually synchronized between C++ and Go. **Any mismatch will cause silent data corruption or crashes.**
+## **General Rules**
 
-**Rules:**
-1.  **Alignment:** Structs are padded to **128 bytes** to prevent false sharing (cache line contention).
-2.  **Padding:** Never remove `_pad` fields without recalculating exact offsets.
-3.  **Types:** `uint64_t` (C++) == `uint64` (Go), `std::atomic<T>` behaves like `atomic` package.
-4.  **Memory Ordering:** Critical state transitions must use `seq_cst`.
-
-#### SlotHeader Layout (Direct Mode)
-*Reference: `include/shm/IPCUtils.h` (C++) and `go/direct.go` (Go)*
-
-| Field | Size (Bytes) | Notes |
-| :--- | :--- | :--- |
-| `pre_pad` | 64 | **Padding to avoid false sharing** |
-| `State` | 4 | Atomic |
-| `HostState` | 4 | Atomic |
-| `GuestState` | 4 | Atomic |
-| `MsgId` | 4 | Sequence ID |
-| `MsgType` | 4 | Command Type |
-| `ReqSize` | 4 | int32 (Negative = End-aligned) |
-| `RespSize` | 4 | int32 (Negative = End-aligned) |
-| `padding` | 36 | **Aligns struct to 128 bytes** |
-
-### 2.2. Synchronization Primitives
-
--   **Hot Path:** Do not use OS Mutexes in the hot loops.
--   **Adaptive Wait:**
-    -   Spin Phase: Check state atomic with `CpuRelax()` / `runtime.Gosched()`.
-    -   Sleep Phase: If spin fails, set `Host/GuestState = WAITING`, double-check, then sleep on OS Event/Semaphore.
-    -   Wakeup: Signal Event/Semaphore only if peer is `WAITING`.
--   **Platform:**
-    -   Use `Platform::SignalEvent` and `Platform::WaitEvent`.
-
----
-
-## 3. Benchmark Guidelines
-
-To ensure consistent and debuggable results:
-
-1.  **Strict Timeout:** All benchmarks must have a strict 60-second timeout. The typical run time is ~1 second. If it takes longer, it is considered a hang/failure.
-2.  **Debug Logging:** The benchmark tool must support an optional verbose mode (e.g., `-v`) that logs progress every 100 operations. This allows identifying the exact point of failure during a hang.
-    *   *Note:* Do not enable this during performance measurement runs as it degrades throughput.
-3.  **Clean Artifacts:** Always delete binary artifacts (`.o`, `.exe`, build directories) after running benchmarks. Do not commit them.
-
----
-
-## 4. Development Guidelines
-
-### 4.1. Code Modifications
--   **Cross-Language Changes:** If you change a header in `include/shm/`, you **MUST** change the corresponding struct in `go/`.
--   **Platform:** Keep `Platform` implementations (Linux/Windows) consistent in behavior.
--   **Feature Parity:** Supported languages (C++ and Go) must achieve functional parity. If a feature is added to the Host (C++), the Guest (Go) must expose the necessary API to interact with it.
-
-### 4.2. Performance
--   **No Logging in Loops:** Never put `fmt.Println` or `std::cout` in the critical path. It invalidates benchmarks.
--   **Allocations:** Minimize Go heap allocations in the hot loop.
-
-### 4.3. Verification
-Before submitting, you must run the benchmarks to ensure no regressions.
-
-```bash
-# Run all benchmarks (Requires CMake and Go)
-task run:benchmark
-```
-
-If the benchmark hangs or produces "ID Mismatch" errors, you have broken the memory layout or synchronization logic.
-
-## 5. Common Pitfalls
-
-1.  **Padding drift:** Adding a field to structs without adjusting padding.
-2.  **Zombie Semaphores (Linux):** If the benchmark crashes, shared memory files (`/dev/shm/*`) may remain. Use `rm /dev/shm/SimpleIPC*` to clean up.
-3.  **SeqCst:** Use `std::memory_order_seq_cst` for `State` transitions to ensure visibility.
-
-## 6. Architectural Standards
-
-### 6.1. Header-Only C++ Library
-The C++ Host library is **header-only**. All source code must reside in `include/shm/`.
--   **Do not** add `.cpp` files to the library core.
--   **Include Path:** Consumers must add the parent `include/` directory to their path and include via `#include <shm/File.h>`.
-
-### 6.2. Direct Exchange Mode
-The project exclusively uses the 'Direct Exchange' model (1:1 Slot Mapping).
--   **Queues/Lanes:** Concepts like "Queues" or "Lanes" are deprecated. Use "Slots".
--   **Guest Call Slots:** Specific slots (indices `NumSlots` to `NumSlots + NumGuestSlots`) are reserved for Guest-initiated calls (Guest->Host).
--   **ZeroCopySlot:** Use `DirectHost::GetZeroCopySlot()` for zero-copy message construction.
-
-### 6.3. Message Typing
--   **MsgId:** Used strictly as a Sequence ID to match Request/Response pairs. Echoed by Guest.
--   **MsgType:** Used to indicate the type/command of the message (e.g., `MSG_TYPE_NORMAL`, `MSG_TYPE_FLATBUFFER`).
--   **App Types:** Application-specific message types must start from `MSG_TYPE_APP_START` (128). The range 0-127 is strictly reserved for internal protocol use.
+*   **Do not** delete this file.
+*   **Do not** create `src/` directory for C++.
+*   **Do not** use Queue-based logic (SPSC/MPSC); strictly use the Direct Exchange (Slot) model defined in `SPECIFICATION.md`.
