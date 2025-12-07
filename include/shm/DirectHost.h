@@ -235,7 +235,9 @@ public:
              if (rSize >= 0) return slot->respBuffer;
 
              // End-aligned: Calculate offset
-             uint32_t absRSize = (uint32_t)(-rSize);
+             uint32_t absRSize = (0u - (uint32_t)rSize);
+             if (absRSize > slot->maxRespSize) absRSize = slot->maxRespSize;
+
              uint32_t offset = slot->maxRespSize - absRSize;
              return slot->respBuffer + offset;
         }
@@ -246,8 +248,13 @@ public:
          */
         int32_t GetRespSize() {
              if (!IsValid()) return 0;
-             int32_t rSize = host->slots[slotIdx].header->respSize;
-             return rSize < 0 ? -rSize : rSize;
+             Slot* slot = &host->slots[slotIdx];
+             int32_t rSize = slot->header->respSize;
+
+             uint32_t absResp = (rSize < 0) ? (0u - (uint32_t)rSize) : (uint32_t)rSize;
+             if (absResp > slot->maxRespSize) absResp = slot->maxRespSize;
+
+             return (int32_t)absResp;
         }
     };
 
