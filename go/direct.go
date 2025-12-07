@@ -5,6 +5,7 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unsafe"
 )
 
@@ -322,9 +323,17 @@ func (g *DirectGuest) SendGuestCall(data []byte, msgType MsgType) ([]byte, error
 			ready = true
 			atomic.StoreUint32(&slot.header.GuestState, GuestStateActive)
 		} else {
-			WaitForEvent(slot.respEvent, 2000) // 2s timeout
-			if atomic.LoadUint32(&slot.header.State) == SlotRespReady {
-				ready = true
+			// Loop to handle spurious wakeups
+			start := time.Now()
+			for {
+				if atomic.LoadUint32(&slot.header.State) == SlotRespReady {
+					ready = true
+					break
+				}
+				WaitForEvent(slot.respEvent, 100)
+				if time.Since(start) > 2*time.Second {
+					break
+				}
 			}
 			atomic.StoreUint32(&slot.header.GuestState, GuestStateActive)
 		}
