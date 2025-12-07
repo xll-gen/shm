@@ -11,7 +11,7 @@ using namespace shm;
 
 int main() {
     DirectHost host;
-    std::string name = "MsgIdTest";
+    std::string name = "MsgSeqTest";
     if (!host.Init(name, 1, 1024)) {
         std::cerr << "Failed to init host" << std::endl;
         return 1;
@@ -32,8 +32,8 @@ int main() {
     uint8_t* slotBase = (uint8_t*)ptr + sizeof(ExchangeHeader);
     SlotHeader* header = (SlotHeader*)slotBase; // Slot 0
 
-    // Set sentinel MsgId
-    header->msgId = 999;
+    // Set sentinel MsgSeq
+    header->msgSeq = 999;
 
     std::atomic<bool> threadRunning{true};
 
@@ -55,15 +55,15 @@ int main() {
         }
     }
 
-    uint32_t msgId = header->msgId;
-    std::cout << "MsgId: " << msgId << std::endl;
+    uint32_t msgSeq = header->msgSeq;
+    std::cout << "MsgSeq: " << msgSeq << std::endl;
 
     bool passed = false;
-    if (msgId == 999) {
-        std::cout << "FAIL: Host did not update msgId!" << std::endl;
+    if (msgSeq == 999) {
+        std::cout << "FAIL: Host did not update msgSeq!" << std::endl;
         passed = false;
     } else {
-        std::cout << "PASS: Host updated msgId to " << msgId << std::endl;
+        std::cout << "PASS: Host updated msgSeq to " << msgSeq << std::endl;
         passed = true;
     }
 

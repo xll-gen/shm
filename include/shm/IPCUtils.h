@@ -106,10 +106,10 @@ struct SlotHeader {
     std::atomic<uint32_t> guestState;
 
     /**
-     * @brief Message Sequence ID.
+     * @brief Message Sequence Number.
      * Unique identifier for the transaction, echoed back by the receiver.
      */
-    uint32_t msgId;
+    uint32_t msgSeq;
 
     /**
      * @brief Message Type (e.g., MSG_TYPE_NORMAL, MSG_TYPE_SHUTDOWN).

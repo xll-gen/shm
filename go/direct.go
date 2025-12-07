@@ -68,7 +68,7 @@ type SlotHeader struct {
 	State     uint32
 	HostState uint32
 	GuestState uint32
-	MsgId     uint32
+	MsgSeq    uint32
     MsgType   MsgType
 	ReqSize   int32
 	RespSize  int32

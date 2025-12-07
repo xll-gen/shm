@@ -35,7 +35,7 @@ void run_mock_guest(std::string shmName, int numSlots) {
 
              if (state == SLOT_REQ_READY) {
                  // Check Msg ID
-                 if (header->msgId == MSG_ID_FLATBUFFER) {
+                 if (header->msgType == MSG_TYPE_FLATBUFFER) {
                      // Verify negative size
                      if (header->reqSize >= 0) {
                          std::cerr << "Guest: Expected negative size for FlatBuffer!" << std::endl;
@@ -58,7 +58,7 @@ void run_mock_guest(std::string shmName, int numSlots) {
                      header->state.store(SLOT_RESP_READY, std::memory_order_release);
                      running = false; // Exit after one success
                      break;
-                 } else if (header->msgId == MSG_ID_SHUTDOWN) {
+                 } else if (header->msgType == MSG_TYPE_SHUTDOWN) {
                      running = false;
                      break;
                  }

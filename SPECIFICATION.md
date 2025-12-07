@@ -59,7 +59,7 @@ The `SlotHeader` controls the state of the transaction. It **must** be aligned t
 | `state` | `atomic<uint32>` | 64 | Current state of the slot (see Section 3.1). |
 | `hostState` | `atomic<uint32>` | 68 | Host activity state (Active/Waiting). |
 | `guestState` | `atomic<uint32>` | 72 | Guest activity state (Active/Waiting). |
-| `msgId` | `uint32` | 76 | Unique Message Sequence ID. |
+| `msgSeq` | `uint32` | 76 | Unique Message Sequence Number. |
 | `msgType` | `uint32` | 80 | Message Type (e.g., Normal, Shutdown). |
 | `reqSize` | `int32` | 84 | Size of Request payload (see Section 3.3). |
 | `respSize` | `int32` | 88 | Size of Response payload (see Section 3.3). |
@@ -108,7 +108,7 @@ The `reqSize` and `respSize` fields indicate the location of the data within the
 ### 3.4. Host-to-Guest Flow
 
 1.  **Claim:** Host finds a slot in state `SLOT_FREE` and atomically sets it to `SLOT_BUSY`.
-2.  **Write:** Host writes data to the Request Buffer and sets `reqSize`, `msgId`, and `msgType`.
+2.  **Write:** Host writes data to the Request Buffer and sets `reqSize`, `msgSeq`, and `msgType`.
 3.  **Signal:** Host atomically sets state to `SLOT_REQ_READY` and signals the Guest (via Event/Semaphore).
 4.  **Process:** Guest wakes up, reads the Request, processes it, and writes to the Response Buffer.
 5.  **Reply:** Guest sets `respSize`, updates state to `SLOT_RESP_READY`, and signals the Host.
