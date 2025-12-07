@@ -56,12 +56,12 @@ public:
      * @brief Initializes the IPC Host.
      *
      * @param name Shared memory name.
-     * @param numQueues Number of slots.
+     * @param numSlots Number of slots.
      * @return true on success.
      */
-    bool Init(const std::string& name, uint32_t numQueues) {
+    bool Init(const std::string& name, uint32_t numSlots) {
         // DirectHost Init does not take a handler in this version.
-        return impl.Init(name, numQueues);
+        return impl.Init(name, numSlots);
     }
 
     /**
