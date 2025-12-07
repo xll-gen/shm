@@ -489,22 +489,6 @@ func (g *DirectGuest) workerLoop(idx int, handler func([]byte, []byte, MsgType) 
                  }
 
                  respSize, respType := handler(reqData, slot.respBuffer, msgType)
-
-                 // Handle Zero-Copy Response (End-Aligned)
-                 // If handler returns negative size, it implies it wrote to the start of the buffer
-                 // but expects it to be at the end. We move it.
-                 if respSize < 0 {
-                     rLen := -respSize
-                     if int(rLen) > len(slot.respBuffer) {
-                         rLen = int32(len(slot.respBuffer))
-                         respSize = -rLen
-                     }
-                     // Move data from Start to End
-                     // copy handles overlapping slices correctly
-                     offset := int(len(slot.respBuffer)) - int(rLen)
-                     copy(slot.respBuffer[offset:], slot.respBuffer[:rLen])
-                 }
-
                  header.RespSize = respSize
                  header.MsgType = respType
              }
