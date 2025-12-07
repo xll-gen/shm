@@ -689,6 +689,22 @@ public:
                     respSize = handler(reqData, absReqSize, slot->respBuffer, slot->header->msgType);
                 }
 
+                // Handle Zero-Copy Response (End-Aligned)
+                // If handler returns negative size, it implies it wrote to the buffer but expects it to be at the end.
+                // Since handler receives pointer to Start, we must move it to End.
+                if (respSize < 0) {
+                    int32_t absRespSize = -respSize;
+                    if ((uint32_t)absRespSize > slot->maxRespSize) {
+                        absRespSize = (int32_t)slot->maxRespSize;
+                        respSize = -absRespSize; // Clamp
+                    }
+
+                    uint32_t offset = slot->maxRespSize - absRespSize;
+                    // Move data from Start to End
+                    // We use memmove to handle potential overlap (though unlikely if small)
+                    memmove(slot->respBuffer + offset, slot->respBuffer, absRespSize);
+                }
+
                 // Write Response Metadata
                 slot->header->respSize = respSize;
 
