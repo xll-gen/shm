@@ -347,8 +347,14 @@ func (g *DirectGuest) SendGuestCall(data []byte, msgType MsgType) ([]byte, error
 		respData = make([]byte, respSize)
 		copy(respData, slot.respBuffer[:respSize])
 	} else {
-		// End aligned support could be added here
-		respData = make([]byte, 0)
+		// Negative size means data is at the end
+		rLen := -respSize
+		if int(rLen) > len(slot.respBuffer) {
+			rLen = int32(len(slot.respBuffer))
+		}
+		offset := int32(len(slot.respBuffer)) - rLen
+		respData = make([]byte, rLen)
+		copy(respData, slot.respBuffer[offset:])
 	}
 
 	// Release Slot
