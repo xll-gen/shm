@@ -20,21 +20,23 @@ SimpleIPC is a high-performance, low-latency shared-memory IPC library connectin
 
 The project's "Direct Exchange" IPC mode significantly outperforms traditional methods, showcasing sub-microsecond latency and high throughput. This is achieved through a 1:1 thread-to-slot mapping, zero-copy operations, and adaptive hybrid waiting.
 
-On an AMD Ryzen 9 3900x system (Bare-metal), the benchmark demonstrated:
+**Sandbox Environment (Containerized):**
 *   **1 Thread**:
-    *   **Throughput**: 1,736,783.51 ops/s
-    *   **Avg Latency (RTT)**: 0.575 us
+    *   **Throughput**: 1,899,812 ops/s
+    *   **Avg Latency (RTT)**: 0.53 us
 *   **4 Threads**:
-    *   **Throughput**: 1,931,987.29 ops/s
-    *   **Avg Latency (RTT)**: 0.517 us
+    *   **Throughput**: 2,731,300 ops/s
+    *   **Avg Latency (RTT)**: 1.46 us
 *   **8 Threads**:
-    *   **Throughput**: 1,323,987.09 ops/s
-    *   **Avg Latency (RTT)**: 0.755 us
-*   **12 Threads**:
-    *   **Throughput**: 1,325,149.50 ops/s
-    *   **Avg Latency (RTT)**: 0.754 us
+    *   **Throughput**: 2,031,359 ops/s
+    *   **Avg Latency (RTT)**: 3.94 us
 
-For detailed benchmark results and methodology, including Sandbox (Containerized) results, please refer to [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md).
+**AMD Ryzen 9 3900x (Bare-metal):**
+*   **1 Thread**: 1.74M ops/s (0.58 us)
+*   **4 Threads**: 1.93M ops/s (0.52 us)
+*   **8 Threads**: 1.32M ops/s (0.76 us)
+
+For detailed benchmark results, methodology, and Guest Call scenarios, please refer to [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md).
 
 ## Architecture
 

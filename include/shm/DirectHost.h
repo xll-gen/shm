@@ -314,7 +314,7 @@ public:
      * Also creates the necessary synchronization events for each slot.
      *
      * @param shmName The name of the shared memory region.
-     * @param numQueues The number of slots (workers) to allocate.
+     * @param numHostSlots The number of slots (workers) to allocate.
      * @param dataSize The total size of the data payload per slot (split between Req/Resp). Default 1MB.
      * @return true if initialization succeeded, false otherwise.
      */
