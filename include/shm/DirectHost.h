@@ -199,6 +199,35 @@ public:
         }
 
         /**
+         * @brief Sends a request using the zero-copy buffer.
+         *
+         * Allows sending arbitrary message types with control over alignment.
+         *
+         * @param size Size of the data. Positive: Start-aligned. Negative: End-aligned.
+         * @param msgType The message Type.
+         */
+        void Send(int32_t size, uint32_t msgType) {
+            if (!IsValid()) return;
+
+            Slot* slot = &host->slots[slotIdx];
+
+            // Bounds check
+            int32_t absSize = size < 0 ? -size : size;
+            if ((uint32_t)absSize > slot->maxReqSize) {
+                absSize = (int32_t)slot->maxReqSize;
+                size = size < 0 ? -absSize : absSize;
+            }
+
+            slot->header->reqSize = size;
+            slot->header->msgType = msgType;
+            slot->header->msgSeq = slot->msgSeq;
+            slot->msgSeq += host->msgSeqStride;
+
+            host->WaitResponse(slot);
+            // Do NOT release slot here. User might want to read response.
+        }
+
+        /**
          * @brief Sends the FlatBuffer request.
          *
          * This method:
