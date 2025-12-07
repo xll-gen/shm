@@ -44,6 +44,7 @@ class DirectHost {
         uint32_t maxReqSize;
         uint32_t maxRespSize;
         int spinLimit;
+        uint32_t msgSeq;
     };
 
     std::vector<Slot> slots;
@@ -215,6 +216,7 @@ public:
             // Zero-Copy convention: Negative size
             slot->header->reqSize = -absSize;
             slot->header->msgType = MSG_TYPE_FLATBUFFER;
+            slot->header->msgId = slot->msgSeq++;
 
             host->WaitResponse(slot);
             // Do NOT release slot here. User might want to read response.
@@ -336,6 +338,7 @@ public:
             slots[i].maxReqSize = halfSize;
             slots[i].maxRespSize = slotSize - respOffset;
             slots[i].spinLimit = 5000;
+            slots[i].msgSeq = 1;
 
             // Events
             std::string reqName = shmName + "_slot_" + std::to_string(i);
@@ -518,6 +521,7 @@ public:
 
         slot->header->reqSize = size;
         slot->header->msgType = msgType;
+        slot->header->msgId = slot->msgSeq++;
 
         // Perform Signal and Wait
         bool ready = WaitResponse(slot);
