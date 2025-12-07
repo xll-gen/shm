@@ -33,6 +33,13 @@ class DirectHost {
     bool running;
 
     /**
+     * @brief Stride for Message Sequence generation.
+     * Used to ensure global uniqueness of msgSeq without atomic contention.
+     * msgSeq = (previous_seq) + msgSeqStride.
+     */
+    uint32_t msgSeqStride;
+
+    /**
      * @brief Internal representation of a Slot.
      */
     struct Slot {
@@ -216,7 +223,8 @@ public:
             // Zero-Copy convention: Negative size
             slot->header->reqSize = -absSize;
             slot->header->msgType = MSG_TYPE_FLATBUFFER;
-            slot->header->msgSeq = slot->msgSeq++;
+            slot->header->msgSeq = slot->msgSeq;
+            slot->msgSeq += host->msgSeqStride;
 
             host->WaitResponse(slot);
             // Do NOT release slot here. User might want to read response.
@@ -263,7 +271,7 @@ public:
     /**
      * @brief Default constructor.
      */
-    DirectHost() : shmBase(nullptr), hMapFile(0), running(false) {}
+    DirectHost() : shmBase(nullptr), hMapFile(0), running(false), msgSeqStride(0) {}
 
     /**
      * @brief Destructor. Ensures Shutdown is called.
@@ -286,6 +294,12 @@ public:
         this->numSlots = numHostSlots; // Host -> Guest slots
         this->numGuestSlots = numGuestSlots; // Guest -> Host slots
         this->slotSize = dataSize;
+
+        // Calculate Stride for Global Uniqueness (Interleaved)
+        // stride = Total Slots.
+        // Slot 0: 1, 1+T, 1+2T
+        // Slot 1: 2, 2+T, 2+2T
+        this->msgSeqStride = numSlots + numGuestSlots;
 
         // Split strategy: 50/50
         uint32_t halfSize = slotSize / 2;
@@ -338,7 +352,9 @@ public:
             slots[i].maxReqSize = halfSize;
             slots[i].maxRespSize = slotSize - respOffset;
             slots[i].spinLimit = 5000;
-            slots[i].msgSeq = 1;
+
+            // Initial msgSeq = Index + 1
+            slots[i].msgSeq = i + 1;
 
             // Events
             std::string reqName = shmName + "_slot_" + std::to_string(i);
@@ -521,7 +537,8 @@ public:
 
         slot->header->reqSize = size;
         slot->header->msgType = msgType;
-        slot->header->msgSeq = slot->msgSeq++;
+        slot->header->msgSeq = slot->msgSeq;
+        slot->msgSeq += msgSeqStride;
 
         // Perform Signal and Wait
         bool ready = WaitResponse(slot);
