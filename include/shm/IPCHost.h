@@ -110,7 +110,7 @@ public:
         }
 
         std::vector<uint8_t> rawResp;
-        if (impl.Send(sendBuf.data(), (uint32_t)totalSize, MSG_ID_NORMAL, rawResp) < 0) {
+        if (impl.Send(sendBuf.data(), (uint32_t)totalSize, MSG_TYPE_NORMAL, rawResp) < 0) {
              // Failed to send
              Shard& shard = shards[reqId % SHARD_COUNT];
              std::lock_guard<std::mutex> lock(shard.mutex);
@@ -148,7 +148,7 @@ public:
     bool SendHeartbeat() {
         // DirectHost is synchronous, so we just check return value.
         std::vector<uint8_t> dummy;
-        int res = impl.Send(nullptr, 0, MSG_ID_HEARTBEAT_REQ, dummy);
+        int res = impl.Send(nullptr, 0, MSG_TYPE_HEARTBEAT_REQ, dummy);
         return res >= 0;
     }
 
@@ -157,7 +157,7 @@ public:
      */
     void SendShutdown() {
         std::vector<uint8_t> dummy;
-        impl.Send(nullptr, 0, MSG_ID_SHUTDOWN, dummy);
+        impl.Send(nullptr, 0, MSG_TYPE_SHUTDOWN, dummy);
     }
 
 private:
