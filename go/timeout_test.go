@@ -58,12 +58,9 @@ func TestGuestCallTimeoutConfig(t *testing.T) {
     }
     defer guest.Close()
 
-    // Set short timeout (e.g., 500ms)
-    timeout := 500 * time.Millisecond
-    guest.SetTimeout(timeout)
-
+    // Use per-call timeout
     start := time.Now()
-    _, err = guest.SendGuestCall([]byte("Test"), MsgTypeGuestCall)
+    _, err = guest.SendGuestCallWithTimeout([]byte("Test"), MsgTypeGuestCall, 500*time.Millisecond)
     duration := time.Since(start)
 
     if err == nil {

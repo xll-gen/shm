@@ -73,6 +73,11 @@ func (c *Client) SendGuestCall(data []byte, msgType MsgType) ([]byte, error) {
 	return c.guest.SendGuestCall(data, msgType)
 }
 
+// SendGuestCallWithTimeout sends a message to the Host (Guest Call) with a custom timeout.
+func (c *Client) SendGuestCallWithTimeout(data []byte, msgType MsgType, timeout time.Duration) ([]byte, error) {
+	return c.guest.SendGuestCallWithTimeout(data, msgType, timeout)
+}
+
 // Close releases all resources associated with the client.
 // It closes shared memory handles and event handles.
 func (c *Client) Close() {

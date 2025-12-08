@@ -267,6 +267,15 @@ func (g *DirectGuest) SetTimeout(d time.Duration) {
 // SendGuestCall sends a request to the Host using a Guest Slot.
 // It blocks until a response is received or a timeout occurs.
 func (g *DirectGuest) SendGuestCall(data []byte, msgType MsgType) ([]byte, error) {
+	return g.sendGuestCallInternal(data, msgType, g.responseTimeout)
+}
+
+// SendGuestCallWithTimeout sends a request to the Host using a Guest Slot with a custom timeout.
+func (g *DirectGuest) SendGuestCallWithTimeout(data []byte, msgType MsgType, timeout time.Duration) ([]byte, error) {
+	return g.sendGuestCallInternal(data, msgType, timeout)
+}
+
+func (g *DirectGuest) sendGuestCallInternal(data []byte, msgType MsgType, timeout time.Duration) ([]byte, error) {
 	if g.numGuestSlots == 0 {
 		return nil, fmt.Errorf("no guest slots available")
 	}
@@ -339,7 +348,7 @@ func (g *DirectGuest) SendGuestCall(data []byte, msgType MsgType) ([]byte, error
 					break
 				}
 				WaitForEvent(slot.respEvent, 100)
-				if time.Since(start) > g.responseTimeout {
+				if time.Since(start) > timeout {
 					break
 				}
 			}

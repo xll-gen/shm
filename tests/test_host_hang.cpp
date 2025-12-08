@@ -37,18 +37,18 @@ int main() {
         return 1;
     }
 
-    // Set timeout to 2 seconds for test (default will be 10s)
-    host.SetTimeout(2000);
-    std::cout << "Timeout set to 2000ms" << std::endl;
+    // Do NOT set global timeout (it is 10s default)
+    // host.SetTimeout(2000);
 
     // Prepare message
     std::vector<uint8_t> resp;
     std::vector<uint8_t> data(10, 0);
 
-    std::cout << "Host sending... (Should timeout in ~2s)" << std::endl;
+    std::cout << "Host sending with 2000ms timeout... (Should timeout in ~2s)" << std::endl;
 
     auto start = std::chrono::steady_clock::now();
-    int result = host.Send(data.data(), 10, MSG_TYPE_NORMAL, resp);
+    // Pass 2000ms as per-call timeout
+    int result = host.Send(data.data(), 10, MSG_TYPE_NORMAL, resp, 2000);
     auto end = std::chrono::steady_clock::now();
 
     std::cout << "Host returned: " << result << std::endl;
