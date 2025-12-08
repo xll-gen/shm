@@ -66,6 +66,7 @@ class DirectHost {
      * @brief Internal helper to wait for a response on a specific slot.
      * Contains the adaptive spin/yield/wait logic.
      * @param slot Pointer to the slot to wait on.
+     * @param timeoutMs Timeout in milliseconds.
      * @return true if response is ready, false if error/timeout.
      */
     bool WaitResponse(Slot* slot, uint32_t timeoutMs) {
@@ -348,8 +349,9 @@ public:
      * Also creates the necessary synchronization events for each slot.
      *
      * @param shmName The name of the shared memory region.
-     * @param numHostSlots The number of slots (workers) to allocate.
+     * @param numHostSlots The number of slots (workers) to allocate for Host-to-Guest communication.
      * @param dataSize The total size of the data payload per slot (split between Req/Resp). Default 1MB.
+     * @param numGuestSlots The number of slots to allocate for Guest-to-Host calls. Default 0.
      * @return true if initialization succeeded, false otherwise.
      */
     bool Init(const std::string& shmName, uint32_t numHostSlots, uint32_t dataSize = 1024 * 1024, uint32_t numGuestSlots = 0) {
