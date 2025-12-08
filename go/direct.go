@@ -365,10 +365,22 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, msgType MsgType, timeou
 					ready = true
 					break
 				}
-				WaitForEvent(slot.respEvent, 100)
-				if time.Since(start) > timeout {
+
+				elapsed := time.Since(start)
+				if elapsed >= timeout {
 					break
 				}
+
+				remaining := timeout - elapsed
+				waitMs := uint32(remaining.Milliseconds())
+				if waitMs == 0 && remaining > 0 {
+					waitMs = 1
+				}
+				if waitMs > 100 {
+					waitMs = 100
+				}
+
+				WaitForEvent(slot.respEvent, waitMs)
 			}
 			atomic.StoreUint32(&slot.header.GuestState, GuestStateActive)
 		}
