@@ -109,6 +109,7 @@ type DirectGuest struct {
 	slotSize      uint32
 	reqOffset     uint32
 	respOffset    uint32
+	responseTimeout time.Duration
 
 	slots []slotContext
 	wg    sync.WaitGroup
@@ -177,6 +178,7 @@ func NewDirectGuest(name string, _ int, _ int) (*DirectGuest, error) {
 		slotSize:      slotSize,
 		reqOffset:     reqOffset,
 		respOffset:    respOffset,
+		responseTimeout: 10 * time.Second,
 		slots:         make([]slotContext, totalSlots),
 	}
 
@@ -256,9 +258,24 @@ func (g *DirectGuest) Wait() {
     g.wg.Wait()
 }
 
+// SetTimeout sets the timeout for waiting for a response.
+// Default is 10 seconds.
+func (g *DirectGuest) SetTimeout(d time.Duration) {
+	g.responseTimeout = d
+}
+
 // SendGuestCall sends a request to the Host using a Guest Slot.
 // It blocks until a response is received or a timeout occurs.
 func (g *DirectGuest) SendGuestCall(data []byte, msgType MsgType) ([]byte, error) {
+	return g.sendGuestCallInternal(data, msgType, g.responseTimeout)
+}
+
+// SendGuestCallWithTimeout sends a request to the Host using a Guest Slot with a custom timeout.
+func (g *DirectGuest) SendGuestCallWithTimeout(data []byte, msgType MsgType, timeout time.Duration) ([]byte, error) {
+	return g.sendGuestCallInternal(data, msgType, timeout)
+}
+
+func (g *DirectGuest) sendGuestCallInternal(data []byte, msgType MsgType, timeout time.Duration) ([]byte, error) {
 	if g.numGuestSlots == 0 {
 		return nil, fmt.Errorf("no guest slots available")
 	}
@@ -331,7 +348,7 @@ func (g *DirectGuest) SendGuestCall(data []byte, msgType MsgType) ([]byte, error
 					break
 				}
 				WaitForEvent(slot.respEvent, 100)
-				if time.Since(start) > 2*time.Second {
+				if time.Since(start) > timeout {
 					break
 				}
 			}

@@ -200,6 +200,18 @@ while (running) {
 resp, err := client.SendGuestCall([]byte("AsyncData"), shm.MsgTypeGuestCall)
 ```
 
+### Handling Long-Running Operations (Async Call Pattern)
+
+The default timeout for operations is 10 seconds. For operations that may exceed this duration, or for asynchronous workflows, do **not** block the IPC channel. Instead, use the following pattern:
+
+1.  **Host** sends a Request (e.g., `START_LONG_JOB`).
+2.  **Guest** receives the request, starts the job in a background goroutine, and **immediately** returns an acknowledgement (Ack).
+3.  **Host** receives the Ack and is free to process other tasks.
+4.  When the job completes, the **Guest** sends the result back to the Host using a **Guest Call** (`SendGuestCall`).
+5.  **Host** processes the result via `ProcessGuestCalls`.
+
+This ensures the 1:1 slot mapping remains available for high-frequency messages and prevents timeouts.
+
 ## Building
 
 ### Requirements

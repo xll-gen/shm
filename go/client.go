@@ -63,9 +63,19 @@ func (c *Client) Wait() {
 	c.guest.Wait()
 }
 
+// SetTimeout sets the timeout for waiting for a response (Guest Call).
+func (c *Client) SetTimeout(d time.Duration) {
+	c.guest.SetTimeout(d)
+}
+
 // SendGuestCall sends a message to the Host (Guest Call).
 func (c *Client) SendGuestCall(data []byte, msgType MsgType) ([]byte, error) {
 	return c.guest.SendGuestCall(data, msgType)
+}
+
+// SendGuestCallWithTimeout sends a message to the Host (Guest Call) with a custom timeout.
+func (c *Client) SendGuestCallWithTimeout(data []byte, msgType MsgType, timeout time.Duration) ([]byte, error) {
+	return c.guest.SendGuestCallWithTimeout(data, msgType, timeout)
 }
 
 // Close releases all resources associated with the client.
