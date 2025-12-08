@@ -64,6 +64,7 @@ public:
      * @param h The event handle.
      */
     static void SignalEvent(EventHandle h) {
+        if (!h) return;
 #ifdef _WIN32
         SetEvent(h);
 #else
@@ -78,6 +79,7 @@ public:
      * @param timeoutMs Timeout in milliseconds. Default 0xFFFFFFFF (Infinite).
      */
     static void WaitEvent(EventHandle h, uint32_t timeoutMs = 0xFFFFFFFF) {
+        if (!h) return;
 #ifdef _WIN32
         WaitForSingleObject(h, timeoutMs);
 #else
@@ -103,6 +105,7 @@ public:
      * @param h The event handle.
      */
     static void CloseEvent(EventHandle h) {
+        if (!h) return;
 #ifdef _WIN32
         CloseHandle(h);
 #else
