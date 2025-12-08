@@ -734,16 +734,11 @@ public:
                     respSize = handler(reqData, absReqSize, slot->respBuffer, slot->header->msgType);
                 }
 
-                // Handle Zero-Copy Response (End-Aligned)
-                // If handler returns negative size, it implies it wrote to the buffer but expects it to be at the end.
-                // However, the handler wrote to the start. To avoid expensive memmove, we simply treat it as Start-Aligned
-                // by flipping the size to positive. The client will read from the start.
-                if (respSize < 0) {
-                    int32_t absRespSize = -respSize;
-                    if ((uint32_t)absRespSize > slot->maxRespSize) {
-                        absRespSize = (int32_t)slot->maxRespSize;
-                    }
-                    respSize = absRespSize; // Flip to positive
+                // Validate Response Size
+                int32_t absRespSize = respSize < 0 ? -respSize : respSize;
+                if ((uint32_t)absRespSize > slot->maxRespSize) {
+                    absRespSize = (int32_t)slot->maxRespSize;
+                    respSize = respSize < 0 ? -absRespSize : absRespSize;
                 }
 
                 // Write Response Metadata
