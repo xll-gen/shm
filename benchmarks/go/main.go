@@ -7,8 +7,10 @@ package main
 import (
 	"flag"
 	"fmt"
+	"log"
 	"os"
 	"os/signal"
+	"runtime/pprof"
 	"syscall"
 
 	"github.com/xll-gen/shm/go"
@@ -17,13 +19,23 @@ import (
 var (
 	// workers defines the number of worker goroutines to spawn.
 	// In Direct Mode, this should match the number of Host slots.
-	workers   = flag.Int("w", 1, "Number of workers")
-	guestCall = flag.Bool("guest-call", false, "Enable guest call scenario")
+	workers    = flag.Int("w", 1, "Number of workers")
+	guestCall  = flag.Bool("guest-call", false, "Enable guest call scenario")
+	cpuProfile = flag.String("cpuprofile", "", "Write cpu profile to file")
 )
 
 // main is the entry point for the Go Benchmark Guest.
 func main() {
 	flag.Parse()
+
+	if *cpuProfile != "" {
+		f, err := os.Create(*cpuProfile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		pprof.StartCPUProfile(f)
+		defer pprof.StopCPUProfile()
+	}
 
 	// runtime.GOMAXPROCS(*workers + 2) // +2 for runtime/gc
 
@@ -66,6 +78,10 @@ func main() {
 		<-c
 		fmt.Println("\nShutting down...")
 		client.Close()
+		// Ensure pprof is stopped before exit if defer doesn't run (os.Exit skips defers)
+		if *cpuProfile != "" {
+			pprof.StopCPUProfile()
+		}
 		os.Exit(0)
 	}()
 
