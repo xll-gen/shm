@@ -168,8 +168,7 @@ public:
      * Guest workers are expected to exit their loops upon receiving this.
      */
     void SendShutdown() {
-        std::vector<uint8_t> dummy;
-        impl.Send(nullptr, 0, MSG_TYPE_SHUTDOWN, dummy);
+        impl.SendShutdown();
     }
 
 private:
