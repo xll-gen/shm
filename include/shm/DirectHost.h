@@ -718,11 +718,11 @@ public:
      * This method is intended to be called in a loop by a background thread.
      *
      * @param handler A function to process the request.
-     *                Args: reqData, respBuffer, msgType.
+     *                Args: reqData, reqSize, respBuffer, maxRespSize, msgType.
      *                Returns: respSize.
      * @return int Number of requests processed.
      */
-    int ProcessGuestCalls(std::function<int32_t(const uint8_t*, int32_t, uint8_t*, uint32_t)> handler) {
+    int ProcessGuestCalls(std::function<int32_t(const uint8_t*, int32_t, uint8_t*, uint32_t, uint32_t)> handler) {
         if (!running) return 0;
         int processed = 0;
 
@@ -757,7 +757,7 @@ public:
                 // Invoke Handler
                 int32_t respSize = 0;
                 if (handler) {
-                    respSize = handler(reqData, absReqSize, slot->respBuffer, slot->header->msgType);
+                    respSize = handler(reqData, absReqSize, slot->respBuffer, slot->maxRespSize, slot->header->msgType);
                 }
 
                 // Validate Response Size

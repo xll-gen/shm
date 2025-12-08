@@ -8,6 +8,9 @@
 - **Zero-Copy Support for Guest Calls**: Guest can send FlatBuffers end-aligned.
 - **Listener API**: `DirectHost::ProcessGuestCalls` for polling Guest requests.
 
+### API Changes
+- Updated `DirectHost::ProcessGuestCalls` handler signature to include `maxRespSize`, enabling safe end-aligned writes for Zero-Copy workflows.
+
 ## [v0.1.0] - 2025-12-05
 
 First stable release of the Shared Memory IPC library.
