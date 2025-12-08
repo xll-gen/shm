@@ -11,7 +11,7 @@
 using namespace shm;
 
 int main() {
-    std::string shmName = "ReproBugSHM";
+    std::string shmName = "TestGuestCallNegativeResp";
     DirectHost host;
     // 1 Host Slot, 1 Guest Slot. Slot Size 1024.
     if (!host.Init(shmName, 1, 1024, 1)) {
@@ -24,8 +24,6 @@ int main() {
     bool exists = false;
     // Total size calculation: Header + (SlotHeader + SlotSize) * 2
     // 64 + (128 + 1024) * 2 = 64 + 1152 * 2 = 64 + 2304 = 2368
-    // We can just open with a large enough size or read the header first.
-    // Let's just open 4096.
     void* shmBase = Platform::CreateNamedShm(shmName.c_str(), 4096, hMapFile, exists);
     if (!shmBase) {
         std::cerr << "Guest failed to attach" << std::endl;
@@ -39,8 +37,8 @@ int main() {
     uint32_t respOffset = ex->respOffset; // 512 (approx)
 
     // Guest Slot is at index 1 (numSlots)
-    size_t exchangeHeaderSize = sizeof(ExchangeHeader); // 64
-    size_t perSlotTotal = sizeof(SlotHeader) + slotSize; // 128 + 1024 = 1152
+    size_t exchangeHeaderSize = sizeof(ExchangeHeader);
+    size_t perSlotTotal = sizeof(SlotHeader) + slotSize;
 
     uint8_t* ptr = (uint8_t*)shmBase + exchangeHeaderSize + (perSlotTotal * numSlots);
     SlotHeader* guestSlotHeader = (SlotHeader*)ptr;
@@ -57,14 +55,14 @@ int main() {
     guestSlotHeader->state.store(SLOT_REQ_READY, std::memory_order_seq_cst);
 
     // Host processes in background thread or loop.
-    // We can just run ProcessGuestCalls once since we set the state.
-
-    // Handler tries to return negative size (End Aligned)
-    // It writes "DONE" to the START of the response buffer (because that's what it gets).
-    // And returns -4.
+    // Handler writes to END of buffer (simulating zero-copy flatbuffer) and returns negative.
     host.ProcessGuestCalls([&](const uint8_t* req, int32_t reqSize, uint8_t* resp, uint32_t msgType) -> int32_t {
-        memcpy(resp, "DONE", 4);
-        return -4;
+        // Write "DONE" to end.
+        const char* response = "DONE";
+        int len = 4;
+        // We know maxRespSize is 512.
+        memcpy(resp + 512 - len, response, len);
+        return -len;
     });
 
     // Guest waits for response
@@ -83,20 +81,24 @@ int main() {
     }
 
     int32_t respSize = guestSlotHeader->respSize;
-    if (respSize != 4) {
-        std::cerr << "Expected respSize 4 (Start Aligned), got " << respSize << std::endl;
+    // We expect negative size now!
+    if (respSize != -4) {
+        std::cerr << "Expected respSize -4 (End Aligned), got " << respSize << std::endl;
         host.Shutdown();
         Platform::CloseShm(hMapFile, shmBase, 4096);
         return 1;
     }
 
-    // Guest reads from START (Host flipped sign to avoid memmove)
-    char* dataAtStart = (char*)guestRespBuf;
+    // Guest reads from END
+    int32_t absSize = -respSize;
+    uint32_t offset = maxRespSize - absSize;
+    char* dataAtEnd = (char*)guestRespBuf + offset;
 
-    // We don't print logic here, just check.
     bool success = false;
-    if (strncmp(dataAtStart, "DONE", 4) == 0) {
+    if (strncmp(dataAtEnd, "DONE", 4) == 0) {
         success = true;
+    } else {
+        std::cerr << "Data mismatch at end. Got: " << std::string(dataAtEnd, 4) << std::endl;
     }
 
     host.Shutdown();
