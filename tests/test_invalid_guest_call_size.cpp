@@ -45,7 +45,7 @@ int main() {
 
     bool handlerCalled = false;
     // New Signature
-    host.ProcessGuestCalls([&](const uint8_t* req, int32_t reqSize, uint8_t* resp, uint32_t msgType) -> int32_t {
+    host.ProcessGuestCalls([&](const uint8_t* req, int32_t reqSize, uint8_t* resp, uint32_t maxRespSize, uint32_t msgType) -> int32_t {
         handlerCalled = true;
         std::cout << "Handler called with size: " << reqSize << std::endl;
         return 0;
