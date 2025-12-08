@@ -49,7 +49,7 @@ func (c *Client) Handle(h func(req []byte, respBuf []byte, msgType MsgType) (int
 
 // Start initiates the worker routines.
 // This method spawns goroutines and returns immediately.
-// Panic if Handler is not set.
+// It panics if the Handler is not set.
 func (c *Client) Start() {
 	if c.handler == nil {
 		panic("Handler not set")
@@ -64,22 +64,37 @@ func (c *Client) Wait() {
 }
 
 // SetTimeout sets the timeout for waiting for a response (Guest Call).
+//
+// d: The timeout duration.
 func (c *Client) SetTimeout(d time.Duration) {
 	c.guest.SetTimeout(d)
 }
 
 // SendGuestCall sends a message to the Host (Guest Call).
+// It uses the default timeout configured via SetTimeout (default 10s).
+//
+// data: The payload to send.
+// msgType: The message type.
+//
+// Returns the response payload or an error.
 func (c *Client) SendGuestCall(data []byte, msgType MsgType) ([]byte, error) {
 	return c.guest.SendGuestCall(data, msgType)
 }
 
 // SendGuestCallWithTimeout sends a message to the Host (Guest Call) with a custom timeout.
+//
+// data: The payload to send.
+// msgType: The message type.
+// timeout: The custom timeout duration.
+//
+// Returns the response payload or an error.
 func (c *Client) SendGuestCallWithTimeout(data []byte, msgType MsgType, timeout time.Duration) ([]byte, error) {
 	return c.guest.SendGuestCallWithTimeout(data, msgType, timeout)
 }
 
 // Close releases all resources associated with the client.
 // It closes shared memory handles and event handles.
+// Note: This does not stop background workers if they are blocked on OS events.
 func (c *Client) Close() {
 	c.guest.Close()
 }

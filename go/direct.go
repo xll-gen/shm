@@ -118,9 +118,10 @@ type DirectGuest struct {
 // NewDirectGuest initializes the DirectGuest by attaching to an existing shared memory region.
 //
 // name: The name of the shared memory region.
-// unused1, unused2: Parameters maintained for legacy interface compatibility (ignored).
+// unused1: Ignored parameter (legacy compatibility).
+// unused2: Ignored parameter (legacy compatibility).
 //
-// Returns a DirectGuest instance or an error.
+// Returns a pointer to the initialized DirectGuest or an error if attachment fails.
 func NewDirectGuest(name string, _ int, _ int) (*DirectGuest, error) {
 	// 1. Map Header
 	// We try to map a small chunk first to read the header.
@@ -218,8 +219,10 @@ func NewDirectGuest(name string, _ int, _ int) (*DirectGuest, error) {
 }
 
 // Start launches the worker goroutines.
+// It spawns one goroutine per slot to handle incoming requests from the Host.
 //
-// handler: The function to process requests.
+// handler: The function to process requests. It receives the request buffer, response buffer, and message type.
+//          It must return the response size (negative for end-aligned) and response message type.
 func (g *DirectGuest) Start(handler func(req []byte, resp []byte, msgType MsgType) (int32, MsgType)) {
 	for i := 0; i < int(g.numSlots); i++ {
 		g.wg.Add(1)
@@ -227,7 +230,9 @@ func (g *DirectGuest) Start(handler func(req []byte, resp []byte, msgType MsgTyp
 	}
 }
 
-// Close releases resources.
+// Close releases shared memory resources.
+// It closes the shared memory handle but intentionally does not unmap memory immediately
+// if it might cause a crash in active worker threads (implementation specific).
 func (g *DirectGuest) Close() {
     // Since we cannot safely interrupt the worker loops (blocked in CGO/sem_wait) without Host cooperation,
     // and this architecture is designed for 1:1 process mapping usually,
@@ -253,24 +258,37 @@ func (g *DirectGuest) Close() {
     // This fixes the "Crash on Close" by NOT closing/unmapping active resources.
 }
 
-// Wait blocks until all workers finish.
+// Wait blocks the calling thread until all worker goroutines have exited.
+// Workers usually exit when the Host sends a Shutdown signal.
 func (g *DirectGuest) Wait() {
     g.wg.Wait()
 }
 
-// SetTimeout sets the timeout for waiting for a response.
-// Default is 10 seconds.
+// SetTimeout sets the default timeout for Guest Call responses.
+//
+// d: The timeout duration. Default is 10 seconds.
 func (g *DirectGuest) SetTimeout(d time.Duration) {
 	g.responseTimeout = d
 }
 
 // SendGuestCall sends a request to the Host using a Guest Slot.
-// It blocks until a response is received or a timeout occurs.
+// It blocks until a response is received or the default timeout occurs.
+//
+// data: The payload to send to the Host.
+// msgType: The message type identifier.
+//
+// Returns the response payload or an error if the call fails or times out.
 func (g *DirectGuest) SendGuestCall(data []byte, msgType MsgType) ([]byte, error) {
 	return g.sendGuestCallInternal(data, msgType, g.responseTimeout)
 }
 
 // SendGuestCallWithTimeout sends a request to the Host using a Guest Slot with a custom timeout.
+//
+// data: The payload to send.
+// msgType: The message type identifier.
+// timeout: The custom duration to wait for a response.
+//
+// Returns the response payload or an error.
 func (g *DirectGuest) SendGuestCallWithTimeout(data []byte, msgType MsgType, timeout time.Duration) ([]byte, error) {
 	return g.sendGuestCallInternal(data, msgType, timeout)
 }

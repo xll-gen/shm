@@ -22,13 +22,13 @@ The project's "Direct Exchange" IPC mode significantly outperforms traditional m
 
 **Sandbox Environment (Containerized):**
 *   **1 Thread**:
-    *   **Throughput**: 1,899,812 ops/s
+    *   **Throughput**: ~1.90M ops/s
     *   **Avg Latency (RTT)**: 0.53 us
 *   **4 Threads**:
-    *   **Throughput**: 2,731,300 ops/s
+    *   **Throughput**: ~2.73M ops/s
     *   **Avg Latency (RTT)**: 1.46 us
 *   **8 Threads**:
-    *   **Throughput**: 2,031,359 ops/s
+    *   **Throughput**: ~2.03M ops/s
     *   **Avg Latency (RTT)**: 3.94 us
 
 **AMD Ryzen 9 3900x (Bare-metal):**

@@ -55,9 +55,11 @@ public:
     /**
      * @brief Initializes the IPC Host.
      *
-     * @param name Shared memory name.
-     * @param numSlots Number of slots.
-     * @return true on success.
+     * Initializes the underlying DirectHost and sets up the shared memory region.
+     *
+     * @param name The name of the shared memory region.
+     * @param numSlots The number of worker slots to allocate.
+     * @return true if initialization was successful, false otherwise.
      */
     bool Init(const std::string& name, uint32_t numSlots) {
         // DirectHost Init does not take a handler in this version.
@@ -73,12 +75,15 @@ public:
     }
 
     /**
-     * @brief Sends a request and awaits a response.
+     * @brief Sends a request to the Guest and awaits a response.
      *
-     * @param reqData Request payload.
-     * @param reqSize Size of payload.
-     * @param[out] outResponse Buffer for response.
-     * @return true on success.
+     * This method is thread-safe and can be called concurrently. It wraps the
+     * user payload with a TransportHeader to track the request ID.
+     *
+     * @param reqData Pointer to the request payload data.
+     * @param reqSize Size of the request payload in bytes.
+     * @param[out] outResponse Reference to a vector where the response payload will be stored.
+     * @return true if the call succeeded and the response ID matched, false otherwise.
      */
     bool Call(const uint8_t* reqData, size_t reqSize, std::vector<uint8_t>& outResponse) {
         uint64_t reqId = ++reqIdCounter;
@@ -142,8 +147,12 @@ public:
     }
 
     /**
-     * @brief Sends a heartbeat.
-     * @return true on success.
+     * @brief Sends a heartbeat request to the Guest.
+     *
+     * This is used to verify that the Guest is responsive. The Guest should
+     * reply with a MSG_TYPE_HEARTBEAT_RESP.
+     *
+     * @return true if the heartbeat was sent successfully (slot acquired), false otherwise.
      */
     bool SendHeartbeat() {
         // DirectHost is synchronous, so we just check return value.
@@ -153,7 +162,10 @@ public:
     }
 
     /**
-     * @brief Sends shutdown signal.
+     * @brief Sends a shutdown signal to all connected Guest workers.
+     *
+     * This iterates through all slots and sends a MSG_TYPE_SHUTDOWN command.
+     * Guest workers are expected to exit their loops upon receiving this.
      */
     void SendShutdown() {
         std::vector<uint8_t> dummy;
