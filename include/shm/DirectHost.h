@@ -230,8 +230,7 @@ public:
             // Bounds check
             int32_t absSize = size < 0 ? -size : size;
             if ((uint32_t)absSize > slot->maxReqSize) {
-                absSize = (int32_t)slot->maxReqSize;
-                size = size < 0 ? -absSize : absSize;
+                return false;
             }
 
             slot->header->reqSize = size;
@@ -271,7 +270,7 @@ public:
             // Bounds check
             int32_t absSize = size;
             if ((uint32_t)absSize > slot->maxReqSize) {
-                absSize = (int32_t)slot->maxReqSize;
+                return false;
             }
 
             // Zero-Copy convention: Negative size
@@ -606,10 +605,9 @@ public:
         // Bounds Check
         int32_t absSize = size < 0 ? -size : size;
         if ((uint32_t)absSize > slot->maxReqSize) {
-             // Truncate logic? Or Error?
-             // Original logic truncated. We will truncate magnitude.
-             absSize = (int32_t)slot->maxReqSize;
-             size = size < 0 ? -absSize : absSize;
+             // Release Slot
+             slot->header->state.store(SLOT_FREE, std::memory_order_release);
+             return -1;
         }
 
         slot->header->reqSize = size;
@@ -673,9 +671,9 @@ public:
             uint32_t uAbsSize = (size < 0) ? (0u - (uint32_t)size) : (uint32_t)size;
 
             if (uAbsSize > (uint32_t)max) {
-                uAbsSize = (uint32_t)max;
-                if (size < 0) size = -(int32_t)uAbsSize;
-                else size = (int32_t)uAbsSize;
+                // Release Slot
+                slots[idx].header->state.store(SLOT_FREE, std::memory_order_release);
+                return -1;
             }
 
             if (size >= 0) {
@@ -707,9 +705,9 @@ public:
             uint32_t uAbsSize = (size < 0) ? (0u - (uint32_t)size) : (uint32_t)size;
 
             if (uAbsSize > (uint32_t)max) {
-                uAbsSize = (uint32_t)max;
-                if (size < 0) size = -(int32_t)uAbsSize;
-                else size = (int32_t)uAbsSize;
+                // Release Slot
+                slots[idx].header->state.store(SLOT_FREE, std::memory_order_release);
+                return -1;
             }
 
             if (size >= 0) {
