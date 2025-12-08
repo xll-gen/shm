@@ -109,10 +109,15 @@ class DirectHost {
             } else {
                  auto start = std::chrono::steady_clock::now();
                  while (slot->header->state.load(std::memory_order_acquire) != SLOT_RESP_READY) {
-                    Platform::WaitEvent(slot->hRespEvent, 100);
-                    if (std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count() > timeoutMs) {
+                    auto now = std::chrono::steady_clock::now();
+                    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
+                    if (elapsed >= timeoutMs) {
                         return false;
                     }
+
+                    uint32_t remaining = timeoutMs - (uint32_t)elapsed;
+                    uint32_t waitTime = (remaining > 100) ? 100 : remaining;
+                    Platform::WaitEvent(slot->hRespEvent, waitTime);
                  }
                  ready = true;
                  slot->header->hostState.store(HOST_STATE_ACTIVE, std::memory_order_relaxed);
