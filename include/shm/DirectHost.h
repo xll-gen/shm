@@ -433,6 +433,12 @@ public:
             slots[i].hReqEvent = Platform::CreateNamedEvent(reqName.c_str());
             slots[i].hRespEvent = Platform::CreateNamedEvent(respName.c_str());
 
+            if (!slots[i].hReqEvent || !slots[i].hRespEvent) {
+                running = true; // Enable Shutdown
+                Shutdown();
+                return false;
+            }
+
             // Initialize Header
             slots[i].header->state.store(SLOT_FREE, std::memory_order_relaxed);
             slots[i].header->hostState.store(HOST_STATE_ACTIVE, std::memory_order_relaxed);
