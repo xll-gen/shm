@@ -9,6 +9,7 @@
 #include <functional>
 #include <atomic>
 #include <cmath>
+#include <chrono>
 #include "Platform.h"
 #include "IPCUtils.h"
 
@@ -31,6 +32,7 @@ class DirectHost {
     uint64_t totalShmSize;
     ShmHandle hMapFile;
     bool running;
+    uint32_t responseTimeoutMs;
 
     /**
      * @brief Stride for Message Sequence generation.
@@ -66,7 +68,7 @@ class DirectHost {
      * @param slot Pointer to the slot to wait on.
      * @return true if response is ready, false if error/timeout.
      */
-    bool WaitResponse(Slot* slot) {
+    bool WaitResponse(Slot* slot, uint32_t timeoutMs) {
         // Reset Host State
         slot->header->hostState.store(HOST_STATE_ACTIVE, std::memory_order_relaxed);
 
@@ -104,8 +106,12 @@ class DirectHost {
                 ready = true;
                 slot->header->hostState.store(HOST_STATE_ACTIVE, std::memory_order_relaxed);
             } else {
+                 auto start = std::chrono::steady_clock::now();
                  while (slot->header->state.load(std::memory_order_acquire) != SLOT_RESP_READY) {
                     Platform::WaitEvent(slot->hRespEvent, 100);
+                    if (std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count() > timeoutMs) {
+                        return false;
+                    }
                  }
                  ready = true;
                  slot->header->hostState.store(HOST_STATE_ACTIVE, std::memory_order_relaxed);
@@ -205,9 +211,10 @@ public:
          *
          * @param size Size of the data. Positive: Start-aligned. Negative: End-aligned.
          * @param msgType The message Type.
+         * @return true on success, false on timeout (slot invalidated).
          */
-        void Send(int32_t size, uint32_t msgType) {
-            if (!IsValid()) return;
+        bool Send(int32_t size, uint32_t msgType) {
+            if (!IsValid()) return false;
 
             Slot* slot = &host->slots[slotIdx];
 
@@ -223,8 +230,14 @@ public:
             slot->header->msgSeq = slot->msgSeq;
             slot->msgSeq += host->msgSeqStride;
 
-            host->WaitResponse(slot);
+            if (!host->WaitResponse(slot, host->responseTimeoutMs)) {
+                // Timeout. Invalidate slot to prevent accidental reuse or freeing.
+                // Leak the slot to prevent corruption.
+                slotIdx = -1;
+                return false;
+            }
             // Do NOT release slot here. User might want to read response.
+            return true;
         }
 
         /**
@@ -237,9 +250,10 @@ public:
          *
          * @param size The size of the FlatBuffer data (positive integer).
          *             The method automatically negates it for the protocol.
+         * @return true on success, false on timeout (slot invalidated).
          */
-        void SendFlatBuffer(int32_t size) {
-            if (!IsValid()) return;
+        bool SendFlatBuffer(int32_t size) {
+            if (!IsValid()) return false;
 
             Slot* slot = &host->slots[slotIdx];
 
@@ -255,8 +269,14 @@ public:
             slot->header->msgSeq = slot->msgSeq;
             slot->msgSeq += host->msgSeqStride;
 
-            host->WaitResponse(slot);
+            if (!host->WaitResponse(slot, host->responseTimeoutMs)) {
+                // Timeout. Invalidate slot to prevent accidental reuse or freeing.
+                // Leak the slot to prevent corruption.
+                slotIdx = -1;
+                return false;
+            }
             // Do NOT release slot here. User might want to read response.
+            return true;
         }
 
         /**
@@ -300,12 +320,20 @@ public:
     /**
      * @brief Default constructor.
      */
-    DirectHost() : shmBase(nullptr), hMapFile(0), running(false), msgSeqStride(0) {}
+    DirectHost() : shmBase(nullptr), hMapFile(0), running(false), msgSeqStride(0), responseTimeoutMs(10000) {}
 
     /**
      * @brief Destructor. Ensures Shutdown is called.
      */
     ~DirectHost() { Shutdown(); }
+
+    /**
+     * @brief Sets the timeout for waiting for a response.
+     * @param ms Timeout in milliseconds. Default 10000.
+     */
+    void SetTimeout(uint32_t ms) {
+        responseTimeoutMs = ms;
+    }
 
     /**
      * @brief Initializes the Shared Memory Host.
@@ -570,7 +598,12 @@ public:
         slot->msgSeq += msgSeqStride;
 
         // Perform Signal and Wait
-        bool ready = WaitResponse(slot);
+        bool ready = WaitResponse(slot, responseTimeoutMs);
+
+        if (!ready) {
+             // Timeout. Do NOT release slot (leak it) to prevent corruption.
+             return -1;
+        }
 
         // Read Response
         int resultSize = 0;
