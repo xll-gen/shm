@@ -657,10 +657,23 @@ public:
         int32_t idx = AcquireSpecificSlot((int32_t)slotIdx);
         if (idx < 0) return -1;
 
-        if (size > 0 && data) {
+        if (data && size != 0) {
             int32_t max = GetMaxReqSize(idx);
-            if (size > max) size = max;
-            memcpy(GetReqBuffer(idx), data, size);
+            uint32_t uAbsSize = (size < 0) ? (0u - (uint32_t)size) : (uint32_t)size;
+
+            if (uAbsSize > (uint32_t)max) {
+                uAbsSize = (uint32_t)max;
+                if (size < 0) size = -(int32_t)uAbsSize;
+                else size = (int32_t)uAbsSize;
+            }
+
+            if (size >= 0) {
+                memcpy(GetReqBuffer(idx), data, uAbsSize);
+            } else {
+                // End-aligned
+                uint32_t offset = (uint32_t)max - uAbsSize;
+                memcpy(GetReqBuffer(idx) + offset, data, uAbsSize);
+            }
         }
         return SendAcquired(idx, size, msgType, outResp, timeoutMs);
     }
@@ -678,10 +691,23 @@ public:
         int32_t idx = AcquireSlot();
         if (idx < 0) return -1;
 
-        if (size > 0 && data) {
+        if (data && size != 0) {
             int32_t max = GetMaxReqSize(idx);
-            if (size > max) size = max;
-            memcpy(GetReqBuffer(idx), data, size);
+            uint32_t uAbsSize = (size < 0) ? (0u - (uint32_t)size) : (uint32_t)size;
+
+            if (uAbsSize > (uint32_t)max) {
+                uAbsSize = (uint32_t)max;
+                if (size < 0) size = -(int32_t)uAbsSize;
+                else size = (int32_t)uAbsSize;
+            }
+
+            if (size >= 0) {
+                memcpy(GetReqBuffer(idx), data, uAbsSize);
+            } else {
+                // End-aligned
+                uint32_t offset = (uint32_t)max - uAbsSize;
+                memcpy(GetReqBuffer(idx) + offset, data, uAbsSize);
+            }
         }
         return SendAcquired(idx, size, msgType, outResp, timeoutMs);
     }
