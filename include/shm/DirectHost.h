@@ -32,6 +32,7 @@ class DirectHost {
     uint64_t totalShmSize;
     ShmHandle hMapFile;
     bool running;
+    uint32_t responseTimeoutMs;
 
     /**
      * @brief Stride for Message Sequence generation.
@@ -67,7 +68,7 @@ class DirectHost {
      * @param slot Pointer to the slot to wait on.
      * @return true if response is ready, false if error/timeout.
      */
-    bool WaitResponse(Slot* slot, uint32_t timeoutMs = 2000) {
+    bool WaitResponse(Slot* slot, uint32_t timeoutMs) {
         // Reset Host State
         slot->header->hostState.store(HOST_STATE_ACTIVE, std::memory_order_relaxed);
 
@@ -229,7 +230,7 @@ public:
             slot->header->msgSeq = slot->msgSeq;
             slot->msgSeq += host->msgSeqStride;
 
-            if (!host->WaitResponse(slot)) {
+            if (!host->WaitResponse(slot, host->responseTimeoutMs)) {
                 // Timeout. Invalidate slot to prevent accidental reuse or freeing.
                 // Leak the slot to prevent corruption.
                 slotIdx = -1;
@@ -268,7 +269,7 @@ public:
             slot->header->msgSeq = slot->msgSeq;
             slot->msgSeq += host->msgSeqStride;
 
-            if (!host->WaitResponse(slot)) {
+            if (!host->WaitResponse(slot, host->responseTimeoutMs)) {
                 // Timeout. Invalidate slot to prevent accidental reuse or freeing.
                 // Leak the slot to prevent corruption.
                 slotIdx = -1;
@@ -319,12 +320,20 @@ public:
     /**
      * @brief Default constructor.
      */
-    DirectHost() : shmBase(nullptr), hMapFile(0), running(false), msgSeqStride(0) {}
+    DirectHost() : shmBase(nullptr), hMapFile(0), running(false), msgSeqStride(0), responseTimeoutMs(10000) {}
 
     /**
      * @brief Destructor. Ensures Shutdown is called.
      */
     ~DirectHost() { Shutdown(); }
+
+    /**
+     * @brief Sets the timeout for waiting for a response.
+     * @param ms Timeout in milliseconds. Default 10000.
+     */
+    void SetTimeout(uint32_t ms) {
+        responseTimeoutMs = ms;
+    }
 
     /**
      * @brief Initializes the Shared Memory Host.
@@ -589,7 +598,7 @@ public:
         slot->msgSeq += msgSeqStride;
 
         // Perform Signal and Wait
-        bool ready = WaitResponse(slot);
+        bool ready = WaitResponse(slot, responseTimeoutMs);
 
         if (!ready) {
              // Timeout. Do NOT release slot (leak it) to prevent corruption.
