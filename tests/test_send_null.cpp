@@ -61,7 +61,7 @@ int main() {
 
     std::vector<uint8_t> resp;
     // Send 50 bytes but data is nullptr
-    int ret = host.Send(nullptr, 50, MSG_TYPE_NORMAL, resp, 1000);
+    int ret = host.Send(nullptr, 50, MsgType::NORMAL, resp, 1000);
 
     if (guest.joinable()) guest.join();
 

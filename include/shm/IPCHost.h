@@ -115,7 +115,7 @@ public:
         }
 
         std::vector<uint8_t> rawResp;
-        if (impl.Send(sendBuf.data(), (uint32_t)totalSize, MSG_TYPE_NORMAL, rawResp) < 0) {
+        if (impl.Send(sendBuf.data(), (uint32_t)totalSize, MsgType::NORMAL, rawResp) < 0) {
              // Failed to send
              Shard& shard = shards[reqId % SHARD_COUNT];
              std::lock_guard<std::mutex> lock(shard.mutex);
@@ -150,26 +150,26 @@ public:
      * @brief Sends a heartbeat request to the Guest.
      *
      * This is used to verify that the Guest is responsive. The Guest should
-     * reply with a MSG_TYPE_HEARTBEAT_RESP.
+     * reply with a MsgType::HEARTBEAT_RESP.
      *
      * @return true if the heartbeat was sent successfully (slot acquired), false otherwise.
      */
     bool SendHeartbeat() {
         // DirectHost is synchronous, so we just check return value.
         std::vector<uint8_t> dummy;
-        int res = impl.Send(nullptr, 0, MSG_TYPE_HEARTBEAT_REQ, dummy);
+        int res = impl.Send(nullptr, 0, MsgType::HEARTBEAT_REQ, dummy);
         return res >= 0;
     }
 
     /**
      * @brief Sends a shutdown signal to all connected Guest workers.
      *
-     * This iterates through all slots and sends a MSG_TYPE_SHUTDOWN command.
+     * This iterates through all slots and sends a MsgType::SHUTDOWN command.
      * Guest workers are expected to exit their loops upon receiving this.
      */
     void SendShutdown() {
         std::vector<uint8_t> dummy;
-        impl.Send(nullptr, 0, MSG_TYPE_SHUTDOWN, dummy);
+        impl.Send(nullptr, 0, MsgType::SHUTDOWN, dummy);
     }
 
 private:

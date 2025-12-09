@@ -97,12 +97,12 @@ int main() {
 
     std::cout << "Sending Cycle 1..." << std::endl;
     for(int i=0; i<numSlots; ++i) {
-        host.SendToSlot(i, nullptr, 0, MSG_TYPE_NORMAL, resp);
+        host.SendToSlot(i, nullptr, 0, MsgType::NORMAL, resp);
     }
 
     std::cout << "Sending Cycle 2..." << std::endl;
     for(int i=0; i<numSlots; ++i) {
-        host.SendToSlot(i, nullptr, 0, MSG_TYPE_NORMAL, resp);
+        host.SendToSlot(i, nullptr, 0, MsgType::NORMAL, resp);
     }
 
     for(auto& t : guests) t.join();

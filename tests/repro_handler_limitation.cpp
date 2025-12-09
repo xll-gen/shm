@@ -13,7 +13,7 @@ using namespace shm;
 // A "generic" handler that tries to write to the end.
 // Now it receives maxRespSize, so it can do it correctly.
 
-int32_t GenericHandler(const uint8_t* req, int32_t reqSize, uint8_t* resp, uint32_t maxRespSize, uint32_t msgType) {
+int32_t GenericHandler(const uint8_t* req, int32_t reqSize, uint8_t* resp, uint32_t maxRespSize, MsgType msgType) {
     const char* response = "DONE";
     int len = 4;
 
@@ -63,7 +63,7 @@ int main() {
     const char* msg = "Hello";
     memcpy(guestReqBuf, msg, 5);
     guestSlotHeader->reqSize = 5;
-    guestSlotHeader->msgType = MSG_TYPE_GUEST_CALL;
+    guestSlotHeader->msgType = MsgType::GUEST_CALL;
     guestSlotHeader->state.store(SLOT_REQ_READY, std::memory_order_seq_cst);
 
     // Host processes

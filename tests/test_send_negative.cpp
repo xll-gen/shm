@@ -78,7 +78,7 @@ int main() {
 
     std::vector<uint8_t> resp;
     // Send "TEST" with size -4 (End Aligned)
-    int ret = host.Send((const uint8_t*)"TEST", -4, MSG_TYPE_FLATBUFFER, resp);
+    int ret = host.Send((const uint8_t*)"TEST", -4, MsgType::FLATBUFFER, resp);
 
     if (guest.joinable()) guest.join();
 
