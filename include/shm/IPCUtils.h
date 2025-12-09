@@ -3,51 +3,6 @@
 #include <stdint.h>
 #include <atomic>
 
-// Message Types for control messages
-
-/**
- * @brief Message Type for normal data payload.
- */
-#define MSG_TYPE_NORMAL 0
-
-/**
- * @brief Message Type for heartbeat request (keep-alive).
- */
-#define MSG_TYPE_HEARTBEAT_REQ 1
-
-/**
- * @brief Message Type for heartbeat response.
- */
-#define MSG_TYPE_HEARTBEAT_RESP 2
-
-/**
- * @brief Message Type for shutdown signal.
- * Used to signal the Guest to terminate its worker loop.
- */
-#define MSG_TYPE_SHUTDOWN 3
-
-/**
- * @brief Message Type for FlatBuffer payload.
- * Used when sending Zero-Copy FlatBuffers where the data is aligned to the end of the buffer.
- */
-#define MSG_TYPE_FLATBUFFER 10
-
-/**
- * @brief Message Type for Guest Call (Guest -> Host).
- */
-#define MSG_TYPE_GUEST_CALL 11
-
-/**
- * @brief Start of Application Specific message types.
- * IDs below 128 are reserved for internal protocol use.
- * Users should start their custom message types from this value.
- *
- * Example:
- *   const uint32_t MY_MSG_LOGIN  = MSG_TYPE_APP_START + 0;
- *   const uint32_t MY_MSG_UPDATE = MSG_TYPE_APP_START + 1;
- */
-#define MSG_TYPE_APP_START 128
-
 // Host/Guest Sleeping States
 
 /**
@@ -71,6 +26,27 @@
 #define GUEST_STATE_WAITING 1
 
 namespace shm {
+
+/**
+ * @brief Message Types for control messages.
+ * Strongly typed enum to ensure type safety and match Go implementation.
+ */
+enum class MsgType : uint32_t {
+    /** @brief Normal data payload. */
+    NORMAL = 0,
+    /** @brief Heartbeat request (keep-alive). */
+    HEARTBEAT_REQ = 1,
+    /** @brief Heartbeat response. */
+    HEARTBEAT_RESP = 2,
+    /** @brief Shutdown signal. Signal Guest to terminate worker loop. */
+    SHUTDOWN = 3,
+    /** @brief FlatBuffer payload (Zero-Copy End-Aligned). */
+    FLATBUFFER = 10,
+    /** @brief Guest Call (Guest -> Host). */
+    GUEST_CALL = 11,
+    /** @brief Start of Application Specific message types. */
+    APP_START = 128
+};
 
 // Direct Mode Slot Header
 // Aligned to 128 bytes to prevent false sharing
@@ -112,10 +88,10 @@ struct SlotHeader {
     uint32_t msgSeq;
 
     /**
-     * @brief Message Type (e.g., MSG_TYPE_NORMAL, MSG_TYPE_SHUTDOWN).
+     * @brief Message Type (e.g., MsgType::NORMAL, MsgType::SHUTDOWN).
      * Describes the content/command of the message.
      */
-    uint32_t msgType;
+    MsgType msgType;
 
     /**
      * @brief Size of the request payload in bytes.
@@ -133,7 +109,7 @@ struct SlotHeader {
 
     /**
      * @brief Padding to align the struct to 128 bytes total size.
-     * 64 (pre_pad) + 4 (state) + 4 (hostState) + 4 (guestState) + 4 (msgId) + 4 (msgType) + 4 (reqSize) + 4 (respSize) = 92 bytes.
+     * 64 (pre_pad) + 4 (state) + 4 (hostState) + 4 (guestState) + 4 (msgSeq) + 4 (msgType) + 4 (reqSize) + 4 (respSize) = 92 bytes.
      * 128 - 92 = 36 bytes padding.
      */
     uint8_t padding[36];

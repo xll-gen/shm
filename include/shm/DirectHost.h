@@ -222,7 +222,7 @@ public:
          * @param timeoutMs Per-call timeout. Default USE_DEFAULT_TIMEOUT.
          * @return true on success, false on timeout (slot invalidated).
          */
-        bool Send(int32_t size, uint32_t msgType, uint32_t timeoutMs = USE_DEFAULT_TIMEOUT) {
+        bool Send(int32_t size, MsgType msgType, uint32_t timeoutMs = USE_DEFAULT_TIMEOUT) {
             if (!IsValid()) return false;
 
             Slot* slot = &host->slots[slotIdx];
@@ -253,7 +253,7 @@ public:
          * @brief Sends the FlatBuffer request.
          *
          * This method:
-         * 1. Sets the message Type to MSG_TYPE_FLATBUFFER.
+         * 1. Sets the message Type to MsgType::FLATBUFFER.
          * 2. Sets the request size to negative (indicating end-aligned Zero-Copy).
          * 3. Signals the Guest and waits for completion.
          *
@@ -275,7 +275,7 @@ public:
 
             // Zero-Copy convention: Negative size
             slot->header->reqSize = -absSize;
-            slot->header->msgType = MSG_TYPE_FLATBUFFER;
+            slot->header->msgType = MsgType::FLATBUFFER;
             slot->header->msgSeq = slot->msgSeq;
             slot->msgSeq += host->msgSeqStride;
 
@@ -460,7 +460,7 @@ public:
         for (uint32_t i = 0; i < numSlots; ++i) {
             std::vector<uint8_t> dummy;
             // Use short timeout (1000ms) to avoid hanging on stuck slots
-            SendToSlot(i, nullptr, 0, MSG_TYPE_SHUTDOWN, dummy, 1000);
+            SendToSlot(i, nullptr, 0, MsgType::SHUTDOWN, dummy, 1000);
         }
     }
 
@@ -612,7 +612,7 @@ public:
      * @param timeoutMs Per-call timeout. Default USE_DEFAULT_TIMEOUT.
      * @return int Bytes read (response size), or -1 on error.
      */
-    int SendAcquired(int32_t slotIdx, int32_t size, uint32_t msgType, std::vector<uint8_t>& outResp, uint32_t timeoutMs = USE_DEFAULT_TIMEOUT) {
+    int SendAcquired(int32_t slotIdx, int32_t size, MsgType msgType, std::vector<uint8_t>& outResp, uint32_t timeoutMs = USE_DEFAULT_TIMEOUT) {
         if (slotIdx < 0 || slotIdx >= (int32_t)numSlots) return -1;
         Slot* slot = &slots[slotIdx];
 
@@ -676,7 +676,7 @@ public:
      * @param timeoutMs Per-call timeout. Default USE_DEFAULT_TIMEOUT.
      * @return int Bytes read (response size), or -1 on error.
      */
-    int SendToSlot(uint32_t slotIdx, const uint8_t* data, int32_t size, uint32_t msgType, std::vector<uint8_t>& outResp, uint32_t timeoutMs = USE_DEFAULT_TIMEOUT) {
+    int SendToSlot(uint32_t slotIdx, const uint8_t* data, int32_t size, MsgType msgType, std::vector<uint8_t>& outResp, uint32_t timeoutMs = USE_DEFAULT_TIMEOUT) {
         int32_t idx = AcquireSpecificSlot((int32_t)slotIdx, timeoutMs);
         if (idx < 0) return -1;
 
@@ -710,7 +710,7 @@ public:
      * @param timeoutMs Per-call timeout. Default USE_DEFAULT_TIMEOUT.
      * @return int Bytes read (response size), or -1 on error.
      */
-    int Send(const uint8_t* data, int32_t size, uint32_t msgType, std::vector<uint8_t>& outResp, uint32_t timeoutMs = USE_DEFAULT_TIMEOUT) {
+    int Send(const uint8_t* data, int32_t size, MsgType msgType, std::vector<uint8_t>& outResp, uint32_t timeoutMs = USE_DEFAULT_TIMEOUT) {
         int32_t idx = AcquireSlot();
         if (idx < 0) return -1;
 
@@ -745,7 +745,7 @@ public:
      *                Returns: respSize.
      * @return int Number of requests processed.
      */
-    int ProcessGuestCalls(std::function<int32_t(const uint8_t*, int32_t, uint8_t*, uint32_t, uint32_t)> handler) {
+    int ProcessGuestCalls(std::function<int32_t(const uint8_t*, int32_t, uint8_t*, uint32_t, MsgType)> handler) {
         if (!running) return 0;
         int processed = 0;
 

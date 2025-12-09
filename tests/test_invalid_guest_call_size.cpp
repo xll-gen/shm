@@ -38,14 +38,14 @@ int main() {
     // SlotSize is 4096. MaxReqSize is 2048 (50% split).
     // We use -5000 to be strictly greater than both MaxReqSize and SlotSize.
     header->reqSize = -5000;
-    header->msgType = MSG_TYPE_GUEST_CALL;
+    header->msgType = MsgType::GUEST_CALL;
     header->state.store(SLOT_REQ_READY, std::memory_order_seq_cst);
 
     std::cout << "Processing Guest Calls with Invalid Size..." << std::endl;
 
     bool handlerCalled = false;
     // New Signature
-    host.ProcessGuestCalls([&](const uint8_t* req, int32_t reqSize, uint8_t* resp, uint32_t maxRespSize, uint32_t msgType) -> int32_t {
+    host.ProcessGuestCalls([&](const uint8_t* req, int32_t reqSize, uint8_t* resp, uint32_t maxRespSize, MsgType msgType) -> int32_t {
         handlerCalled = true;
         std::cout << "Handler called with size: " << reqSize << std::endl;
         return 0;

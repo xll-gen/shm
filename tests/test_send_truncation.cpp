@@ -62,7 +62,7 @@ int main() {
     // Send 100 bytes (Expect fail because MaxReqSize is 64)
     std::vector<uint8_t> data(100, 'A');
 
-    int ret = host.Send(data.data(), (int32_t)data.size(), MSG_TYPE_NORMAL, resp);
+    int ret = host.Send(data.data(), (int32_t)data.size(), MsgType::NORMAL, resp);
 
     if (guest.joinable()) guest.join();
 
