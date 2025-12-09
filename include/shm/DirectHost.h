@@ -459,7 +459,8 @@ public:
 
         for (uint32_t i = 0; i < numSlots; ++i) {
             std::vector<uint8_t> dummy;
-            SendToSlot(i, nullptr, 0, MSG_TYPE_SHUTDOWN, dummy);
+            // Use short timeout (1000ms) to avoid hanging on stuck slots
+            SendToSlot(i, nullptr, 0, MSG_TYPE_SHUTDOWN, dummy, 1000);
         }
     }
 
@@ -546,21 +547,34 @@ public:
     /**
      * @brief Acquires a specific slot.
      * @param slotIdx The index of the slot to acquire.
+     * @param timeoutMs Timeout in milliseconds. Default USE_DEFAULT_TIMEOUT.
      * @return The slot index (same as input), or -1 if failed.
      */
-    int32_t AcquireSpecificSlot(int32_t slotIdx) {
+    int32_t AcquireSpecificSlot(int32_t slotIdx, uint32_t timeoutMs = USE_DEFAULT_TIMEOUT) {
         if (!running || slotIdx < 0 || slotIdx >= (int32_t)numSlots) return -1;
         Slot* slot = &slots[slotIdx];
 
+        uint32_t effectiveTimeout = (timeoutMs == USE_DEFAULT_TIMEOUT) ? responseTimeoutMs : timeoutMs;
+        auto start = std::chrono::steady_clock::now();
         int retries = 0;
+
         while(true) {
              uint32_t expected = SLOT_FREE;
              if (slot->header->state.compare_exchange_strong(expected, SLOT_BUSY, std::memory_order_acquire)) {
                  break;
              }
+
              Platform::CpuRelax();
              retries++;
              if (retries > 1000) {
+                 if (effectiveTimeout != 0xFFFFFFFF) {
+                     auto now = std::chrono::steady_clock::now();
+                     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
+                     if (elapsed >= effectiveTimeout) {
+                         return -1;
+                     }
+                 }
+
                  Platform::ThreadYield();
                  retries = 0;
              }
@@ -663,7 +677,7 @@ public:
      * @return int Bytes read (response size), or -1 on error.
      */
     int SendToSlot(uint32_t slotIdx, const uint8_t* data, int32_t size, uint32_t msgType, std::vector<uint8_t>& outResp, uint32_t timeoutMs = USE_DEFAULT_TIMEOUT) {
-        int32_t idx = AcquireSpecificSlot((int32_t)slotIdx);
+        int32_t idx = AcquireSpecificSlot((int32_t)slotIdx, timeoutMs);
         if (idx < 0) return -1;
 
         if (data && size != 0) {
