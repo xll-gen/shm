@@ -426,7 +426,13 @@ public:
             slots[i].msgSeq = i + 1;
 
             // Events
-            std::string reqName = shmName + "_slot_" + std::to_string(i);
+            std::string reqName;
+            if (i < numSlots) {
+                reqName = shmName + "_slot_" + std::to_string(i);
+            } else {
+                // Shared event for all Guest Calls to allow single-thread draining
+                reqName = shmName + "_guest_call";
+            }
             std::string respName = shmName + "_slot_" + std::to_string(i) + "_resp";
 
             slots[i].hReqEvent = Platform::CreateNamedEvent(reqName.c_str());
@@ -469,6 +475,8 @@ public:
      */
     void Shutdown() {
         if (!running) return;
+
+        Stop(); // Stop background worker if active
 
         for (uint32_t i = 0; i < slots.size(); ++i) {
              Platform::CloseEvent(slots[i].hReqEvent);
@@ -736,6 +744,64 @@ public:
     }
 
 
+    using GuestCallHandler = std::function<int32_t(const uint8_t*, int32_t, uint8_t*, uint32_t, MsgType)>;
+
+private:
+    std::thread guestWorker;
+    std::atomic<bool> guestWorkerRunning{false};
+
+    void GuestWorkerLoop(GuestCallHandler handler, int32_t maxBatchSize) {
+        EventHandle waitEvent = nullptr;
+        // Since all guest slots share the same reqEvent (shmName + "_guest_call"),
+        // we can wait on the first one.
+        if (numGuestSlots > 0 && numSlots + numGuestSlots <= slots.size()) {
+             waitEvent = slots[numSlots].hReqEvent;
+        }
+
+        while (guestWorkerRunning.load(std::memory_order_relaxed)) {
+            // Wait for signal (timeout 1s to check for shutdown)
+            if (waitEvent) {
+                 Platform::WaitEvent(waitEvent, 1000);
+            } else {
+                 // Should not happen if Start checks numGuestSlots
+                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+
+            // Drain events (Process until empty or limit reached)
+            // Note: On Linux semaphores, WaitEvent consumes 1 count.
+            // If multiple requests came in, sem value > 0.
+            // However, ProcessGuestCalls iterates ALL slots.
+            // So one Wakeup might process N requests.
+            // Subsequent WaitEvents might return immediately (spurious wakeups), which is fine.
+            int processed = ProcessGuestCalls(handler, maxBatchSize);
+            (void)processed;
+        }
+    }
+
+public:
+    /**
+     * @brief Starts the background worker for Guest Calls.
+     *
+     * @param handler The handler to process requests.
+     * @param maxBatchSize Max requests to process in one burst (default 100).
+     */
+    void Start(GuestCallHandler handler, int32_t maxBatchSize = 100) {
+        if (numGuestSlots == 0) return;
+        if (guestWorkerRunning.exchange(true)) return;
+        guestWorker = std::thread(&DirectHost::GuestWorkerLoop, this, handler, maxBatchSize);
+    }
+
+    /**
+     * @brief Stops the background worker.
+     */
+    void Stop() {
+        if (guestWorkerRunning.exchange(false)) {
+            if (guestWorker.joinable()) {
+                guestWorker.join();
+            }
+        }
+    }
+
     /**
      * @brief Processes any pending Guest Calls (Guest -> Host).
      * This method is intended to be called in a loop by a background thread.
@@ -743,13 +809,15 @@ public:
      * @param handler A function to process the request.
      *                Args: reqData, reqSize, respBuffer, maxRespSize, msgType.
      *                Returns: respSize.
+     * @param limit Max number of requests to process per call. -1 for unlimited.
      * @return int Number of requests processed.
      */
-    int ProcessGuestCalls(std::function<int32_t(const uint8_t*, int32_t, uint8_t*, uint32_t, MsgType)> handler) {
+    int ProcessGuestCalls(GuestCallHandler handler, int limit = -1) {
         if (!running) return 0;
         int processed = 0;
 
         for (uint32_t i = numSlots; i < numSlots + numGuestSlots; ++i) {
+            if (limit > 0 && processed >= limit) break;
             Slot* slot = &slots[i];
 
             // Check for REQ_READY (Guest wrote request)

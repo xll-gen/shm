@@ -203,7 +203,12 @@ func NewDirectGuest(name string, _ int, _ int) (*DirectGuest, error) {
 		g.slots[i].reqBuffer = unsafe.Slice((*byte)(reqPtr), maxReq)
         g.slots[i].respBuffer = unsafe.Slice((*byte)(respPtr), maxResp)
 
-		reqName := fmt.Sprintf("%s_slot_%d", name, i)
+		var reqName string
+		if uint32(i) < numSlots {
+			reqName = fmt.Sprintf("%s_slot_%d", name, i)
+		} else {
+			reqName = fmt.Sprintf("%s_guest_call", name)
+		}
 		respName := fmt.Sprintf("%s_slot_%d_resp", name, i)
 
 		evReq, err := OpenEvent(reqName)
