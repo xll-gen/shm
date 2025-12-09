@@ -603,16 +603,17 @@ public:
     }
 
     /**
-     * @brief Sends a request using an acquired slot (Zero-Copy flow).
+     * @brief Sends a request using an acquired slot (Zero-Allocation flow).
      *
      * @param slotIdx The index of the acquired slot.
      * @param size Size of the data. Negative means End-Aligned (Zero-Copy).
      * @param msgType The message Type.
-     * @param[out] outResp Vector to store the response data.
+     * @param[out] respBuf Buffer to store the response data.
+     * @param respCap Capacity of the response buffer.
      * @param timeoutMs Per-call timeout. Default USE_DEFAULT_TIMEOUT.
      * @return int Bytes read (response size), or -1 on error.
      */
-    int SendAcquired(int32_t slotIdx, int32_t size, uint32_t msgType, std::vector<uint8_t>& outResp, uint32_t timeoutMs = USE_DEFAULT_TIMEOUT) {
+    int SendAcquired(int32_t slotIdx, int32_t size, uint32_t msgType, uint8_t* respBuf, uint32_t respCap, uint32_t timeoutMs = USE_DEFAULT_TIMEOUT) {
         if (slotIdx < 0 || slotIdx >= (int32_t)numSlots) return -1;
         Slot* slot = &slots[slotIdx];
 
@@ -646,15 +647,29 @@ public:
 
             if ((uint32_t)absResp > slot->maxRespSize) absResp = (int32_t)slot->maxRespSize;
 
-            outResp.resize(absResp);
-            if (absResp > 0) {
-                if (respSize >= 0) {
-                    // Start-aligned
-                    memcpy(outResp.data(), slot->respBuffer, absResp);
+            if (respBuf && absResp > 0) {
+                if ((uint32_t)absResp > respCap) {
+                    // Truncate or Error? Let's truncate to fit buffer and return actual size needed?
+                    // Standard C read(): returns what was read.
+                    // But here we might want to know it was truncated.
+                    // Let's copy min(absResp, respCap).
+                    uint32_t copySize = (uint32_t)absResp > respCap ? respCap : (uint32_t)absResp;
+
+                    if (respSize >= 0) {
+                        // Start-aligned
+                        memcpy(respBuf, slot->respBuffer, copySize);
+                    } else {
+                        // End-aligned (Zero-Copy Guest)
+                        uint32_t offset = slot->maxRespSize - absResp;
+                        memcpy(respBuf, slot->respBuffer + offset, copySize);
+                    }
                 } else {
-                    // End-aligned (Zero-Copy Guest)
-                    uint32_t offset = slot->maxRespSize - absResp;
-                    memcpy(outResp.data(), slot->respBuffer + offset, absResp);
+                    if (respSize >= 0) {
+                        memcpy(respBuf, slot->respBuffer, absResp);
+                    } else {
+                        uint32_t offset = slot->maxRespSize - absResp;
+                        memcpy(respBuf, slot->respBuffer + offset, absResp);
+                    }
                 }
             }
             resultSize = absResp;
@@ -667,14 +682,83 @@ public:
     }
 
     /**
-     * @brief Sends a request to a specific slot.
-     * @param slotIdx The index of the slot to use.
-     * @param data Pointer to the request data.
-     * @param size Size of the request data.
-     * @param msgType The message Type.
-     * @param[out] outResp Vector to store the response data.
-     * @param timeoutMs Per-call timeout. Default USE_DEFAULT_TIMEOUT.
-     * @return int Bytes read (response size), or -1 on error.
+     * @brief Sends a request using an acquired slot (std::vector legacy flow).
+     */
+    int SendAcquired(int32_t slotIdx, int32_t size, uint32_t msgType, std::vector<uint8_t>& outResp, uint32_t timeoutMs = USE_DEFAULT_TIMEOUT) {
+         if (slotIdx < 0 || slotIdx >= (int32_t)numSlots) return -1;
+        Slot* slot = &slots[slotIdx];
+
+        // Bounds Check
+        int32_t absSize = size < 0 ? -size : size;
+        if ((uint32_t)absSize > slot->maxReqSize) {
+             slot->header->state.store(SLOT_FREE, std::memory_order_release);
+             return -1;
+        }
+
+        slot->header->reqSize = size;
+        slot->header->msgType = msgType;
+        slot->header->msgSeq = slot->msgSeq;
+        slot->msgSeq += msgSeqStride;
+
+        uint32_t t = (timeoutMs == USE_DEFAULT_TIMEOUT) ? responseTimeoutMs : timeoutMs;
+        bool ready = WaitResponse(slot, t);
+
+        if (!ready) {
+             return -1;
+        }
+
+        int resultSize = 0;
+        if (ready) {
+            int32_t respSize = slot->header->respSize;
+            int32_t absResp = respSize < 0 ? -respSize : respSize;
+
+            if ((uint32_t)absResp > slot->maxRespSize) absResp = (int32_t)slot->maxRespSize;
+
+            outResp.resize(absResp);
+            if (absResp > 0) {
+                if (respSize >= 0) {
+                    memcpy(outResp.data(), slot->respBuffer, absResp);
+                } else {
+                    uint32_t offset = slot->maxRespSize - absResp;
+                    memcpy(outResp.data(), slot->respBuffer + offset, absResp);
+                }
+            }
+            resultSize = absResp;
+        }
+
+        slot->header->state.store(SLOT_FREE, std::memory_order_release);
+
+        return resultSize;
+    }
+
+    /**
+     * @brief Sends a request to a specific slot (Zero-Allocation).
+     */
+    int SendToSlot(uint32_t slotIdx, const uint8_t* data, int32_t size, uint32_t msgType, uint8_t* respBuf, uint32_t respCap, uint32_t timeoutMs = USE_DEFAULT_TIMEOUT) {
+        int32_t idx = AcquireSpecificSlot((int32_t)slotIdx, timeoutMs);
+        if (idx < 0) return -1;
+
+        if (data && size != 0) {
+            int32_t max = GetMaxReqSize(idx);
+            uint32_t uAbsSize = (size < 0) ? (0u - (uint32_t)size) : (uint32_t)size;
+
+            if (uAbsSize > (uint32_t)max) {
+                slots[idx].header->state.store(SLOT_FREE, std::memory_order_release);
+                return -1;
+            }
+
+            if (size >= 0) {
+                memcpy(GetReqBuffer(idx), data, uAbsSize);
+            } else {
+                uint32_t offset = (uint32_t)max - uAbsSize;
+                memcpy(GetReqBuffer(idx) + offset, data, uAbsSize);
+            }
+        }
+        return SendAcquired(idx, size, msgType, respBuf, respCap, timeoutMs);
+    }
+
+    /**
+     * @brief Sends a request to a specific slot (std::vector legacy).
      */
     int SendToSlot(uint32_t slotIdx, const uint8_t* data, int32_t size, uint32_t msgType, std::vector<uint8_t>& outResp, uint32_t timeoutMs = USE_DEFAULT_TIMEOUT) {
         int32_t idx = AcquireSpecificSlot((int32_t)slotIdx, timeoutMs);
@@ -685,7 +769,6 @@ public:
             uint32_t uAbsSize = (size < 0) ? (0u - (uint32_t)size) : (uint32_t)size;
 
             if (uAbsSize > (uint32_t)max) {
-                // Release Slot
                 slots[idx].header->state.store(SLOT_FREE, std::memory_order_release);
                 return -1;
             }
@@ -693,7 +776,6 @@ public:
             if (size >= 0) {
                 memcpy(GetReqBuffer(idx), data, uAbsSize);
             } else {
-                // End-aligned
                 uint32_t offset = (uint32_t)max - uAbsSize;
                 memcpy(GetReqBuffer(idx) + offset, data, uAbsSize);
             }
@@ -702,13 +784,33 @@ public:
     }
 
     /**
-     * @brief Sends a request using any available slot.
-     * @param data Pointer to the request data.
-     * @param size Size of the request data.
-     * @param msgType The message Type.
-     * @param[out] outResp Vector to store the response data.
-     * @param timeoutMs Per-call timeout. Default USE_DEFAULT_TIMEOUT.
-     * @return int Bytes read (response size), or -1 on error.
+     * @brief Sends a request using any available slot (Zero-Allocation).
+     */
+    int Send(const uint8_t* data, int32_t size, uint32_t msgType, uint8_t* respBuf, uint32_t respCap, uint32_t timeoutMs = USE_DEFAULT_TIMEOUT) {
+        int32_t idx = AcquireSlot();
+        if (idx < 0) return -1;
+
+        if (data && size != 0) {
+            int32_t max = GetMaxReqSize(idx);
+            uint32_t uAbsSize = (size < 0) ? (0u - (uint32_t)size) : (uint32_t)size;
+
+            if (uAbsSize > (uint32_t)max) {
+                slots[idx].header->state.store(SLOT_FREE, std::memory_order_release);
+                return -1;
+            }
+
+            if (size >= 0) {
+                memcpy(GetReqBuffer(idx), data, uAbsSize);
+            } else {
+                uint32_t offset = (uint32_t)max - uAbsSize;
+                memcpy(GetReqBuffer(idx) + offset, data, uAbsSize);
+            }
+        }
+        return SendAcquired(idx, size, msgType, respBuf, respCap, timeoutMs);
+    }
+
+    /**
+     * @brief Sends a request using any available slot (std::vector legacy).
      */
     int Send(const uint8_t* data, int32_t size, uint32_t msgType, std::vector<uint8_t>& outResp, uint32_t timeoutMs = USE_DEFAULT_TIMEOUT) {
         int32_t idx = AcquireSlot();
@@ -719,7 +821,6 @@ public:
             uint32_t uAbsSize = (size < 0) ? (0u - (uint32_t)size) : (uint32_t)size;
 
             if (uAbsSize > (uint32_t)max) {
-                // Release Slot
                 slots[idx].header->state.store(SLOT_FREE, std::memory_order_release);
                 return -1;
             }
@@ -727,7 +828,6 @@ public:
             if (size >= 0) {
                 memcpy(GetReqBuffer(idx), data, uAbsSize);
             } else {
-                // End-aligned
                 uint32_t offset = (uint32_t)max - uAbsSize;
                 memcpy(GetReqBuffer(idx) + offset, data, uAbsSize);
             }
@@ -740,12 +840,14 @@ public:
      * @brief Processes any pending Guest Calls (Guest -> Host).
      * This method is intended to be called in a loop by a background thread.
      *
-     * @param handler A function to process the request.
-     *                Args: reqData, reqSize, respBuffer, maxRespSize, msgType.
-     *                Returns: respSize.
+     * @tparam HandlerFunc A callable type (lambda or function pointer).
+     *         Args: reqData, reqSize, respBuffer, maxRespSize, msgType.
+     *         Returns: respSize.
+     * @param handler The function to process the request.
      * @return int Number of requests processed.
      */
-    int ProcessGuestCalls(std::function<int32_t(const uint8_t*, int32_t, uint8_t*, uint32_t, uint32_t)> handler) {
+    template <typename HandlerFunc>
+    int ProcessGuestCalls(HandlerFunc&& handler) {
         if (!running) return 0;
         int processed = 0;
 
@@ -778,10 +880,7 @@ public:
                 }
 
                 // Invoke Handler
-                int32_t respSize = 0;
-                if (handler) {
-                    respSize = handler(reqData, absReqSize, slot->respBuffer, slot->maxRespSize, slot->header->msgType);
-                }
+                int32_t respSize = handler(reqData, absReqSize, slot->respBuffer, slot->maxRespSize, slot->header->msgType);
 
                 // Validate Response Size
                 int32_t absRespSize = respSize < 0 ? -respSize : respSize;

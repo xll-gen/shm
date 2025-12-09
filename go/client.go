@@ -72,6 +72,7 @@ func (c *Client) SetTimeout(d time.Duration) {
 
 // SendGuestCall sends a message to the Host (Guest Call).
 // It uses the default timeout configured via SetTimeout (default 10s).
+// This method allocates a new slice for the response.
 //
 // data: The payload to send.
 // msgType: The message type.
@@ -82,6 +83,7 @@ func (c *Client) SendGuestCall(data []byte, msgType MsgType) ([]byte, error) {
 }
 
 // SendGuestCallWithTimeout sends a message to the Host (Guest Call) with a custom timeout.
+// This method allocates a new slice for the response.
 //
 // data: The payload to send.
 // msgType: The message type.
@@ -90,6 +92,18 @@ func (c *Client) SendGuestCall(data []byte, msgType MsgType) ([]byte, error) {
 // Returns the response payload or an error.
 func (c *Client) SendGuestCallWithTimeout(data []byte, msgType MsgType, timeout time.Duration) ([]byte, error) {
 	return c.guest.SendGuestCallWithTimeout(data, msgType, timeout)
+}
+
+// SendGuestCallBuffer sends a message to the Host (Guest Call) and writes the response
+// into the provided buffer, avoiding allocation.
+//
+// data: The payload to send.
+// msgType: The message type.
+// respBuf: The buffer to write the response into.
+//
+// Returns the number of bytes written, the response message type, and an error.
+func (c *Client) SendGuestCallBuffer(data []byte, msgType MsgType, respBuf []byte) (int, MsgType, error) {
+	return c.guest.SendGuestCallBuffer(data, msgType, respBuf)
 }
 
 // Close releases all resources associated with the client.
