@@ -6,10 +6,9 @@ tasks:
       - task: run:benchmark
 
   build:cpp:
-    dir: benchmarks/build
     cmds:
-      - cmd: cmake .. -DCMAKE_BUILD_TYPE=Release
-      - cmd: '{{if eq OS "windows"}}cmake --build . --config Release{{else}}make -j$(nproc){{end}}'
+      - cmd: cmake -S . -B build -DSHM_BUILD_BENCHMARKS=ON -DCMAKE_BUILD_TYPE=Release
+      - cmd: cmake --build build --config Release --parallel
 
   build:go:
     dir: benchmarks/go
@@ -52,9 +51,9 @@ tasks:
         platforms: [windows]
 
       # Run Client
-      - cmd: './benchmarks/build/shm_benchmark -t {{.THREADS}}'
+      - cmd: './build/benchmarks/shm_benchmark -t {{.THREADS}}'
         platforms: [linux]
-      - cmd: 'benchmarks\build\shm_benchmark.exe -t {{.THREADS}}'
+      - cmd: 'build\benchmarks\shm_benchmark.exe -t {{.THREADS}}'
         platforms: [windows]
 
       # Cleanup
