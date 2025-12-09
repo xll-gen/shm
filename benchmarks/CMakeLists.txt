@@ -1,43 +1,31 @@
-cmake_minimum_required(VERSION 3.10)
-project(shm_benchmark)
+# shm_benchmark
 
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
-if(CMAKE_BUILD_TYPE STREQUAL "Release")
-    # Enable aggressive optimizations for Release builds
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -march=native -flto")
-    # Link Time Optimization requires linker support
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -flto")
-endif()
+# Note: This file is intended to be included from the root CMakeLists.txt
 
 option(ENABLE_PROFILING "Enable gprof profiling" OFF)
-if(ENABLE_PROFILING)
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pg")
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -pg")
-    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -pg")
+
+set(SOURCES main.cpp)
+
+add_executable(shm_benchmark ${SOURCES})
+
+# Optimization flags
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(shm_benchmark PRIVATE -O3 -march=native -flto)
+        target_link_options(shm_benchmark PRIVATE -flto)
+    endif()
 endif()
 
-# Include directories
-include_directories(${CMAKE_SOURCE_DIR}/../include) # shm/include
-include_directories(${CMAKE_SOURCE_DIR}/include)    # benchmarks/include (generated headers)
-include_directories(${CMAKE_SOURCE_DIR}/external)
+if(ENABLE_PROFILING)
+    target_compile_options(shm_benchmark PRIVATE -pg)
+    target_link_options(shm_benchmark PRIVATE -pg)
+endif()
 
-# Add source files
-# IPCHost.cpp is removed, now header-only (templated)
-set(SOURCES
-    main.cpp
+# Include local headers (generated flatbuffers) and external
+target_include_directories(shm_benchmark PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/external
 )
 
-# Executable
-add_executable(shm_benchmark ${SOURCES})
-add_executable(guest_call_test ../tests/guest_call_test.cpp)
-
-# Libraries
-if(WIN32)
-    target_link_libraries(shm_benchmark PRIVATE ws2_32)
-    target_link_libraries(guest_call_test PRIVATE ws2_32)
-else()
-    target_link_libraries(shm_benchmark PRIVATE pthread rt)
-    target_link_libraries(guest_call_test PRIVATE pthread rt)
-endif()
+# Link against the main library
+target_link_libraries(shm_benchmark PRIVATE shm)

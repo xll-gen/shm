@@ -12,11 +12,8 @@ cleanup
 
 # Build C++
 echo "[Build] C++ Host..."
-mkdir -p benchmarks/build
-cd benchmarks/build
-cmake .. -DCMAKE_BUILD_TYPE=Release > /dev/null
-make -j$(nproc) > /dev/null
-cd ../..
+cmake -S . -B build -DSHM_BUILD_BENCHMARKS=ON -DCMAKE_BUILD_TYPE=Release > /dev/null
+cmake --build build --config Release --parallel > /dev/null
 
 # Build Go
 echo "[Build] Go Guest..."
@@ -46,7 +43,7 @@ run_case() {
         ARGS="$ARGS -v"
     fi
 
-    if timeout 60s ./benchmarks/build/shm_benchmark $ARGS; then
+    if timeout 60s ./build/benchmarks/shm_benchmark $ARGS; then
         echo "Success."
     else
         RET=$?
