@@ -51,12 +51,12 @@ int main() {
     const char* msg = "Hello";
     memcpy(guestReqBuf, msg, 5);
     guestSlotHeader->reqSize = 5;
-    guestSlotHeader->msgType = MSG_TYPE_GUEST_CALL;
+    guestSlotHeader->msgType = MsgType::GUEST_CALL;
     guestSlotHeader->state.store(SLOT_REQ_READY, std::memory_order_seq_cst);
 
     // Host processes in background thread or loop.
     // Handler writes to END of buffer (simulating zero-copy flatbuffer) and returns negative.
-    host.ProcessGuestCalls([&](const uint8_t* req, int32_t reqSize, uint8_t* resp, uint32_t maxRespSize, uint32_t msgType) -> int32_t {
+    host.ProcessGuestCalls([&](const uint8_t* req, int32_t reqSize, uint8_t* resp, uint32_t maxRespSize, MsgType msgType) -> int32_t {
         // Write "DONE" to end.
         const char* response = "DONE";
         int len = 4;
@@ -100,6 +100,7 @@ int main() {
     bool success = false;
     if (strncmp(dataAtEnd, "DONE", 4) == 0) {
         success = true;
+        std::cout << "Success!" << std::endl;
     } else {
         std::cerr << "Data mismatch at end. Got: " << std::string(dataAtEnd, 4) << std::endl;
     }

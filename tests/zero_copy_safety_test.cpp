@@ -33,7 +33,7 @@ void run_malicious_guest(std::string shmName, int numSlots) {
              uint32_t state = header->state.load(std::memory_order_acquire);
 
              if (state == SLOT_REQ_READY) {
-                 if (header->msgType == MSG_TYPE_FLATBUFFER) {
+                 if (header->msgType == MsgType::FLATBUFFER) {
                      // MALICIOUS ACT: Set respSize to cause underflow
                      header->respSize = -10000;
 
@@ -49,7 +49,7 @@ void run_malicious_guest(std::string shmName, int numSlots) {
 
                      running = false;
                      break;
-                 } else if (header->msgType == MSG_TYPE_SHUTDOWN) {
+                 } else if (header->msgType == MsgType::SHUTDOWN) {
                      running = false;
                      break;
                  }

@@ -20,7 +20,7 @@ int main() {
     // Since there is no Guest, this MUST timeout.
     // The spin loop will fail quickly.
     // Then it should check timeout and return.
-    int ret = host.Send(nullptr, 0, MSG_TYPE_NORMAL, resp, 1);
+    int ret = host.Send(nullptr, 0, MsgType::NORMAL, resp, 1);
     auto end = std::chrono::steady_clock::now();
 
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();

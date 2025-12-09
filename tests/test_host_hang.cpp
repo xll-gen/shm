@@ -48,7 +48,7 @@ int main() {
 
     auto start = std::chrono::steady_clock::now();
     // Pass 2000ms as per-call timeout
-    int result = host.Send(data.data(), 10, MSG_TYPE_NORMAL, resp, 2000);
+    int result = host.Send(data.data(), 10, MsgType::NORMAL, resp, 2000);
     auto end = std::chrono::steady_clock::now();
 
     std::cout << "Host returned: " << result << std::endl;

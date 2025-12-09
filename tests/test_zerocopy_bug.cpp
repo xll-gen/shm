@@ -103,7 +103,7 @@ int main() {
         // reqSize = 4. Guest looks at Start. Data is at Start. Guest finds "DATA".
         // Guest writes "OK".
 
-        slot.Send(4, MSG_TYPE_NORMAL);
+        slot.Send(4, MsgType::NORMAL);
 
         // Check Response
         uint8_t* resp = slot.GetRespBuffer();
