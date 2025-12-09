@@ -677,6 +677,8 @@ public:
      * @return int Bytes read (response size), or -1 on error.
      */
     int SendToSlot(uint32_t slotIdx, const uint8_t* data, int32_t size, uint32_t msgType, std::vector<uint8_t>& outResp, uint32_t timeoutMs = USE_DEFAULT_TIMEOUT) {
+        if (size != 0 && !data) return -1;
+
         int32_t idx = AcquireSpecificSlot((int32_t)slotIdx, timeoutMs);
         if (idx < 0) return -1;
 
@@ -711,6 +713,8 @@ public:
      * @return int Bytes read (response size), or -1 on error.
      */
     int Send(const uint8_t* data, int32_t size, uint32_t msgType, std::vector<uint8_t>& outResp, uint32_t timeoutMs = USE_DEFAULT_TIMEOUT) {
+        if (size != 0 && !data) return -1;
+
         int32_t idx = AcquireSlot();
         if (idx < 0) return -1;
 
