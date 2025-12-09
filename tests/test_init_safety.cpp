@@ -47,7 +47,7 @@ int main() {
             std::cout << "Init returned true (BUG)." << std::endl;
              std::vector<uint8_t> resp;
              // This line ensures we crash if the fix is partial
-             host.Send((const uint8_t*)"test", 4, 0, resp);
+             host.Send((const uint8_t*)"test", 4, shm::MsgType::NORMAL, resp);
         }
     }
 
