@@ -10,6 +10,8 @@ import (
 func TestShortTimeout(t *testing.T) {
 	shmName := "TestShortTimeout"
     UnlinkShm(shmName)
+    UnlinkEvent(fmt.Sprintf("%s_slot_0", shmName))
+    UnlinkEvent(fmt.Sprintf("%s_slot_0_resp", shmName))
     UnlinkEvent(fmt.Sprintf("%s_slot_1", shmName))
     UnlinkEvent(fmt.Sprintf("%s_slot_1_resp", shmName))
 
@@ -34,6 +36,18 @@ func TestShortTimeout(t *testing.T) {
     exHeader.RespOffset = 512
 
     // Create Events
+    // Slot 0
+    reqEvName0 := fmt.Sprintf("%s_slot_0", shmName)
+    respEvName0 := fmt.Sprintf("%s_slot_0_resp", shmName)
+    hReq0, _ := CreateEvent(reqEvName0)
+    hResp0, _ := CreateEvent(respEvName0)
+    defer func() {
+        CloseEvent(hReq0)
+        UnlinkEvent(reqEvName0)
+        CloseEvent(hResp0)
+        UnlinkEvent(respEvName0)
+    }()
+
     reqEvName := fmt.Sprintf("%s_slot_1", shmName)
     respEvName := fmt.Sprintf("%s_slot_1_resp", shmName)
 

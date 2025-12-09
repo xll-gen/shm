@@ -205,8 +205,26 @@ func NewDirectGuest(name string, _ int, _ int) (*DirectGuest, error) {
 		reqName := fmt.Sprintf("%s_slot_%d", name, i)
 		respName := fmt.Sprintf("%s_slot_%d_resp", name, i)
 
-		evReq, _ := OpenEvent(reqName)
-		evResp, _ := OpenEvent(respName)
+		evReq, err := OpenEvent(reqName)
+		if err != nil {
+			CloseShm(h, addr, totalSize)
+			for j := 0; j < i; j++ {
+				CloseEvent(g.slots[j].reqEvent)
+				CloseEvent(g.slots[j].respEvent)
+			}
+			return nil, fmt.Errorf("failed to open event %s: %v", reqName, err)
+		}
+
+		evResp, err := OpenEvent(respName)
+		if err != nil {
+			CloseEvent(evReq)
+			CloseShm(h, addr, totalSize)
+			for j := 0; j < i; j++ {
+				CloseEvent(g.slots[j].reqEvent)
+				CloseEvent(g.slots[j].respEvent)
+			}
+			return nil, fmt.Errorf("failed to open event %s: %v", respName, err)
+		}
 
 		g.slots[i].reqEvent = evReq
 		g.slots[i].respEvent = evResp
