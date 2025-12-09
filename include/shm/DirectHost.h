@@ -458,9 +458,42 @@ public:
         if (!running) return;
 
         for (uint32_t i = 0; i < numSlots; ++i) {
-            std::vector<uint8_t> dummy;
-            // Use short timeout (1000ms) to avoid hanging on stuck slots
-            SendToSlot(i, nullptr, 0, MSG_TYPE_SHUTDOWN, dummy, 1000);
+            Slot* slot = &slots[i];
+
+            // Forcefully acquire slot, handling FREE or RESP_READY (stuck response).
+            // This ensures we can shutdown even if a response was left unread.
+
+            bool acquired = false;
+            auto start = std::chrono::steady_clock::now();
+
+            while (true) {
+                 uint32_t expected = slot->header->state.load(std::memory_order_acquire);
+
+                 // If FREE or RESP_READY, we can claim it.
+                 // RESP_READY means Guest is done and waiting for us. We discard the old response.
+                 if (expected == SLOT_FREE || expected == SLOT_RESP_READY) {
+                      if (slot->header->state.compare_exchange_strong(expected, SLOT_BUSY, std::memory_order_acquire)) {
+                           acquired = true;
+                           break;
+                      }
+                      continue; // Retry
+                 }
+
+                 // If Guest is busy (REQ_READY) or Host is writing (BUSY - shouldn't happen), wait.
+                 auto now = std::chrono::steady_clock::now();
+                 if (std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count() > 1000) {
+                      break; // Timeout
+                 }
+                 Platform::ThreadYield();
+            }
+
+            if (acquired) {
+                 // We own the slot (BUSY). Use SendAcquired to transmit Shutdown.
+                 std::vector<uint8_t> dummy;
+                 SendAcquired((int32_t)i, 0, MSG_TYPE_SHUTDOWN, dummy, 1000);
+            }
+            // If not acquired (Timeout), we failed to shutdown this worker.
+            // We skip SendToSlot because it would just wait for FREE and timeout again.
         }
     }
 
