@@ -113,6 +113,7 @@ type DirectGuest struct {
 
 	slots []slotContext
 	wg    sync.WaitGroup
+	closing int32
 }
 
 // NewDirectGuest initializes the DirectGuest by attaching to an existing shared memory region.
@@ -249,31 +250,16 @@ func (g *DirectGuest) Start(handler func(req []byte, resp []byte, msgType MsgTyp
 }
 
 // Close releases shared memory resources.
-// It closes the shared memory handle but intentionally does not unmap memory immediately
-// if it might cause a crash in active worker threads (implementation specific).
+// It signals workers to exit and cleans up resources.
 func (g *DirectGuest) Close() {
-    // Since we cannot safely interrupt the worker loops (blocked in CGO/sem_wait) without Host cooperation,
-    // and this architecture is designed for 1:1 process mapping usually,
-    // "Closing" the Guest while keeping the process alive is tricky.
+	atomic.StoreInt32(&g.closing, 1)
+	g.wg.Wait()
 
-    // 1. Mark as closed (not implemented but concept)
-
-    // 2. We skip CloseEvent. On Linux, closing a semaphore while another thread waits on it is UB/crash.
-    // 3. We skip CloseShm/Unmap. If we unmap, the worker accessing the pointer crashes.
-
-    // Effectively, we "leak" the resources until the process exits.
-    // This allows the user to "Close" the client object, but the background goroutines will persist
-    // until the Host sends a Shutdown signal or the process ends.
-    // This prevents the SEGFAULTs.
-    // The file descriptors will leak, but that is better than a crash.
-    // For a robust restartable client, we would need a local "Stop" event that we can signal.
-
-    // Current workaround: Do nothing destructive.
-    // Just close the ShmHandle but NOT unmap? No, CloseShm unmaps.
-
-    // We will just return. Resources are cleaned up on process exit.
-    // This fixes the "Disconnect -> Reconnect Failure" by NOT unlinking.
-    // This fixes the "Crash on Close" by NOT closing/unmapping active resources.
+	for i := range g.slots {
+		CloseEvent(g.slots[i].reqEvent)
+		CloseEvent(g.slots[i].respEvent)
+	}
+	CloseShm(g.handle, g.shmBase, g.shmSize)
 }
 
 // Wait blocks the calling thread until all worker goroutines have exited.
@@ -455,6 +441,10 @@ func (g *DirectGuest) workerLoop(idx int, handler func([]byte, []byte, MsgType) 
     atomic.StoreUint32(&header.GuestState, GuestStateActive)
 
 	for {
+		if atomic.LoadInt32(&g.closing) == 1 {
+			return
+		}
+
 		// Adaptive Wait for REQ_READY
         ready := false
         currentLimit := slot.spinLimit
@@ -513,6 +503,11 @@ func (g *DirectGuest) workerLoop(idx int, handler func([]byte, []byte, MsgType) 
                  atomic.StoreUint32(&header.GuestState, GuestStateActive)
             } else {
                  WaitForEvent(slot.reqEvent, 100)
+
+				 if atomic.LoadInt32(&g.closing) == 1 {
+					 return
+				 }
+
                  // Check again
                  // If SHM unmapped, this load faults.
                  if atomic.LoadUint32(&header.State) == SlotReqReady {
