@@ -2,7 +2,6 @@ package shm
 
 import (
 	"fmt"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -94,7 +93,7 @@ type slotContext struct {
 	respBuffer []byte
 	reqEvent   EventHandle
 	respEvent  EventHandle
-    spinLimit  int
+    waitStrategy *WaitStrategy
 }
 
 // DirectGuest implements the Guest side of the Direct Mode IPC.
@@ -234,7 +233,7 @@ func NewDirectGuest(name string, _ int, _ int) (*DirectGuest, error) {
 
 		g.slots[i].reqEvent = evReq
 		g.slots[i].respEvent = evResp
-        g.slots[i].spinLimit = 2000
+        g.slots[i].waitStrategy = NewWaitStrategy()
 
 		ptr += uintptr(perSlotSize)
 	}
@@ -346,54 +345,52 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, msgType MsgType, timeou
 	atomic.StoreUint32(&slot.header.State, SlotReqReady)
 	SignalEvent(slot.reqEvent)
 
-	// Wait for Response
-	ready := false
-	currentLimit := 2000
+	// Wait for Response using WaitStrategy
+    // Since Guest Calls are transient/shared, we might want a per-call strategy?
+    // But `slot` is one of the Guest Slots.
+    // However, the `slotContext` struct now has `waitStrategy`.
+    // But note: `sendGuestCallInternal` picks ANY free guest slot.
+    // If multiple threads use SendGuestCall, they might pick the same slot sequentially.
+    // Adaptation on that slot is fine.
 
-	for i := 0; i < currentLimit; i++ {
-		if atomic.LoadUint32(&slot.header.State) == SlotRespReady {
-			ready = true
-			break
-		}
-		// Yield less frequently
-		if i&0x3F == 0 {
-			runtime.Gosched()
-		}
-	}
+    checkReady := func() bool {
+        return atomic.LoadUint32(&slot.header.State) == SlotRespReady
+    }
 
-	if !ready {
-		atomic.StoreUint32(&slot.header.GuestState, GuestStateWaiting)
-		if atomic.LoadUint32(&slot.header.State) == SlotRespReady {
-			ready = true
-			atomic.StoreUint32(&slot.header.GuestState, GuestStateActive)
-		} else {
-			// Loop to handle spurious wakeups
-			start := time.Now()
-			for {
-				if atomic.LoadUint32(&slot.header.State) == SlotRespReady {
-					ready = true
-					break
-				}
+    sleepAction := func() {
+        atomic.StoreUint32(&slot.header.GuestState, GuestStateWaiting)
+        if checkReady() {
+            atomic.StoreUint32(&slot.header.GuestState, GuestStateActive)
+            return
+        }
 
-				elapsed := time.Since(start)
-				if elapsed >= timeout {
-					break
-				}
+        // Loop to handle spurious wakeups
+        start := time.Now()
+        for {
+            if checkReady() {
+                break
+            }
 
-				remaining := timeout - elapsed
-				waitMs := uint32(remaining.Milliseconds())
-				if waitMs == 0 && remaining > 0 {
-					waitMs = 1
-				}
-				if waitMs > 100 {
-					waitMs = 100
-				}
+            elapsed := time.Since(start)
+            if elapsed >= timeout {
+                break
+            }
 
-				WaitForEvent(slot.respEvent, waitMs)
-			}
-			atomic.StoreUint32(&slot.header.GuestState, GuestStateActive)
-		}
-	}
+            remaining := timeout - elapsed
+            waitMs := uint32(remaining.Milliseconds())
+            if waitMs == 0 && remaining > 0 {
+                waitMs = 1
+            }
+            if waitMs > 100 {
+                waitMs = 100
+            }
+
+            WaitForEvent(slot.respEvent, waitMs)
+        }
+        atomic.StoreUint32(&slot.header.GuestState, GuestStateActive)
+    }
+
+    ready := slot.waitStrategy.Wait(checkReady, sleepAction)
 
 	if !ready {
 		// Timeout - DO NOT free, Host might process late.
@@ -450,78 +447,31 @@ func (g *DirectGuest) workerLoop(idx int, handler func([]byte, []byte, MsgType) 
 			return
 		}
 
-		// Adaptive Wait for REQ_READY
-        ready := false
-        currentLimit := slot.spinLimit
-        const minSpin = 1
-        const maxSpin = 2000
-
-        // 1. Spin
-        for i := 0; i < currentLimit; i++ {
-            if atomic.LoadUint32(&header.State) == SlotReqReady {
-                ready = true
-                break
-            }
-            // Yield less frequently to reduce scheduler overhead (every 64 iterations)
-            if i&0x3F == 0 {
-                runtime.Gosched()
-            }
+		// Adaptive Wait for REQ_READY using WaitStrategy
+        checkReady := func() bool {
+            return atomic.LoadUint32(&header.State) == SlotReqReady
         }
 
-        if ready {
-            if currentLimit < maxSpin { currentLimit += 100 }
-        } else {
-            if currentLimit > minSpin { currentLimit -= 500 }
-            if currentLimit < minSpin { currentLimit = minSpin }
-
-            // 2. Sleep
+        sleepAction := func() {
             atomic.StoreUint32(&header.GuestState, GuestStateWaiting)
 
-            // Double check
-            // Accessing header might Segfault if SHM is unmapped?
-            // Yes. In Close(), we unmap SHM.
-            // If we access header here, we crash.
-            // We need to recover from panic or check validity?
-            // But checking validity requires a lock or atomic that is not in SHM.
-            // But we don't have that.
-
-            // To be safe against Unmap, we must ensure worker stops BEFORE Unmap.
-            // Since we can't signaling them easily, we are stuck.
-            // HOWEVER, the SEGFAULT happens at `WaitForEvent` usually?
-            // No, the previous crash was accessing `header.State` or `WaitForEvent`.
-            // If we unmap, `header` pointer becomes invalid.
-
-            // This architecture assumes the Guest Process exits when it's done.
-            // But "Reconnect" implies the process stays alive.
-            // So we MUST stop the goroutines.
-            // We can add a `closed int32` flag to DirectGuest and check it?
-            // But the worker is inside `WaitForEvent`.
-
-            // Solution: We need a "Shutdown" event that is local to the process?
-            // Or we just accept that `Close()` is terminal for the process usually.
-            // But for the sake of the test (and robustness), we should handle it.
-
-            // Let's defer panic to exit cleanly?
-
-            if atomic.LoadUint32(&header.State) == SlotReqReady {
-                 ready = true
-                 atomic.StoreUint32(&header.GuestState, GuestStateActive)
-            } else {
-                 WaitForEvent(slot.reqEvent, 100)
-
-				 if atomic.LoadInt32(&g.closing) == 1 {
-					 return
-				 }
-
-                 // Check again
-                 // If SHM unmapped, this load faults.
-                 if atomic.LoadUint32(&header.State) == SlotReqReady {
-                     ready = true
-                 }
-                 atomic.StoreUint32(&header.GuestState, GuestStateActive)
+            if checkReady() {
+                atomic.StoreUint32(&header.GuestState, GuestStateActive)
+                return
             }
+
+            WaitForEvent(slot.reqEvent, 100)
+
+            if atomic.LoadInt32(&g.closing) == 1 {
+                return
+            }
+
+            // Check again (might fault if unmapped, handled by recover)
+            // checkReady() is called by WaitStrategy after sleepAction returns.
+            atomic.StoreUint32(&header.GuestState, GuestStateActive)
         }
-        slot.spinLimit = currentLimit
+
+        ready := slot.waitStrategy.Wait(checkReady, sleepAction)
 
         if ready {
              // Process
