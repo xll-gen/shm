@@ -4,7 +4,7 @@ SimpleIPC is a high-performance, low-latency shared-memory IPC library connectin
 
 > **⚠️ WARNING: EXPERIMENTAL STATUS**
 >
-> This project is currently in an **experimental stage** and is under active development.
+> This project is currently in an **experimental stage** (v0.3.0) and is under active development.
 > It is **NOT** recommended for use in production environments at this time.
 > APIs and memory layouts are subject to change without notice.
 
@@ -73,21 +73,19 @@ If a peer is not responsive (spinning times out), the other peer will wait on a 
 #include <shm/DirectHost.h>
 
 shm::DirectHost host;
-if (!host.Init("MyIPC", 4)) { // 4 Worker Slots
-    return -1;
-}
+shm::HostConfig config;
+config.shmName = "MyIPC";
+config.numHostSlots = 4;
+config.payloadSize = 1024 * 1024; // 1MB payload per slot
 
-/*
-// To enable Async Guest Calls (Guest -> Host), use the 4th argument:
-if (!host.Init("MyIPC", 4, 1024*1024, 2)) { // 4 Worker Slots, 1MB Slot Size, 2 Async Slots
+if (!host.Init(config)) {
     return -1;
 }
-*/
 
 std::vector<uint8_t> resp;
 // Send 4 bytes to any available slot
 // Note: This blocks until response is received.
-host.Send((const uint8_t*)"test", 4, MSG_TYPE_NORMAL, resp);
+host.Send((const uint8_t*)"test", 4, shm::MsgType::NORMAL, resp);
 ```
 
 ### Zero-Copy (FlatBuffers)
@@ -120,7 +118,16 @@ package main
 import "github.com/xll-gen/shm/go"
 
 func main() {
-    client, _ := shm.Connect("MyIPC")
+    // Basic Connection
+    client, _ := shm.ConnectDefault("MyIPC")
+
+    // Or Advanced Configuration
+    /*
+    client, _ := shm.Connect(shm.ClientConfig{
+        ShmName: "MyIPC",
+        ConnectionTimeout: 5 * time.Second,
+    })
+    */
 
     // Handler now receives msgType and returns msgType
     client.Handle(func(req []byte, respBuf []byte, msgType shm.MsgType) (int32, shm.MsgType) {
@@ -150,10 +157,10 @@ The system reserves types `0` through `127`. User-defined types should start at 
 #include <shm/IPCUtils.h>
 
 // Define your custom Type
-const uint32_t MY_OP_TYPE = MSG_TYPE_APP_START + 1;
+const uint32_t MY_OP_TYPE = (uint32_t)shm::MsgType::APP_START + 1;
 
 // Send
-host.Send(payload, size, MY_OP_TYPE, resp);
+host.Send(payload, size, (shm::MsgType)MY_OP_TYPE, resp);
 ```
 
 **Go Guest:**
@@ -176,13 +183,16 @@ The library supports Guest-initiated calls (e.g., for async callbacks). Specific
 **C++ Host (Listener):**
 
 ```cpp
-// Init with 4 Host Slots and 2 Guest Slots
-host.Init("MyIPC", 4, 1024*1024, 2);
+shm::HostConfig config;
+config.shmName = "MyIPC";
+config.numHostSlots = 4;
+config.numGuestSlots = 2; // 2 Async Slots
+host.Init(config);
 
 // In a background thread:
 while (running) {
-    host.ProcessGuestCalls([](const uint8_t* req, int32_t reqSize, uint8_t* resp, uint32_t maxRespSize, uint32_t msgType) -> int32_t {
-        if (msgType == MSG_TYPE_GUEST_CALL) {
+    host.ProcessGuestCalls([](const uint8_t* req, int32_t reqSize, uint8_t* resp, uint32_t maxRespSize, shm::MsgType msgType) -> int32_t {
+        if (msgType == shm::MsgType::GUEST_CALL) {
              // Process Guest Request
         }
         return 0; // Return response size

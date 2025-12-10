@@ -53,8 +53,8 @@ const (
 
 	// Magic is the magic number for validating shared memory ("XLL!").
 	Magic uint32 = 0x584C4C21
-	// Version is the current protocol version (v0.2.0).
-	Version uint32 = 0x00020000
+	// Version is the current protocol version (v0.3.0).
+	Version uint32 = 0x00030000
 
 	// HostStateActive indicates the Host is spinning or processing.
 	HostStateActive  = 0
@@ -77,7 +77,7 @@ type SlotHeader struct {
     MsgType   MsgType
 	ReqSize   int32
 	RespSize  int32
-    _         [36]byte
+    _         [36]byte // Reserved
 }
 
 // ExchangeHeader represents the metadata at the start of the shared memory region.
@@ -90,7 +90,7 @@ type ExchangeHeader struct {
 	SlotSize      uint32
 	ReqOffset     uint32
 	RespOffset    uint32
-	_             [36]byte
+	_             [36]byte // Reserved
 }
 
 // slotContext holds local runtime state for a slot.
@@ -125,17 +125,11 @@ type DirectGuest struct {
 // NewDirectGuest initializes the DirectGuest by attaching to an existing shared memory region.
 //
 // name: The name of the shared memory region.
-// unused1: Ignored parameter (legacy compatibility).
-// unused2: Ignored parameter (legacy compatibility).
 //
 // Returns a pointer to the initialized DirectGuest or an error if attachment fails.
-func NewDirectGuest(name string, _ int, _ int) (*DirectGuest, error) {
+func NewDirectGuest(name string) (*DirectGuest, error) {
 	// 1. Map Header
 	// We try to map a small chunk first to read the header.
-	// However, if the file is smaller than 4096 (e.g. 1 slot), OpenShm check will fail.
-	// We should map sizeof(ExchangeHeader) at minimum (64 bytes).
-	// But OpenShm is page-aligned usually? No, mmap is.
-	// Let's use 64 bytes.
 	const HeaderMapSize = 64
 	h, addr, err := OpenShm(name, HeaderMapSize)
 	if err != nil {

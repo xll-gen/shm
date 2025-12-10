@@ -69,7 +69,7 @@ func TestGuestCallTimeoutConfig(t *testing.T) {
     }()
 
     // 2. Guest Logic
-    guest, err := NewDirectGuest(shmName, 0, 0)
+	guest, err := NewDirectGuest(shmName)
     if err != nil {
         t.Fatalf("NewDirectGuest failed: %v", err)
     }
