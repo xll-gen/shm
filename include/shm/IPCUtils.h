@@ -28,6 +28,19 @@
 namespace shm {
 
 /**
+ * @brief Magic Number "XLL!" (0x584C4C21).
+ * Used to verify that the shared memory region is a valid xll-gen/shm segment.
+ */
+static const uint32_t SHM_MAGIC = 0x584C4C21;
+
+/**
+ * @brief Protocol Version v0.2.0 (0x00020000).
+ * High 16 bits: Major, Low 16 bits: Minor.
+ * Breaking changes increment Major version.
+ */
+static const uint32_t SHM_VERSION = 0x00020000;
+
+/**
  * @brief Message Types for control messages.
  * Strongly typed enum to ensure type safety and match Go implementation.
  */
@@ -141,6 +154,10 @@ enum SlotState {
  * to map the memory correctly.
  */
 struct ExchangeHeader {
+    /** @brief Magic Number (SHM_MAGIC). */
+    uint32_t magic;
+    /** @brief Protocol Version (SHM_VERSION). */
+    uint32_t version;
     /** @brief Number of slots in the pool (Host -> Guest). */
     uint32_t numSlots;
     /** @brief Number of Guest Call slots (Guest -> Host). */
@@ -152,7 +169,7 @@ struct ExchangeHeader {
     /** @brief Offset of the Response buffer within a slot. */
     uint32_t respOffset;
     /** @brief Padding to align to 64 bytes. */
-    uint8_t padding[44];
+    uint8_t padding[36];
 };
 
 }
