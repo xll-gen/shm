@@ -334,12 +334,29 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, msgType MsgType, timeou
 	endIdx := int(g.numSlots + g.numGuestSlots)
 
 	var slot *slotContext
-	// Simple scan
+	// Scan for free slots AND reclaim zombie slots
 	for i := startIdx; i < endIdx; i++ {
 		s := &g.slots[i]
-		if atomic.CompareAndSwapUint32(&s.header.State, SlotFree, SlotBusy) {
-			slot = s
-			break
+		currentState := atomic.LoadUint32(&s.header.State)
+
+		// Case 1: Slot is Free. Try to claim it.
+		if currentState == SlotFree {
+			if atomic.CompareAndSwapUint32(&s.header.State, SlotFree, SlotBusy) {
+				slot = s
+				break
+			}
+		}
+
+		// Case 2: Slot is stuck in RESP_READY (Zombie).
+		// This happens if a previous caller timed out and abandoned the slot,
+		// but the Host eventually processed it and set it to RESP_READY.
+		// Since the original caller is gone, we can safely reclaim it.
+		// We transition RESP_READY -> BUSY.
+		if currentState == SlotRespReady {
+			if atomic.CompareAndSwapUint32(&s.header.State, SlotRespReady, SlotBusy) {
+				slot = s
+				break
+			}
 		}
 	}
 
