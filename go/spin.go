@@ -19,9 +19,9 @@ func NewWaitStrategy() *WaitStrategy {
 	return &WaitStrategy{
 		CurrentLimit: 2000,
 		MinSpin:      100,
-		MaxSpin:      20000,
-		IncStep:      100,
-		DecStep:      500,
+		MaxSpin:      5000,
+		IncStep:      200,
+		DecStep:      100,
 	}
 }
 

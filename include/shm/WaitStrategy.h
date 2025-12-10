@@ -26,10 +26,10 @@ public:
      * Default values are tuned for high-performance IPC:
      * - Max: 20000 (Allows adaptation to medium latencies)
      * - Min: 100 (Avoids complete waste if thrashing)
-     * - Inc: 100 (Gradual increase)
-     * - Dec: 500 (Aggressive backoff on failure)
+     * - Inc: 200 (Aggressive increase)
+     * - Dec: 100 (Gradual backoff)
      */
-    WaitStrategy(int min = 100, int max = 20000, int inc = 100, int dec = 500)
+    WaitStrategy(int min = 100, int max = 5000, int inc = 200, int dec = 100)
         : currentLimit(min), minSpin(min), maxSpin(max), incStep(inc), decStep(dec) {
             // Start with a reasonable middle ground or min?
             // Usually starting at min allows quick ramp up if needed,
