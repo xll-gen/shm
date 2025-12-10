@@ -42,7 +42,7 @@ func (w *WaitStrategy) Wait(condition func() bool, sleepAction func()) bool {
 			break
 		}
 		// Yield less frequently to reduce scheduler overhead (every 64 iterations)
-		if i&0x3F == 0 {
+		if i&0x7F == 0 {
 			runtime.Gosched()
 		}
 	}
