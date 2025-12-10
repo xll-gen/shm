@@ -58,7 +58,7 @@ func TestLeakOnClose(t *testing.T) {
     t.Logf("Initial FDs: %d", initialFDs)
 
     for i := 0; i < 50; i++ {
-        guest, err := NewDirectGuest(shmName, 0, 0)
+		guest, err := NewDirectGuest(shmName)
         if err != nil {
             t.Fatalf("Iteration %d: NewDirectGuest failed: %v", i, err)
         }

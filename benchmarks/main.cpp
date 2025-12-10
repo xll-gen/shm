@@ -157,7 +157,14 @@ int main(int argc, char** argv) {
     // So size >= 2 * ceil(X, 64).
     if (requiredSize < 256) requiredSize = 256;
 
-    if (!host.Init(SHM_NAME, NUM_THREADS, requiredSize, numGuestSlots)) {
+    // New HostConfig usage
+    HostConfig config;
+    config.shmName = SHM_NAME;
+    config.numHostSlots = NUM_THREADS;
+    config.payloadSize = requiredSize;
+    config.numGuestSlots = numGuestSlots;
+
+    if (!host.Init(config)) {
         std::cerr << "Failed to init DirectHost." << std::endl;
         return 1;
     }

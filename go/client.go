@@ -5,6 +5,18 @@ import (
 	"time"
 )
 
+// ClientConfig holds configuration parameters for the Client connection.
+type ClientConfig struct {
+	// ShmName is the name of the shared memory region (e.g., "MyIPC").
+	ShmName string
+	// ConnectionTimeout is the maximum duration to wait for the Host to initialize shared memory.
+	// Default: 10 seconds.
+	ConnectionTimeout time.Duration
+	// RetryInterval is the interval between connection attempts.
+	// Default: 100 milliseconds.
+	RetryInterval time.Duration
+}
+
 // Client is the high-level API for the Guest side of the IPC.
 // It wraps DirectGuest and handles connection retries and lifecycle management.
 type Client struct {
@@ -12,28 +24,50 @@ type Client struct {
 	handler func([]byte, []byte, MsgType) (int32, MsgType)
 }
 
-// Connect attempts to establish a connection to the Host with the given shared memory name.
-// It assumes Direct Mode and retries up to 50 times (5 seconds) for the Host to initialize the memory.
+// Connect attempts to establish a connection to the Host using the provided configuration.
+// It assumes Direct Mode and retries until the timeout expires.
 //
-// name: The name of the shared memory region (e.g., "MyIPC").
+// config: The configuration object.
 //
 // Returns a Client instance or an error if connection fails after retries.
-func Connect(name string) (*Client, error) {
+func Connect(config ClientConfig) (*Client, error) {
 	var g *DirectGuest
 	var err error
 
-	// Retry loop
-	for i := 0; i < 100; i++ {
+	timeout := config.ConnectionTimeout
+	if timeout == 0 {
+		timeout = 10 * time.Second
+	}
+
+	interval := config.RetryInterval
+	if interval == 0 {
+		interval = 100 * time.Millisecond
+	}
+
+	start := time.Now()
+
+	for {
 		// Direct Mode: Auto-discover configuration from SHM Header.
-		// Extra params ignored as DirectGuest discovers size from header.
-		g, err = NewDirectGuest(name, 0, 0)
+		g, err = NewDirectGuest(config.ShmName)
 
 		if err == nil {
 			return &Client{guest: g}, nil
 		}
-		time.Sleep(100 * time.Millisecond)
+
+		if time.Since(start) >= timeout {
+			break
+		}
+		time.Sleep(interval)
 	}
-	return nil, fmt.Errorf("failed to connect after retries: %v", err)
+	return nil, fmt.Errorf("failed to connect to %s after %v: %v", config.ShmName, timeout, err)
+}
+
+// ConnectDefault is a helper for backward compatibility or simple usage.
+// It connects with default settings (10s timeout).
+func ConnectDefault(name string) (*Client, error) {
+    return Connect(ClientConfig{
+        ShmName: name,
+    })
 }
 
 // Handle registers the request handler function.

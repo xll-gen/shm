@@ -18,6 +18,27 @@
 namespace shm {
 
 /**
+ * @struct HostConfig
+ * @brief Configuration parameters for initializing the DirectHost.
+ */
+struct HostConfig {
+    /** @brief Name of the shared memory region (e.g., "MyIPC"). */
+    std::string shmName;
+
+    /** @brief Number of slots (workers) to allocate for Host-to-Guest communication. */
+    uint32_t numHostSlots;
+
+    /** @brief Desired capacity for request/response payloads in bytes.
+     * The actual shared memory slot size will be calculated to accommodate this payload plus headers.
+     * Default: 1MB.
+     */
+    uint32_t payloadSize = 1024 * 1024;
+
+    /** @brief Number of slots to allocate for Guest-to-Host calls. Default: 0. */
+    uint32_t numGuestSlots = 0;
+};
+
+/**
  * @class DirectHost
  * @brief Implements the Host side of the Direct Mode IPC.
  *
@@ -368,27 +389,21 @@ public:
     }
 
     /**
-     * @brief Initializes the Shared Memory Host.
+     * @brief Initializes the Shared Memory Host using a configuration object.
      *
      * Creates the shared memory region and initializes the ExchangeHeader and SlotHeaders.
-     * Also creates the necessary synchronization events for each slot.
      *
-     * @param shmName The name of the shared memory region.
-     * @param numHostSlots The number of slots (workers) to allocate for Host-to-Guest communication.
-     * @param dataSize The total size of the data payload per slot (split between Req/Resp). Default 1MB.
-     * @param numGuestSlots The number of slots to allocate for Guest-to-Host calls. Default 0.
+     * @param config The HostConfig object containing initialization parameters.
      * @return Result<void> Success or Error.
      */
-    Result<void> Init(const std::string& shmName, uint32_t numHostSlots, uint32_t dataSize = 1024 * 1024, uint32_t numGuestSlots = 0) {
-        this->shmName = shmName;
-        this->numSlots = numHostSlots; // Host -> Guest slots
-        this->numGuestSlots = numGuestSlots; // Guest -> Host slots
-        this->slotSize = dataSize;
+    Result<void> Init(const HostConfig& config) {
+        this->shmName = config.shmName;
+        this->numSlots = config.numHostSlots;
+        this->numGuestSlots = config.numGuestSlots;
+        this->slotSize = config.payloadSize;
 
         // Calculate Stride for Global Uniqueness (Interleaved)
         // stride = Total Slots.
-        // Slot 0: 1, 1+T, 1+2T
-        // Slot 1: 2, 2+T, 2+2T
         this->msgSeqStride = numSlots + numGuestSlots;
 
         // Split strategy: 50/50
@@ -420,7 +435,7 @@ public:
         shmBase = Platform::CreateNamedShm(shmName.c_str(), totalSize, hMapFile, exists);
         if (!shmBase) return Result<void>::Failure(Error::InternalError);
 
-        // Zero out memory if new (or always, to be safe?)
+        // Zero out memory if new
         memset(shmBase, 0, totalSize);
 
         // Write ExchangeHeader
@@ -477,6 +492,18 @@ public:
 
         running = true;
         return Result<void>::Success();
+    }
+
+    /**
+     * @brief Deprecated Init method. Use HostConfig variant instead.
+     */
+    Result<void> Init(const std::string& shmName, uint32_t numHostSlots, uint32_t payloadSize = 1024 * 1024, uint32_t numGuestSlots = 0) {
+        HostConfig config;
+        config.shmName = shmName;
+        config.numHostSlots = numHostSlots;
+        config.payloadSize = payloadSize;
+        config.numGuestSlots = numGuestSlots;
+        return Init(config);
     }
 
     /**

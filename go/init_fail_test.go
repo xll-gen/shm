@@ -40,7 +40,7 @@ func TestInitFailOnEventError(t *testing.T) {
 
     // Attempt NewDirectGuest
     // This should fail because creating/opening the event /aaaa..._slot_0 will fail (too long)
-    _, err = NewDirectGuest(name, 0, 0)
+    _, err = NewDirectGuest(name)
 
     if err == nil {
         t.Errorf("Expected error from NewDirectGuest (invalid event name), got nil")

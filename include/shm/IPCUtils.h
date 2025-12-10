@@ -34,11 +34,11 @@ namespace shm {
 static const uint32_t SHM_MAGIC = 0x584C4C21;
 
 /**
- * @brief Protocol Version v0.2.0 (0x00020000).
+ * @brief Protocol Version v0.3.0 (0x00030000).
  * High 16 bits: Major, Low 16 bits: Minor.
  * Breaking changes increment Major version.
  */
-static const uint32_t SHM_VERSION = 0x00020000;
+static const uint32_t SHM_VERSION = 0x00030000;
 
 /**
  * @brief Message Types for control messages.
@@ -121,11 +121,11 @@ struct SlotHeader {
     int32_t respSize;
 
     /**
-     * @brief Padding to align the struct to 128 bytes total size.
+     * @brief Reserved for future use.
      * 64 (pre_pad) + 4 (state) + 4 (hostState) + 4 (guestState) + 4 (msgSeq) + 4 (msgType) + 4 (reqSize) + 4 (respSize) = 92 bytes.
-     * 128 - 92 = 36 bytes padding.
+     * 128 - 92 = 36 bytes reserved.
      */
-    uint8_t padding[36];
+    uint8_t reserved[36];
 };
 
 // Slot State Constants
@@ -168,8 +168,8 @@ struct ExchangeHeader {
     uint32_t reqOffset;
     /** @brief Offset of the Response buffer within a slot. */
     uint32_t respOffset;
-    /** @brief Padding to align to 64 bytes. */
-    uint8_t padding[36];
+    /** @brief Reserved for future use. */
+    uint8_t reserved[36];
 };
 
 }
