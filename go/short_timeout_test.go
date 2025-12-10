@@ -48,7 +48,7 @@ func TestShortTimeout(t *testing.T) {
         UnlinkEvent(respEvName0)
     }()
 
-    reqEvName := fmt.Sprintf("%s_slot_1", shmName)
+    reqEvName := fmt.Sprintf("%s_guest_call", shmName)
     respEvName := fmt.Sprintf("%s_slot_1_resp", shmName)
 
     hReq, err := CreateEvent(reqEvName)
