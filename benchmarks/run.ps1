@@ -1,31 +1,10 @@
-# Stop on first error
-$ErrorActionPreference = "Stop"
-
-# Cleanup function
-function Cleanup-Processes {
-    Write-Host "Cleaning up old processes..."
-    # Stop any running server or benchmark processes from previous runs
-    Get-Process | Where-Object { $_.Name -in @("server", "shm_benchmark") } | Stop-Process -Force -ErrorAction SilentlyContinue
-}
-
-# Initial cleanup
-Cleanup-Processes
-
 # Build C++
 Write-Host "[Build] C++ Host..."
 # Create build directory if it doesn't exist
-New-Item -Path "benchmarks/build" -ItemType Directory -Force | Out-Null
-# Change to build directory
-Set-Location -Path "benchmarks/build"
-
-# Run CMake and build
-# Note: This assumes a suitable generator like "Visual Studio" or "Ninja" is available.
-# To be more robust, one could specify a generator with -G, but for now we'll let CMake decide.
-cmake .. -DCMAKE_BUILD_TYPE=Release
-cmake --build . --config Release
-
-# Change back to the project root
-Set-Location -Path "../.."
+New-Item -Path "build_bench" -ItemType Directory -Force | Out-Null
+# Run CMake from the root and build
+cmake -S . -B build_bench -DSHM_BUILD_BENCHMARKS=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build_bench --config Release
 
 # Build Go
 Write-Host "[Build] Go Guest..."
@@ -56,7 +35,7 @@ function Run-Case {
     Start-Sleep -Seconds 2
 
     # Run C++ client and wait for it to finish, with a timeout
-    $benchmarkExe = (Resolve-Path -Path "./benchmarks/build/shm_benchmark.exe").Path
+    $benchmarkExe = (Resolve-Path -Path "./build_bench/benchmarks/shm_benchmark.exe").Path
     $benchmarkArgs = "-t $Threads"
     if ($env:VERBOSE -eq "1") {
         $benchmarkArgs += " -v"
@@ -124,8 +103,5 @@ function Run-Case {
 Run-Case -Threads 1
 Run-Case -Threads 4
 Run-Case -Threads 8
-
-# Final cleanup
-Cleanup-Processes
-
-Write-Host "Done."
+Run-Case -Threads 12
+Run-Case -Threads 24

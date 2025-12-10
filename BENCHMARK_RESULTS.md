@@ -8,6 +8,21 @@ The project has transitioned to a "Direct Exchange" IPC mode, removing legacy qu
 
 The benchmark evaluates the "System Effective OPS" (Total successful operations per second) and average Round-Trip Latency (RTT) between the C++ Host and Go Guest.
 
+### Windows (Ryzen 9 3900X 12-Core)
+
+**Environment:** Windows 10
+**CPU:** AMD Ryzen 9 3900X 12-Core Processor
+**Payload:** 64 bytes (Ping-Pong)
+
+| Threads | Throughput (ops/s) |
+|:---:|:---:|
+| 1 | 2,922,546 |
+| 4 | 2,194,114 |
+| 8 | 1,443,110 |
+| 12 | 1,451,307 |
+| 24 | 1,784,417 |
+
+### Sandbox (Containerized)
 **Environment:** Sandbox (Containerized)
 **Payload:** 64 bytes (Ping-Pong)
 
