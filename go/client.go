@@ -92,6 +92,17 @@ func (c *Client) SendGuestCallWithTimeout(data []byte, msgType MsgType, timeout 
 	return c.guest.SendGuestCallWithTimeout(data, msgType, timeout)
 }
 
+// AcquireGuestSlot acquires a free guest slot for Zero-Copy operations.
+//
+// This allows the caller to write directly to the shared memory buffer
+// and read the response directly, avoiding extra allocations.
+//
+// Returns a GuestSlot object or an error if no slots are available.
+// The caller must call Release() on the slot when finished.
+func (c *Client) AcquireGuestSlot() (*GuestSlot, error) {
+	return c.guest.AcquireGuestSlot()
+}
+
 // Close releases all resources associated with the client.
 // It closes shared memory handles and event handles.
 // Note: This does not stop background workers if they are blocked on OS events.
