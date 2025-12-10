@@ -23,7 +23,7 @@ func Connect(name string) (*Client, error) {
 	var err error
 
 	// Retry loop
-	for i := 0; i < 50; i++ {
+	for i := 0; i < 100; i++ {
 		// Direct Mode: Auto-discover configuration from SHM Header.
 		// Extra params ignored as DirectGuest discovers size from header.
 		g, err = NewDirectGuest(name, 0, 0)

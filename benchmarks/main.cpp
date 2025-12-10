@@ -12,7 +12,7 @@
 using namespace shm;
 
 // Configuration
-std::string SHM_NAME = "BenchmarkSHM";
+std::string SHM_NAME = "SimpleIPC";
 int NUM_THREADS = 1;
 int DATA_SIZE = 64; // Bytes
 int DURATION_SEC = 10;
@@ -149,8 +149,15 @@ int main(int argc, char** argv) {
     // If Guest Call Mode, allocate Guest Slots.
     uint32_t numGuestSlots = GUEST_CALL_MODE ? NUM_THREADS : 0;
 
-    // We add 64 bytes padding to slot size to accommodate header safely
-    if (!host.Init(SHM_NAME, NUM_THREADS, DATA_SIZE + 128, numGuestSlots)) {
+    // We add padding to slot size to accommodate header safely and ensure alignment
+    uint32_t requiredSize = DATA_SIZE + 128;
+    // Ensure sufficient size for alignment (needs at least 128 for 64 req + 64 resp)
+    // But logic in DirectHost: half = size/2; half = (half/64)*64.
+    // So if we want X bytes req, we need half >= X.
+    // So size >= 2 * ceil(X, 64).
+    if (requiredSize < 256) requiredSize = 256;
+
+    if (!host.Init(SHM_NAME, NUM_THREADS, requiredSize, numGuestSlots)) {
         std::cerr << "Failed to init DirectHost." << std::endl;
         return 1;
     }

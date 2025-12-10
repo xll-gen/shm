@@ -12,6 +12,7 @@
 #include <chrono>
 #include "Platform.h"
 #include "IPCUtils.h"
+#include "WaitStrategy.h"
 
 namespace shm {
 
@@ -52,7 +53,7 @@ class DirectHost {
         EventHandle hRespEvent; // Signaled by Guest (Wake Host)
         uint32_t maxReqSize;
         uint32_t maxRespSize;
-        int spinLimit;
+        WaitStrategy waitStrategy;
         uint32_t msgSeq;
     };
 
@@ -81,49 +82,47 @@ class DirectHost {
             Platform::SignalEvent(slot->hReqEvent);
         }
 
-        // Adaptive Wait for Response
-        bool ready = false;
-        int currentLimit = slot->spinLimit;
-        const int MIN_SPIN = 100;
-        const int MAX_SPIN = 50000;
+        // Condition lambda
+        auto checkReady = [&]() -> bool {
+            return slot->header->state.load(std::memory_order_acquire) == SLOT_RESP_READY;
+        };
 
-        for (int i = 0; i < currentLimit; ++i) {
-            if (slot->header->state.load(std::memory_order_acquire) == SLOT_RESP_READY) {
-                ready = true;
-                break;
-            }
-            Platform::CpuRelax();
-        }
-
-        if (ready) {
-            if (currentLimit < MAX_SPIN) currentLimit += 200;
-        } else {
-            if (currentLimit > MIN_SPIN) currentLimit -= 100;
-            if (currentLimit < MIN_SPIN) currentLimit = MIN_SPIN;
-
+        // Sleep/Wait lambda
+        auto sleepAction = [&]() {
             slot->header->hostState.store(HOST_STATE_WAITING, std::memory_order_seq_cst);
 
-            if (slot->header->state.load(std::memory_order_acquire) == SLOT_RESP_READY) {
-                ready = true;
+            // Double check
+            if (checkReady()) {
                 slot->header->hostState.store(HOST_STATE_ACTIVE, std::memory_order_relaxed);
-            } else {
-                 auto start = std::chrono::steady_clock::now();
-                 while (slot->header->state.load(std::memory_order_acquire) != SLOT_RESP_READY) {
-                    auto now = std::chrono::steady_clock::now();
-                    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
-                    if (elapsed >= timeoutMs) {
-                        return false;
-                    }
-
-                    uint32_t remaining = timeoutMs - (uint32_t)elapsed;
-                    uint32_t waitTime = (remaining > 100) ? 100 : remaining;
-                    Platform::WaitEvent(slot->hRespEvent, waitTime);
-                 }
-                 ready = true;
-                 slot->header->hostState.store(HOST_STATE_ACTIVE, std::memory_order_relaxed);
+                return;
             }
-        }
-        slot->spinLimit = currentLimit;
+
+            // Wait with timeout
+            auto start = std::chrono::steady_clock::now();
+            while (!checkReady()) {
+                auto now = std::chrono::steady_clock::now();
+                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
+
+                // Note: If timeoutMs is 0xFFFFFFFF, elapsed >= timeoutMs might be false unless elapsed is huge.
+                // But generally safe.
+                if (timeoutMs != 0xFFFFFFFF && elapsed >= timeoutMs) {
+                    break; // Timeout, return and let caller fail
+                }
+
+                uint32_t remaining = (timeoutMs == 0xFFFFFFFF) ? 0xFFFFFFFF : (timeoutMs - (uint32_t)elapsed);
+                uint32_t waitTime = (remaining > 100) ? 100 : remaining;
+                if (timeoutMs == 0xFFFFFFFF) waitTime = 100; // Cap infinite wait chunks
+
+                Platform::WaitEvent(slot->hRespEvent, waitTime);
+            }
+            slot->header->hostState.store(HOST_STATE_ACTIVE, std::memory_order_relaxed);
+        };
+
+        bool ready = slot->waitStrategy.Wait(checkReady, sleepAction);
+
+        // WaitStrategy only says "I spun or I slept". If I slept, I might have timed out.
+        // So we must check ready flag one last time or rely on Wait return.
+        // Wait returns true if condition met.
         return ready;
     }
 
@@ -420,7 +419,7 @@ public:
             slots[i].respBuffer = dataBase + respOffset;
             slots[i].maxReqSize = halfSize;
             slots[i].maxRespSize = slotSize - respOffset;
-            slots[i].spinLimit = 5000;
+            // waitStrategy initialized by default constructor
 
             // Initial msgSeq = Index + 1
             slots[i].msgSeq = i + 1;
