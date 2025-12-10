@@ -1,4 +1,4 @@
-# Shared Memory IPC Specification (v0.1.0)
+# Shared Memory IPC Specification (v0.2.0)
 
 This document defines the specification for the `xll-gen/shm` Shared Memory IPC system. It serves as the authoritative reference for implementing the protocol in any language (C++, Go, Python, Rust, etc.).
 
@@ -28,12 +28,14 @@ The first 64 bytes of the shared memory are reserved for the `ExchangeHeader`. T
 
 | Field | Type | Offset | Description |
 | :--- | :--- | :--- | :--- |
-| `numSlots` | `uint32` | 0 | Number of Host-to-Guest slots. |
-| `numGuestSlots` | `uint32` | 4 | Number of Guest-to-Host (Guest Call) slots. |
-| `slotSize` | `uint32` | 8 | Total size of a single slot in bytes. |
-| `reqOffset` | `uint32` | 12 | Offset of the Request Buffer within a slot (relative to Slot start). |
-| `respOffset` | `uint32` | 16 | Offset of the Response Buffer within a slot (relative to Slot start). |
-| `padding` | `uint8[44]`| 20 | Padding to ensure 64-byte alignment. |
+| `magic` | `uint32` | 0 | Magic Number (0x584C4C21). |
+| `version` | `uint32` | 4 | Protocol Version (0x00020000). |
+| `numSlots` | `uint32` | 8 | Number of Host-to-Guest slots. |
+| `numGuestSlots` | `uint32` | 12 | Number of Guest-to-Host (Guest Call) slots. |
+| `slotSize` | `uint32` | 16 | Total size of a single slot in bytes. |
+| `reqOffset` | `uint32` | 20 | Offset of the Request Buffer within a slot (relative to Slot start). |
+| `respOffset` | `uint32` | 24 | Offset of the Response Buffer within a slot (relative to Slot start). |
+| `padding` | `uint8[36]`| 28 | Padding to ensure 64-byte alignment. |
 
 **Total Size:** 64 Bytes.
 

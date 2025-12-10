@@ -533,7 +533,7 @@ public:
             Slot& s = slots[cachedSlotIdx];
             uint32_t current = s.header->state.load(std::memory_order_acquire);
             bool canClaim = (current == SLOT_FREE);
-            if (!canClaim && current == SLOT_RESP_READY) {
+            if (!canClaim && (current == SLOT_RESP_READY || current == SLOT_REQ_READY)) {
                  if (!s.activeWait.load(std::memory_order_acquire)) {
                      canClaim = true;
                  }
@@ -556,7 +556,7 @@ public:
                 Slot& s = slots[idx];
                 uint32_t current = s.header->state.load(std::memory_order_acquire);
                 bool canClaim = (current == SLOT_FREE);
-                if (!canClaim && current == SLOT_RESP_READY) {
+                if (!canClaim && (current == SLOT_RESP_READY || current == SLOT_REQ_READY)) {
                      if (!s.activeWait.load(std::memory_order_acquire)) {
                          canClaim = true;
                      }
@@ -609,7 +609,7 @@ public:
         while(true) {
              uint32_t current = slot->header->state.load(std::memory_order_acquire);
              bool canClaim = (current == SLOT_FREE);
-             if (!canClaim && current == SLOT_RESP_READY) {
+             if (!canClaim && (current == SLOT_RESP_READY || current == SLOT_REQ_READY)) {
                   if (!slot->activeWait.load(std::memory_order_acquire)) {
                       canClaim = true;
                   }
