@@ -38,7 +38,7 @@ int main() {
         shm::DirectHost host;
         // This should fail gracefully because CreateNamedEvent (Req) will fail
         // (assuming CreateNamedShm took the last FD)
-        bool res = host.Init("InitSafetyTest", 1, 1024);
+        auto res = host.Init("InitSafetyTest", 1, 1024);
 
         if (!res) {
             passed = true;

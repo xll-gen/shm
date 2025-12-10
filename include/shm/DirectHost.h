@@ -13,6 +13,7 @@
 #include "Platform.h"
 #include "IPCUtils.h"
 #include "WaitStrategy.h"
+#include "Result.h"
 
 namespace shm {
 
@@ -376,9 +377,9 @@ public:
      * @param numHostSlots The number of slots (workers) to allocate for Host-to-Guest communication.
      * @param dataSize The total size of the data payload per slot (split between Req/Resp). Default 1MB.
      * @param numGuestSlots The number of slots to allocate for Guest-to-Host calls. Default 0.
-     * @return true if initialization succeeded, false otherwise.
+     * @return Result<void> Success or Error.
      */
-    bool Init(const std::string& shmName, uint32_t numHostSlots, uint32_t dataSize = 1024 * 1024, uint32_t numGuestSlots = 0) {
+    Result<void> Init(const std::string& shmName, uint32_t numHostSlots, uint32_t dataSize = 1024 * 1024, uint32_t numGuestSlots = 0) {
         this->shmName = shmName;
         this->numSlots = numHostSlots; // Host -> Guest slots
         this->numGuestSlots = numGuestSlots; // Guest -> Host slots
@@ -417,7 +418,7 @@ public:
 
         bool exists = false;
         shmBase = Platform::CreateNamedShm(shmName.c_str(), totalSize, hMapFile, exists);
-        if (!shmBase) return false;
+        if (!shmBase) return Result<void>::Failure(Error::InternalError);
 
         // Zero out memory if new (or always, to be safe?)
         memset(shmBase, 0, totalSize);
@@ -463,7 +464,7 @@ public:
             if (!slots[i].hReqEvent || !slots[i].hRespEvent) {
                 running = true; // Enable Shutdown
                 Shutdown();
-                return false;
+                return Result<void>::Failure(Error::InternalError);
             }
 
             // Initialize Header
@@ -475,7 +476,7 @@ public:
         }
 
         running = true;
-        return true;
+        return Result<void>::Success();
     }
 
     /**
