@@ -55,6 +55,27 @@ class DirectHost {
         uint32_t maxRespSize;
         WaitStrategy waitStrategy;
         uint32_t msgSeq;
+        std::atomic<bool> activeWait;
+
+        Slot() : header(nullptr), reqBuffer(nullptr), respBuffer(nullptr),
+                 hReqEvent(nullptr), hRespEvent(nullptr),
+                 maxReqSize(0), maxRespSize(0), msgSeq(0), activeWait(false) {}
+
+        Slot(Slot&& other) noexcept : waitStrategy(other.waitStrategy) {
+            header = other.header;
+            reqBuffer = other.reqBuffer;
+            respBuffer = other.respBuffer;
+            hReqEvent = other.hReqEvent;
+            hRespEvent = other.hRespEvent;
+            maxReqSize = other.maxReqSize;
+            maxRespSize = other.maxRespSize;
+            msgSeq = other.msgSeq;
+            activeWait.store(other.activeWait.load());
+
+            other.header = nullptr;
+            other.hReqEvent = nullptr;
+            other.hRespEvent = nullptr;
+        }
     };
 
     std::vector<Slot> slots;
@@ -71,6 +92,8 @@ class DirectHost {
      * @return true if response is ready, false if error/timeout.
      */
     bool WaitResponse(Slot* slot, uint32_t timeoutMs) {
+        slot->activeWait.store(true, std::memory_order_relaxed);
+
         // Reset Host State
         slot->header->hostState.store(HOST_STATE_ACTIVE, std::memory_order_relaxed);
 
@@ -120,9 +143,7 @@ class DirectHost {
 
         bool ready = slot->waitStrategy.Wait(checkReady, sleepAction);
 
-        // WaitStrategy only says "I spun or I slept". If I slept, I might have timed out.
-        // So we must check ready flag one last time or rely on Wait return.
-        // Wait returns true if condition met.
+        slot->activeWait.store(false, std::memory_order_release);
         return ready;
     }
 
@@ -403,6 +424,8 @@ public:
 
         // Write ExchangeHeader
         ExchangeHeader* exHeader = (ExchangeHeader*)shmBase;
+        exHeader->magic = SHM_MAGIC;
+        exHeader->version = SHM_VERSION;
         exHeader->numSlots = numSlots;
         exHeader->numGuestSlots = numGuestSlots;
         exHeader->slotSize = slotSize;
@@ -508,10 +531,19 @@ public:
         // Fast Path: Try cached slot
         if (cachedSlotIdx < numSlots) {
             Slot& s = slots[cachedSlotIdx];
-            uint32_t expected = SLOT_FREE;
-            if (s.header->state.compare_exchange_strong(expected, SLOT_BUSY, std::memory_order_acquire)) {
-                slot = &s;
-                resultIdx = (int32_t)cachedSlotIdx;
+            uint32_t current = s.header->state.load(std::memory_order_acquire);
+            bool canClaim = (current == SLOT_FREE);
+            if (!canClaim && current == SLOT_RESP_READY) {
+                 if (!s.activeWait.load(std::memory_order_acquire)) {
+                     canClaim = true;
+                 }
+            }
+
+            if (canClaim) {
+                if (s.header->state.compare_exchange_strong(current, SLOT_BUSY, std::memory_order_acquire)) {
+                    slot = &s;
+                    resultIdx = (int32_t)cachedSlotIdx;
+                }
             }
         }
 
@@ -522,12 +554,21 @@ public:
 
             while (true) {
                 Slot& s = slots[idx];
-                uint32_t expected = SLOT_FREE;
-                if (s.header->state.compare_exchange_strong(expected, SLOT_BUSY, std::memory_order_acquire)) {
-                    slot = &s;
-                    cachedSlotIdx = idx; // Update Cache
-                    resultIdx = (int32_t)idx;
-                    break;
+                uint32_t current = s.header->state.load(std::memory_order_acquire);
+                bool canClaim = (current == SLOT_FREE);
+                if (!canClaim && current == SLOT_RESP_READY) {
+                     if (!s.activeWait.load(std::memory_order_acquire)) {
+                         canClaim = true;
+                     }
+                }
+
+                if (canClaim) {
+                    if (s.header->state.compare_exchange_strong(current, SLOT_BUSY, std::memory_order_acquire)) {
+                        slot = &s;
+                        cachedSlotIdx = idx; // Update Cache
+                        resultIdx = (int32_t)idx;
+                        break;
+                    }
                 }
                 idx = (idx + 1) % numSlots;
                 retries++;
@@ -566,9 +607,18 @@ public:
         int retries = 0;
 
         while(true) {
-             uint32_t expected = SLOT_FREE;
-             if (slot->header->state.compare_exchange_strong(expected, SLOT_BUSY, std::memory_order_acquire)) {
-                 break;
+             uint32_t current = slot->header->state.load(std::memory_order_acquire);
+             bool canClaim = (current == SLOT_FREE);
+             if (!canClaim && current == SLOT_RESP_READY) {
+                  if (!slot->activeWait.load(std::memory_order_acquire)) {
+                      canClaim = true;
+                  }
+             }
+
+             if (canClaim) {
+                 if (slot->header->state.compare_exchange_strong(current, SLOT_BUSY, std::memory_order_acquire)) {
+                     break;
+                 }
              }
 
              Platform::CpuRelax();

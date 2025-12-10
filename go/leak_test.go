@@ -24,6 +24,7 @@ func TestLeakOnClose(t *testing.T) {
 
     // Create Host Resources
     totalSize := uint64(64 + 128 + 1024)
+    if totalSize < 4096 { totalSize = 4096 }
     hShm, addr, err := CreateShm(shmName, totalSize)
     if err != nil {
         t.Fatalf("CreateShm failed: %v", err)
@@ -35,6 +36,8 @@ func TestLeakOnClose(t *testing.T) {
 
     // Init Header
     ex := (*ExchangeHeader)(unsafe.Pointer(addr))
+    ex.Magic = Magic
+    ex.Version = Version
     ex.NumSlots = 1
     ex.SlotSize = 1024
     ex.ReqOffset = 0

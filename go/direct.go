@@ -51,6 +51,11 @@ const (
 	//   )
 	MsgTypeAppStart      MsgType = 128
 
+	// Magic is the magic number for validating shared memory ("XLL!").
+	Magic uint32 = 0x584C4C21
+	// Version is the current protocol version (v0.2.0).
+	Version uint32 = 0x00020000
+
 	// HostStateActive indicates the Host is spinning or processing.
 	HostStateActive  = 0
 	// HostStateWaiting indicates the Host is sleeping on the Response Event.
@@ -78,12 +83,14 @@ type SlotHeader struct {
 // ExchangeHeader represents the metadata at the start of the shared memory region.
 // It describes the layout of the slot pool.
 type ExchangeHeader struct {
+	Magic         uint32
+	Version       uint32
 	NumSlots      uint32
 	NumGuestSlots uint32
 	SlotSize      uint32
 	ReqOffset     uint32
 	RespOffset    uint32
-	_             [44]byte
+	_             [36]byte
 }
 
 // slotContext holds local runtime state for a slot.
@@ -136,15 +143,29 @@ func NewDirectGuest(name string, _ int, _ int) (*DirectGuest, error) {
 	}
 
 	header := (*ExchangeHeader)(unsafe.Pointer(addr))
+
+	if header.Magic != Magic {
+		CloseShm(h, addr, HeaderMapSize)
+		return nil, fmt.Errorf("invalid magic number: 0x%x (expected 0x%x)", header.Magic, Magic)
+	}
+	if header.Version != Version {
+		CloseShm(h, addr, HeaderMapSize)
+		return nil, fmt.Errorf("protocol version mismatch: 0x%x (expected 0x%x)", header.Version, Version)
+	}
+
 	numSlots := header.NumSlots
 	numGuestSlots := header.NumGuestSlots
 	slotSize := header.SlotSize
 	reqOffset := header.ReqOffset
 	respOffset := header.RespOffset
 
-	if numSlots == 0 || slotSize == 0 {
+	if numSlots == 0 || numSlots > 100000 {
 		CloseShm(h, addr, HeaderMapSize)
-		return nil, fmt.Errorf("shared memory not ready")
+		return nil, fmt.Errorf("invalid numSlots: %d", numSlots)
+	}
+	if slotSize == 0 || slotSize > 1024*1024*1024 {
+		CloseShm(h, addr, HeaderMapSize)
+		return nil, fmt.Errorf("invalid slotSize: %d", slotSize)
 	}
 
 	CloseShm(h, addr, HeaderMapSize)

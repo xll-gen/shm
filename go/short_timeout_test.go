@@ -17,6 +17,7 @@ func TestShortTimeout(t *testing.T) {
 
     // 1. Create SHM (Act as Host)
     totalSize := uint64(64 + 2 * (128 + 1024))
+    if totalSize < 4096 { totalSize = 4096 }
 
     hShm, addr, err := CreateShm(shmName, totalSize)
     if err != nil {
@@ -29,6 +30,8 @@ func TestShortTimeout(t *testing.T) {
 
     // Init Exchange Header
     exHeader := (*ExchangeHeader)(unsafe.Pointer(addr))
+    exHeader.Magic = Magic
+    exHeader.Version = Version
     exHeader.NumSlots = 1
     exHeader.NumGuestSlots = 1
     exHeader.SlotSize = 1024

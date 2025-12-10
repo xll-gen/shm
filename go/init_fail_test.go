@@ -30,6 +30,8 @@ func TestInitFailOnEventError(t *testing.T) {
 
     // Init Header
 	exHeader := (*ExchangeHeader)(unsafe.Pointer(addr))
+	exHeader.Magic = Magic
+	exHeader.Version = Version
 	exHeader.NumSlots = 1
 	exHeader.NumGuestSlots = 0
 	exHeader.SlotSize = 64
