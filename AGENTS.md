@@ -31,6 +31,19 @@ This file contains instructions for AI Agents working on this repository.
 *   **Benchmarks:** Run `task run:benchmark` to verify performance regressions.
 *   **Pre-commit:** Always verify your changes with `read_file` or `ls` before submitting.
 
+## **Tag Message Guidelines**
+
+When creating a release tag, the message must follow this format:
+
+1.  **Summary of Major Changes:**
+    Group significant changes by category (e.g., Performance, Features, Bug Fixes).
+    *   **Category Name**:
+        *   Description of change ([commit_hash](https://github.com/xll-gen/shm/commit/commit_hash))
+
+2.  **Full Changelog:**
+    List all commits included in the release, referencing the commit hash with a hyperlink.
+    *   [commit_hash](https://github.com/xll-gen/shm/commit/commit_hash) Commit message
+
 ## **General Rules**
 
 *   **Do not** delete this file.
