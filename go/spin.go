@@ -1,8 +1,8 @@
 package shm
 
 import (
+	"runtime"
 	"sync/atomic"
-    // "runtime"
 )
 
 // WaitStrategy implements an adaptive spin-wait strategy.
@@ -12,16 +12,21 @@ type WaitStrategy struct {
 	MaxSpin      int32
 	IncStep      int32
 	DecStep      int32
+    YieldEnabled bool
 }
 
 // NewWaitStrategy creates a new WaitStrategy with default optimized values.
-func NewWaitStrategy() *WaitStrategy {
+// enableYield: If true, calls runtime.Gosched() periodically during spinning.
+//              Recommended for multi-threaded/oversubscribed environments.
+//              If false, performs strict busy-waiting (better for single-thread latency).
+func NewWaitStrategy(enableYield bool) *WaitStrategy {
 	return &WaitStrategy{
 		CurrentLimit: 5000,
 		MinSpin:      100,
 		MaxSpin:      5000,
 		IncStep:      200,
 		DecStep:      100,
+        YieldEnabled: enableYield,
 	}
 }
 
@@ -41,7 +46,13 @@ func (w *WaitStrategy) Wait(condition func() bool, sleepAction func()) bool {
 			ready = true
 			break
 		}
-		// Strict busy wait (no Gosched)
+
+        if w.YieldEnabled {
+            // Yield less frequently to reduce scheduler overhead (every 128 iterations)
+            if i&0x7F == 0 {
+                runtime.Gosched()
+            }
+        }
 	}
 
 	if ready {

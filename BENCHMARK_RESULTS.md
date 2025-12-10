@@ -12,21 +12,21 @@ The benchmark evaluates the "System Effective OPS" (Total successful operations 
 **Payload:** 64 bytes (Ping-Pong)
 
 ### 1 Thread
-*   **Throughput**: 1,567,476 ops/s
-*   **Avg Latency (RTT)**: 0.64 us
+*   **Throughput**: 1,426,102 ops/s
+*   **Avg Latency (RTT)**: 0.70 us
 
 ### 4 Threads
-*   **Throughput**: 1,911,587 ops/s
-*   **Avg Latency (RTT)**: 2.09 us
+*   **Throughput**: 1,864,378 ops/s
+*   **Avg Latency (RTT)**: 2.15 us
 
 ### 8 Threads
-*   **Throughput**: ~2.0M OPS (Estimated based on 4T trend)
-*   **Avg Latency (RTT)**: ~4.0 us
+*   **Throughput**: 2,200,666 ops/s
+*   **Avg Latency (RTT)**: 3.63 us
 
 ## Optimization Notes
-*   **Single Thread Optimization**: Removed `runtime.Gosched()` from the hot loop to maximize single-thread throughput, restoring performance towards the Pingpong baseline.
-*   **Wait Strategy**: Tuned to MaxSpin=5000 to accommodate Guest-side memory copy latency, preventing premature sleeping.
-*   **Trade-off**: This optimization prioritizes low-latency single-thread operation. Heavily oversubscribed scenarios (e.g. 8 threads on 4 cores) may see slightly reduced aggregate throughput compared to proactive yielding.
+*   **Single Thread Optimization**: `runtime.Gosched()` is automatically disabled when `NumSlots == 1`, prioritizing single-thread latency. This restores performance significantly compared to the proactive yielding baseline.
+*   **Throughput Optimization**: For multi-thread scenarios (`NumSlots > 1`), `runtime.Gosched()` is enabled (every 128 iterations) to prevent starvation in oversubscribed environments.
+*   **Wait Strategy**: Tuned to MaxSpin=5000 to accommodate Guest-side memory copy latency.
 
 ## Guest Call Scenario
 

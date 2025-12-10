@@ -15,7 +15,7 @@ func TestGuestCallNegativeRespSize(t *testing.T) {
     UnlinkShm(shmName)
     UnlinkEvent(fmt.Sprintf("%s_slot_0", shmName))
     UnlinkEvent(fmt.Sprintf("%s_slot_0_resp", shmName))
-    UnlinkEvent(fmt.Sprintf("%s_slot_1", shmName))
+    UnlinkEvent(fmt.Sprintf("%s_guest_call", shmName))
     UnlinkEvent(fmt.Sprintf("%s_slot_1_resp", shmName))
 
     // 1. Create SHM (Act as Host)
@@ -51,7 +51,8 @@ func TestGuestCallNegativeRespSize(t *testing.T) {
         UnlinkEvent(respEvName0)
     }()
 
-    reqEvName := fmt.Sprintf("%s_slot_1", shmName)
+    // Logic update: Guest Slots use shared "_guest_call" event for Requests
+    reqEvName := fmt.Sprintf("%s_guest_call", shmName)
     respEvName := fmt.Sprintf("%s_slot_1_resp", shmName)
 
     hReq, err := CreateEvent(reqEvName)
@@ -127,7 +128,7 @@ func TestSpuriousWakeup(t *testing.T) {
     UnlinkShm(shmName)
     UnlinkEvent(fmt.Sprintf("%s_slot_0", shmName))
     UnlinkEvent(fmt.Sprintf("%s_slot_0_resp", shmName))
-    UnlinkEvent(fmt.Sprintf("%s_slot_1", shmName))
+    UnlinkEvent(fmt.Sprintf("%s_guest_call", shmName))
     UnlinkEvent(fmt.Sprintf("%s_slot_1_resp", shmName))
 
     totalSize := uint64(64 + 2 * (128 + 1024))
@@ -160,7 +161,7 @@ func TestSpuriousWakeup(t *testing.T) {
         UnlinkEvent(respEvName0)
     }()
 
-    reqEvName := fmt.Sprintf("%s_slot_1", shmName)
+    reqEvName := fmt.Sprintf("%s_guest_call", shmName)
     respEvName := fmt.Sprintf("%s_slot_1_resp", shmName)
 
     hReq, err := CreateEvent(reqEvName)

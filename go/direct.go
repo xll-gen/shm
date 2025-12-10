@@ -233,7 +233,10 @@ func NewDirectGuest(name string, _ int, _ int) (*DirectGuest, error) {
 
 		g.slots[i].reqEvent = evReq
 		g.slots[i].respEvent = evResp
-        g.slots[i].waitStrategy = NewWaitStrategy()
+
+        // Optimize for Single Thread (latency) vs Multi Thread (throughput)
+        enableYield := numSlots > 1
+        g.slots[i].waitStrategy = NewWaitStrategy(enableYield)
 
 		ptr += uintptr(perSlotSize)
 	}
