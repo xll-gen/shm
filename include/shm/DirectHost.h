@@ -952,8 +952,9 @@ public:
                 // Validate Response Size
                 int32_t absRespSize = respSize < 0 ? -respSize : respSize;
                 if ((uint32_t)absRespSize > slot->maxRespSize) {
-                    absRespSize = (int32_t)slot->maxRespSize;
-                    respSize = respSize < 0 ? -absRespSize : absRespSize;
+                    // Overflow: Signal error by returning 0 size.
+                    // Prevents sending truncated/corrupt data to Guest.
+                    respSize = 0;
                 }
 
                 // Write Response Metadata
