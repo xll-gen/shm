@@ -12,7 +12,8 @@ This file contains instructions for AI Agents working on this repository.
 ## **Project Structure**
 
 *   **include/shm/**: C++ Header-only library. **Do not create .cpp files for the library.**
-*   **go/**: Go library. **Do not use external dependencies (go.mod should be minimal).**
+*   **go.mod**: Go module definition (at root).
+*   **go/**: Go library source code. **Do not use external dependencies.**
 *   **benchmarks/**: Performance tests and examples.
 
 ## **Coding Standards**
