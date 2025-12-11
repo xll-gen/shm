@@ -135,7 +135,10 @@ LPXLOPER12 WINAPI MYADD(double num1, double num2) {
 
         builder.Finish(root_offset);
 
-        slot.SendFlatBuffer(builder.GetSize());
+        if (slot.SendFlatBuffer(builder.GetSize()).HasError()) {
+            LOG(L"MYADD: SendFlatBuffer failed.");
+            return &xResult;
+        }
 
         auto* respRoot = flatbuffers::GetRoot<MyIPC::Root>(slot.GetRespBuffer());
         if (respRoot && respRoot->message_type() == MyIPC::Message_Response) {
@@ -183,7 +186,10 @@ LPXLOPER12 WINAPI MYRAND(void) {
 
         builder.Finish(root_offset);
         
-        slot.SendFlatBuffer(builder.GetSize());
+        if (slot.SendFlatBuffer(builder.GetSize()).HasError()) {
+             LOG(L"MYRAND: SendFlatBuffer failed.");
+             return &xResult;
+        }
         
         const auto* respRoot = flatbuffers::GetRoot<MyIPC::Root>(slot.GetRespBuffer());
         if (respRoot && respRoot->message_type() == MyIPC::Message_Response) {

@@ -93,7 +93,11 @@ int main() {
         memcpy(req, "DATA", 4);
 
         std::cout << "Sending FlatBuffer..." << std::endl;
-        slot.SendFlatBuffer(4);
+        if (slot.SendFlatBuffer(4).HasError()) {
+            std::cerr << "SendFlatBuffer failed" << std::endl;
+            if (guest.joinable()) guest.join();
+            return 1;
+        }
 
         // Check Response
         uint8_t* resp = slot.GetRespBuffer();

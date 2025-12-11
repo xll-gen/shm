@@ -48,10 +48,10 @@ int main() {
 
     auto start = std::chrono::steady_clock::now();
     // Pass 2000ms as per-call timeout
-    int result = host.Send(data.data(), 10, MsgType::NORMAL, resp, 2000);
+    auto res = host.Send(data.data(), 10, MsgType::NORMAL, resp, 2000);
     auto end = std::chrono::steady_clock::now();
 
-    std::cout << "Host returned: " << result << std::endl;
+    std::cout << "Host returned: " << (res ? "Success" : "Error") << std::endl;
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
     std::cout << "Duration: " << duration << "ms" << std::endl;
 
@@ -61,8 +61,8 @@ int main() {
     Platform::UnlinkNamedEvent((shmName + "_slot_0").c_str());
     Platform::UnlinkNamedEvent((shmName + "_slot_0_resp").c_str());
 
-    // Expect timeout (result -1)
-    if (result < 0) {
+    // Expect timeout (Error)
+    if (res.HasError() && res.GetError() == Error::Timeout) {
          // Expect duration approx 2000ms
          if (duration >= 1900 && duration < 3000) {
              return 0; // Success

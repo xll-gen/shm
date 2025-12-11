@@ -62,15 +62,15 @@ int main() {
     // Send 100 bytes (Expect fail because MaxReqSize is 64)
     std::vector<uint8_t> data(100, 'A');
 
-    int ret = host.Send(data.data(), (int32_t)data.size(), MsgType::NORMAL, resp);
+    auto res = host.Send(data.data(), (int32_t)data.size(), MsgType::NORMAL, resp);
 
     if (guest.joinable()) guest.join();
 
-    if (ret == -1) {
-        std::cout << "Test PASSED: Send returned -1 for overflow." << std::endl;
+    if (res.HasError()) {
+        std::cout << "Test PASSED: Send returned Error for overflow." << std::endl;
         return 0;
     } else {
-        std::cout << "Test FAILED: Send returned success (" << ret << ") but should have failed." << std::endl;
+        std::cout << "Test FAILED: Send returned success (" << res.Value() << ") but should have failed." << std::endl;
         return 1;
     }
 }

@@ -78,15 +78,15 @@ int main() {
 
     std::vector<uint8_t> resp;
     // Send "TEST" with size -4 (End Aligned)
-    int ret = host.Send((const uint8_t*)"TEST", -4, MsgType::FLATBUFFER, resp);
+    auto res = host.Send((const uint8_t*)"TEST", -4, MsgType::FLATBUFFER, resp);
 
     if (guest.joinable()) guest.join();
 
-    if (ret > 0 && std::string((char*)resp.data()) == "PASS") {
+    if (!res.HasError() && res.Value() > 0 && std::string((char*)resp.data()) == "PASS") {
         std::cout << "Test PASSED" << std::endl;
         return 0;
     } else {
-        std::cout << "Test FAILED: " << (ret > 0 ? std::string((char*)resp.data()) : "No Resp/Incorrect") << std::endl;
+        std::cout << "Test FAILED: " << (!res.HasError() && res.Value() > 0 ? std::string((char*)resp.data()) : "No Resp/Incorrect") << std::endl;
         return 1;
     }
 }

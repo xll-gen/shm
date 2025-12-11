@@ -22,8 +22,8 @@ int main() {
     {
         auto z = host.GetZeroCopySlot();
         // Send with 10ms timeout. No guest connected, so it will timeout.
-        bool res = z.Send(10, MsgType::NORMAL, 10);
-        if (res) {
+        auto res = z.Send(10, MsgType::NORMAL, 10);
+        if (!res.HasError()) {
             std::cerr << "Send should have timed out!" << std::endl;
             return 1;
         }

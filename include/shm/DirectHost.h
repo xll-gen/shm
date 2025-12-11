@@ -25,7 +25,9 @@ struct HostConfig {
     /** @brief Name of the shared memory region (e.g., "MyIPC"). */
     std::string shmName;
 
-    /** @brief Number of slots (workers) to allocate for Host-to-Guest communication. */
+    /** @brief Number of slots (workers) to allocate for Host-to-Guest communication.
+     * Corresponds to `numSlots` in ExchangeHeader.
+     */
     uint32_t numHostSlots;
 
     /** @brief Desired capacity for request/response payloads in bytes.
@@ -262,17 +264,17 @@ public:
          * @param size Size of the data. Positive: Start-aligned. Negative: End-aligned.
          * @param msgType The message Type.
          * @param timeoutMs Per-call timeout. Default USE_DEFAULT_TIMEOUT.
-         * @return true on success, false on timeout (slot invalidated).
+         * @return Result<void> Success or Error.
          */
-        bool Send(int32_t size, MsgType msgType, uint32_t timeoutMs = USE_DEFAULT_TIMEOUT) {
-            if (!IsValid()) return false;
+        Result<void> Send(int32_t size, MsgType msgType, uint32_t timeoutMs = USE_DEFAULT_TIMEOUT) {
+            if (!IsValid()) return Result<void>::Failure(Error::InvalidArgs);
 
             Slot* slot = &host->slots[slotIdx];
 
             // Bounds check
             int32_t absSize = size < 0 ? -size : size;
             if ((uint32_t)absSize > slot->maxReqSize) {
-                return false;
+                return Result<void>::Failure(Error::BufferTooSmall);
             }
 
             slot->header->reqSize = size;
@@ -285,10 +287,10 @@ public:
                 // Timeout. Invalidate slot to prevent accidental reuse or freeing.
                 // Leak the slot to prevent corruption.
                 slotIdx = -1;
-                return false;
+                return Result<void>::Failure(Error::Timeout);
             }
             // Do NOT release slot here. User might want to read response.
-            return true;
+            return Result<void>::Success();
         }
 
         /**
@@ -302,17 +304,17 @@ public:
          * @param size The size of the FlatBuffer data (positive integer).
          *             The method automatically negates it for the protocol.
          * @param timeoutMs Per-call timeout. Default USE_DEFAULT_TIMEOUT.
-         * @return true on success, false on timeout (slot invalidated).
+         * @return Result<void> Success or Error.
          */
-        bool SendFlatBuffer(int32_t size, uint32_t timeoutMs = USE_DEFAULT_TIMEOUT) {
-            if (!IsValid()) return false;
+        Result<void> SendFlatBuffer(int32_t size, uint32_t timeoutMs = USE_DEFAULT_TIMEOUT) {
+            if (!IsValid()) return Result<void>::Failure(Error::InvalidArgs);
 
             Slot* slot = &host->slots[slotIdx];
 
             // Bounds check
             int32_t absSize = size;
             if ((uint32_t)absSize > slot->maxReqSize) {
-                return false;
+                return Result<void>::Failure(Error::BufferTooSmall);
             }
 
             // Zero-Copy convention: Negative size
@@ -326,10 +328,10 @@ public:
                 // Timeout. Invalidate slot to prevent accidental reuse or freeing.
                 // Leak the slot to prevent corruption.
                 slotIdx = -1;
-                return false;
+                return Result<void>::Failure(Error::Timeout);
             }
             // Do NOT release slot here. User might want to read response.
-            return true;
+            return Result<void>::Success();
         }
 
         /**
@@ -561,9 +563,14 @@ public:
             Slot& s = slots[cachedSlotIdx];
             uint32_t current = s.header->state.load(std::memory_order_acquire);
             bool canClaim = (current == SLOT_FREE);
-            if (!canClaim && (current == SLOT_RESP_READY || current == SLOT_REQ_READY)) {
-                 if (!s.activeWait.load(std::memory_order_acquire)) {
-                     canClaim = true;
+            if (!canClaim) {
+                 // Recovery logic:
+                 // 1. SLOT_RESP_READY or SLOT_REQ_READY and Host not waiting -> Previous transaction abandoned.
+                 // 2. SLOT_GUEST_BUSY and Host not waiting -> Guest crashed or timed out during transaction.
+                 if (current == SLOT_RESP_READY || current == SLOT_REQ_READY || current == SLOT_GUEST_BUSY) {
+                      if (!s.activeWait.load(std::memory_order_acquire)) {
+                          canClaim = true;
+                      }
                  }
             }
 
@@ -584,9 +591,11 @@ public:
                 Slot& s = slots[idx];
                 uint32_t current = s.header->state.load(std::memory_order_acquire);
                 bool canClaim = (current == SLOT_FREE);
-                if (!canClaim && (current == SLOT_RESP_READY || current == SLOT_REQ_READY)) {
-                     if (!s.activeWait.load(std::memory_order_acquire)) {
-                         canClaim = true;
+                if (!canClaim) {
+                     if (current == SLOT_RESP_READY || current == SLOT_REQ_READY || current == SLOT_GUEST_BUSY) {
+                          if (!s.activeWait.load(std::memory_order_acquire)) {
+                              canClaim = true;
+                          }
                      }
                 }
 
@@ -695,10 +704,10 @@ public:
      * @param msgType The message Type.
      * @param[out] outResp Vector to store the response data.
      * @param timeoutMs Per-call timeout. Default USE_DEFAULT_TIMEOUT.
-     * @return int Bytes read (response size), or -1 on error.
+     * @return Result<int> Bytes read (response size) on success, or Error on failure.
      */
-    int SendAcquired(int32_t slotIdx, int32_t size, MsgType msgType, std::vector<uint8_t>& outResp, uint32_t timeoutMs = USE_DEFAULT_TIMEOUT) {
-        if (slotIdx < 0 || slotIdx >= (int32_t)numSlots) return -1;
+    Result<int> SendAcquired(int32_t slotIdx, int32_t size, MsgType msgType, std::vector<uint8_t>& outResp, uint32_t timeoutMs = USE_DEFAULT_TIMEOUT) {
+        if (slotIdx < 0 || slotIdx >= (int32_t)numSlots) return Result<int>(Error::InvalidArgs);
         Slot* slot = &slots[slotIdx];
 
         // Bounds Check
@@ -706,7 +715,7 @@ public:
         if ((uint32_t)absSize > slot->maxReqSize) {
              // Release Slot
              slot->header->state.store(SLOT_FREE, std::memory_order_release);
-             return -1;
+             return Result<int>(Error::BufferTooSmall);
         }
 
         slot->header->reqSize = size;
@@ -720,7 +729,7 @@ public:
 
         if (!ready) {
              // Timeout. Do NOT release slot (leak it) to prevent corruption.
-             return -1;
+             return Result<int>(Error::Timeout);
         }
 
         // Read Response
@@ -748,7 +757,7 @@ public:
         // Release Slot
         slot->header->state.store(SLOT_FREE, std::memory_order_release);
 
-        return resultSize;
+        return Result<int>(resultSize);
     }
 
     /**
@@ -759,20 +768,26 @@ public:
      * @param msgType The message Type.
      * @param[out] outResp Vector to store the response data.
      * @param timeoutMs Per-call timeout. Default USE_DEFAULT_TIMEOUT.
-     * @return int Bytes read (response size), or -1 on error.
+     * @return Result<int> Bytes read (response size) on success, or Error on failure.
      */
-    int SendToSlot(uint32_t slotIdx, const uint8_t* data, int32_t size, MsgType msgType, std::vector<uint8_t>& outResp, uint32_t timeoutMs = USE_DEFAULT_TIMEOUT) {
+    Result<int> SendToSlot(uint32_t slotIdx, const uint8_t* data, int32_t size, MsgType msgType, std::vector<uint8_t>& outResp, uint32_t timeoutMs = USE_DEFAULT_TIMEOUT) {
         int32_t idx = AcquireSpecificSlot((int32_t)slotIdx, timeoutMs);
-        if (idx < 0) return -1;
+        if (idx < 0) return Result<int>(Error::ResourceExhausted);
 
-        if (data && size != 0) {
+        if (size != 0) {
+            if (!data) {
+                // Invalid Argument: size > 0 but data is null.
+                slots[idx].header->state.store(SLOT_FREE, std::memory_order_release);
+                return Result<int>(Error::InvalidArgs);
+            }
+
             int32_t max = GetMaxReqSize(idx);
             uint32_t uAbsSize = (size < 0) ? (0u - (uint32_t)size) : (uint32_t)size;
 
             if (uAbsSize > (uint32_t)max) {
                 // Release Slot
                 slots[idx].header->state.store(SLOT_FREE, std::memory_order_release);
-                return -1;
+                return Result<int>(Error::BufferTooSmall);
             }
 
             if (size >= 0) {
@@ -793,20 +808,26 @@ public:
      * @param msgType The message Type.
      * @param[out] outResp Vector to store the response data.
      * @param timeoutMs Per-call timeout. Default USE_DEFAULT_TIMEOUT.
-     * @return int Bytes read (response size), or -1 on error.
+     * @return Result<int> Bytes read (response size) on success, or Error on failure.
      */
-    int Send(const uint8_t* data, int32_t size, MsgType msgType, std::vector<uint8_t>& outResp, uint32_t timeoutMs = USE_DEFAULT_TIMEOUT) {
+    Result<int> Send(const uint8_t* data, int32_t size, MsgType msgType, std::vector<uint8_t>& outResp, uint32_t timeoutMs = USE_DEFAULT_TIMEOUT) {
         int32_t idx = AcquireSlot();
-        if (idx < 0) return -1;
+        if (idx < 0) return Result<int>(Error::ResourceExhausted);
 
-        if (data && size != 0) {
+        if (size != 0) {
+            if (!data) {
+                // Invalid Argument: size > 0 but data is null.
+                slots[idx].header->state.store(SLOT_FREE, std::memory_order_release);
+                return Result<int>(Error::InvalidArgs);
+            }
+
             int32_t max = GetMaxReqSize(idx);
             uint32_t uAbsSize = (size < 0) ? (0u - (uint32_t)size) : (uint32_t)size;
 
             if (uAbsSize > (uint32_t)max) {
                 // Release Slot
                 slots[idx].header->state.store(SLOT_FREE, std::memory_order_release);
-                return -1;
+                return Result<int>(Error::BufferTooSmall);
             }
 
             if (size >= 0) {
