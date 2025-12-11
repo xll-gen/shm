@@ -112,6 +112,14 @@ int32_t respSize = slot.GetRespSize();
 
 ### Go Guest
 
+First, install the module:
+
+```bash
+go get github.com/xll-gen/shm
+```
+
+Then import it:
+
 ```go
 package main
 
