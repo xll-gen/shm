@@ -919,7 +919,10 @@ public:
             Slot* slot = &slots[i];
 
             // Check for REQ_READY (Guest wrote request)
-            if (slot->header->state.load(std::memory_order_acquire) == SLOT_REQ_READY) {
+            // Use CAS to claim the slot (transition to BUSY) to prevent race conditions
+            // if ProcessGuestCalls is called from multiple threads or recursively.
+            uint32_t expected = SLOT_REQ_READY;
+            if (slot->header->state.compare_exchange_strong(expected, SLOT_BUSY, std::memory_order_acq_rel)) {
                 // Read Request
                 int32_t reqSize = slot->header->reqSize;
                 const uint8_t* reqData = nullptr;
@@ -960,7 +963,7 @@ public:
                 // Write Response Metadata
                 slot->header->respSize = respSize;
 
-                // State Transition: REQ_READY -> RESP_READY
+                // State Transition: BUSY -> RESP_READY
                 slot->header->state.store(SLOT_RESP_READY, std::memory_order_seq_cst);
 
                 // Signal Guest (Guest waits on RespEvent)
