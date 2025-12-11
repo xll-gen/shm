@@ -27,6 +27,8 @@ const (
 	SlotDone      = 3
 	// SlotBusy indicates the Host has claimed the slot and is writing data.
 	SlotBusy      = 4
+	// SlotGuestBusy indicates the Guest has claimed the slot and is writing data.
+	SlotGuestBusy = 5
 
 	// MsgTypeNormal is a standard data payload message.
 	MsgTypeNormal        MsgType = 0
@@ -53,8 +55,8 @@ const (
 
 	// Magic is the magic number for validating shared memory ("XLL!").
 	Magic uint32 = 0x584C4C21
-	// Version is the current protocol version (v0.3.0).
-	Version uint32 = 0x00030000
+	// Version is the current protocol version (v0.5.0).
+	Version uint32 = 0x00050000
 
 	// HostStateActive indicates the Host is spinning or processing.
 	HostStateActive  = 0
@@ -335,7 +337,7 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, msgType MsgType, timeou
 
 		// Case 1: Slot is Free. Try to claim it.
 		if currentState == SlotFree {
-			if atomic.CompareAndSwapUint32(&s.header.State, SlotFree, SlotBusy) {
+			if atomic.CompareAndSwapUint32(&s.header.State, SlotFree, SlotGuestBusy) {
 				slot = s
 				break
 			}
@@ -345,9 +347,9 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, msgType MsgType, timeou
 		// This happens if a previous caller timed out and abandoned the slot,
 		// but the Host eventually processed it and set it to RESP_READY.
 		// Since the original caller is gone, we can safely reclaim it.
-		// We transition RESP_READY -> BUSY.
+		// We transition RESP_READY -> GUEST_BUSY.
 		if currentState == SlotRespReady {
-			if atomic.CompareAndSwapUint32(&s.header.State, SlotRespReady, SlotBusy) {
+			if atomic.CompareAndSwapUint32(&s.header.State, SlotRespReady, SlotGuestBusy) {
 				slot = s
 				break
 			}
@@ -509,6 +511,12 @@ func (g *DirectGuest) workerLoop(idx int, handler func([]byte, []byte, MsgType) 
         ready := slot.waitStrategy.Wait(checkReady, sleepAction)
 
         if ready {
+             // Try to transition REQ_READY -> GUEST_BUSY to lock the slot
+             if !atomic.CompareAndSwapUint32(&header.State, SlotReqReady, SlotGuestBusy) {
+                 // Host might have timed out and reclaimed the slot. Abort.
+                 continue
+             }
+
              // Process
              msgType := header.MsgType
              if msgType == MsgTypeShutdown {
@@ -543,7 +551,7 @@ func (g *DirectGuest) workerLoop(idx int, handler func([]byte, []byte, MsgType) 
                  header.MsgType = respType
              }
 
-             // Signal Ready
+             // Signal Ready (Transition GUEST_BUSY -> RESP_READY)
              atomic.StoreUint32(&header.State, SlotRespReady)
 
              // Wake Host

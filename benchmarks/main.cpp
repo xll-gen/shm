@@ -71,11 +71,11 @@ void WorkerThread(DirectHost* host, int id) {
 
         // Send to specific slot (1:1 mapping)
         // Note: DirectHost::SendToSlot blocks until response.
-        int read = host->SendToSlot(id, sendBuf.data(), (int32_t)sendBuf.size(), MsgType::NORMAL, resp);
+        auto res = host->SendToSlot(id, sendBuf.data(), (int32_t)sendBuf.size(), MsgType::NORMAL, resp);
 
         auto end = std::chrono::steady_clock::now();
 
-        if (read < 0) {
+        if (res.HasError()) {
             globalStats.errors++;
             if (VERBOSE && errorLogCount < MAX_ERROR_LOGS) {
                 std::cerr << "[Thread " << id << "] Send failed." << std::endl;
@@ -83,6 +83,8 @@ void WorkerThread(DirectHost* host, int id) {
             }
             continue;
         }
+
+        int read = res.Value();
 
         // Verify Response
         if (read >= 8) {
@@ -182,7 +184,7 @@ int main(int argc, char** argv) {
     int retries = 0;
     while (true) {
         // Send generic probe
-        if (host.Send(&data, 1, MsgType::NORMAL, resp) < 0) {
+        if (host.Send(&data, 1, MsgType::NORMAL, resp).HasError()) {
             if (retries++ > 10) {
                 std::cerr << "Guest not responding. Is the Go server running?" << std::endl;
                 // Don't exit, maybe just slow.

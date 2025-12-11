@@ -20,15 +20,15 @@ int main() {
     // Since there is no Guest, this MUST timeout.
     // The spin loop will fail quickly.
     // Then it should check timeout and return.
-    int ret = host.Send(nullptr, 0, MsgType::NORMAL, resp, 1);
+    auto res = host.Send(nullptr, 0, MsgType::NORMAL, resp, 1);
     auto end = std::chrono::steady_clock::now();
 
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
 
-    std::cout << "Send returned " << ret << " after " << duration << "ms" << std::endl;
+    std::cout << "Send returned " << (res ? "Success" : "Error") << " after " << duration << "ms" << std::endl;
 
-    if (ret != -1) {
-        std::cerr << "FAILED: Send should have timed out and returned -1" << std::endl;
+    if (!res.HasError()) {
+        std::cerr << "FAILED: Send should have timed out and returned Error" << std::endl;
         return 1;
     }
 

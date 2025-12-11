@@ -53,9 +53,9 @@ int main() {
     });
 
     std::vector<uint8_t> resp;
-    int res = host.SendToSlot(0, nullptr, 0, MsgType::NORMAL, resp, 50);
+    auto res = host.SendToSlot(0, nullptr, 0, MsgType::NORMAL, resp, 50);
 
-    if (res != -1) {
+    if (!res.HasError()) {
         std::cerr << "Expected timeout, got success" << std::endl;
         guest.join();
         return 1;
@@ -67,7 +67,7 @@ int main() {
 
     guest.join();
 
-    if (res == -1) {
+    if (res.HasError()) {
         std::cerr << "Call 2 failed (Recovery failed)" << std::endl;
         return 1;
     }

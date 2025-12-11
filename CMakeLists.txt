@@ -1,5 +1,10 @@
 cmake_minimum_required(VERSION 3.13)
-project(shm VERSION 0.1.0 LANGUAGES CXX)
+
+# Read version from VERSION file
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" SHM_VERSION_STRING)
+string(STRIP "${SHM_VERSION_STRING}" SHM_VERSION_STRING)
+
+project(shm VERSION ${SHM_VERSION_STRING} LANGUAGES CXX)
 
 # --- Options ---
 option(SHM_BUILD_TESTS "Build unit tests" OFF)

@@ -34,11 +34,11 @@ namespace shm {
 static const uint32_t SHM_MAGIC = 0x584C4C21;
 
 /**
- * @brief Protocol Version v0.3.0 (0x00030000).
+ * @brief Protocol Version v0.5.0 (0x00050000).
  * High 16 bits: Major, Low 16 bits: Minor.
  * Breaking changes increment Major version.
  */
-static const uint32_t SHM_VERSION = 0x00030000;
+static const uint32_t SHM_VERSION = 0x00050000;
 
 /**
  * @brief Message Types for control messages.
@@ -142,7 +142,9 @@ enum SlotState {
     /** @brief Transaction complete (transient state). */
     SLOT_DONE = 3,
     /** @brief Slot is claimed by Host, writing request. */
-    SLOT_BUSY = 4
+    SLOT_BUSY = 4,
+    /** @brief Slot is claimed by Guest, writing request. */
+    SLOT_GUEST_BUSY = 5
 };
 
 // Direct Mode Exchange Header

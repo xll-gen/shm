@@ -79,7 +79,11 @@ int main() {
         }
 
         std::cout << "Host: Sending..." << std::endl;
-        slot.SendFlatBuffer(10);
+        if (slot.SendFlatBuffer(10).HasError()) {
+            std::cerr << "SendFlatBuffer failed" << std::endl;
+            if (guest.joinable()) guest.join();
+            return 1;
+        }
 
         std::cout << "Host: Getting Resp Buffer..." << std::endl;
         uint8_t* resp = slot.GetRespBuffer();

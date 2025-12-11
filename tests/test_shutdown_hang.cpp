@@ -29,9 +29,9 @@ int main() {
     // Send returns -1, slot is leaked (State != FREE).
     std::cout << "Leaking slot 0 via timeout..." << std::endl;
     std::vector<uint8_t> resp;
-    int res = host.Send(nullptr, 0, shm::MsgType::NORMAL, resp, 50);
+    auto res = host.Send(nullptr, 0, shm::MsgType::NORMAL, resp, 50);
 
-    if (res != -1) {
+    if (!res.HasError()) {
         std::cerr << "Expected Send to fail/timeout" << std::endl;
         return 1;
     }

@@ -1,4 +1,4 @@
-# Shared Memory IPC Specification (v0.2.0)
+# Shared Memory IPC Specification (v0.5.0)
 
 This document defines the specification for the `xll-gen/shm` Shared Memory IPC system. It serves as the authoritative reference for implementing the protocol in any language (C++, Go, Python, Rust, etc.).
 
@@ -29,7 +29,7 @@ The first 64 bytes of the shared memory are reserved for the `ExchangeHeader`. T
 | Field | Type | Offset | Description |
 | :--- | :--- | :--- | :--- |
 | `magic` | `uint32` | 0 | Magic Number (0x584C4C21). |
-| `version` | `uint32` | 4 | Protocol Version (0x00020000). |
+| `version` | `uint32` | 4 | Protocol Version (0x00050000). |
 | `numSlots` | `uint32` | 8 | Number of Host-to-Guest slots. |
 | `numGuestSlots` | `uint32` | 12 | Number of Guest-to-Host (Guest Call) slots. |
 | `slotSize` | `uint32` | 16 | Total size of a single slot in bytes. |
@@ -87,7 +87,8 @@ The `state` field in `SlotHeader` manages the ownership of the slot.
 | `SLOT_REQ_READY` | 1 | Request data is written. Receiver (Guest) can process it. |
 | `SLOT_RESP_READY` | 2 | Response data is written. Owner (Host) can read it. |
 | `SLOT_DONE` | 3 | Transaction complete (Transient state). |
-| `SLOT_BUSY` | 4 | Slot is claimed by Owner, data is being written. |
+| `SLOT_BUSY` | 4 | Slot is claimed by Host (for Host Slots), data is being written. |
+| `SLOT_GUEST_BUSY` | 5 | Slot is claimed by Guest (for Guest Slots), data is being written. |
 
 ### 3.2. Message Types
 

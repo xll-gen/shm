@@ -103,7 +103,11 @@ int main() {
         // reqSize = 4. Guest looks at Start. Data is at Start. Guest finds "DATA".
         // Guest writes "OK".
 
-        slot.Send(4, MsgType::NORMAL);
+        if (slot.Send(4, MsgType::NORMAL).HasError()) {
+             std::cerr << "Send failed" << std::endl;
+             if (guest.joinable()) guest.join();
+             return 1;
+        }
 
         // Check Response
         uint8_t* resp = slot.GetRespBuffer();
