@@ -444,12 +444,17 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, msgType MsgType, timeou
 		respData = make([]byte, respSize)
 		copy(respData, slot.respBuffer[:respSize])
 	} else {
-		// Negative size means data is at the end
+		// Negative size means data is at the end (End-Aligned)
 		rLen := -respSize
+		// If rLen is larger than buffer, clamp it (though this indicates Host error)
 		if int(rLen) > len(slot.respBuffer) {
 			rLen = int32(len(slot.respBuffer))
 		}
-		offset := int32(len(slot.respBuffer)) - rLen
+
+		// Calculate offset from end of buffer
+		bufferLen := int32(len(slot.respBuffer))
+		offset := bufferLen - rLen
+
 		respData = make([]byte, rLen)
 		copy(respData, slot.respBuffer[offset:])
 	}
