@@ -448,6 +448,11 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, msgType MsgType, timeou
 	} else {
 		// Negative size means data is at the end
 		rLen := -respSize
+		// Check for overflow (e.g., MinInt32)
+		if rLen < 0 {
+			atomic.StoreUint32(&slot.header.State, SlotFree)
+			return nil, fmt.Errorf("invalid response size: %d", respSize)
+		}
 		if int(rLen) > len(slot.respBuffer) {
 			rLen = int32(len(slot.respBuffer))
 		}
