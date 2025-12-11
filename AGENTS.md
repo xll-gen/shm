@@ -50,3 +50,4 @@ When creating a release tag, the message must follow this format:
 *   **Do not** delete this file.
 *   **Do not** create `src/` directory for C++.
 *   **Do not** use Queue-based logic (SPSC/MPSC); strictly use the Direct Exchange (Slot) model defined in `SPECIFICATION.md`.
+*   All documentation, code comments, commit messages, and other project-related text must be in English.
