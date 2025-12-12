@@ -4,7 +4,7 @@ SimpleIPC is a high-performance, low-latency shared-memory IPC library connectin
 
 > **⚠️ WARNING: EXPERIMENTAL STATUS**
 >
-> This project is currently in an **experimental stage** (v0.3.0) and is under active development.
+> This project is currently in an **experimental stage** (v0.5.3) and is under active development.
 > It is **NOT** recommended for use in production environments at this time.
 > APIs and memory layouts are subject to change without notice.
 

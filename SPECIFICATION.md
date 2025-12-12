@@ -1,4 +1,4 @@
-# Shared Memory IPC Specification (v0.5.0)
+# Shared Memory IPC Specification (v0.5.3)
 
 This document defines the specification for the `xll-gen/shm` Shared Memory IPC system. It serves as the authoritative reference for implementing the protocol in any language (C++, Go, Python, Rust, etc.).
 
@@ -35,7 +35,7 @@ The first 64 bytes of the shared memory are reserved for the `ExchangeHeader`. T
 | `slotSize` | `uint32` | 16 | Total size of a single slot in bytes. |
 | `reqOffset` | `uint32` | 20 | Offset of the Request Buffer within a slot (relative to Slot start). |
 | `respOffset` | `uint32` | 24 | Offset of the Response Buffer within a slot (relative to Slot start). |
-| `padding` | `uint8[36]`| 28 | Padding to ensure 64-byte alignment. |
+| `reserved` | `uint8[36]`| 28 | Reserved to ensure 64-byte alignment. |
 
 **Total Size:** 64 Bytes.
 
@@ -65,7 +65,7 @@ The `SlotHeader` controls the state of the transaction. It **must** be aligned t
 | `msgType` | `uint32` | 80 | Message Type (e.g., Normal, Shutdown). |
 | `reqSize` | `int32` | 84 | Size of Request payload (see Section 3.3). |
 | `respSize` | `int32` | 88 | Size of Response payload (see Section 3.3). |
-| `padding` | `uint8[36]` | 92 | Padding to reach 128 bytes. |
+| `reserved` | `uint8[36]` | 92 | Reserved to reach 128 bytes. |
 
 **Total Size:** 128 Bytes.
 
@@ -114,7 +114,7 @@ The `reqSize` and `respSize` fields indicate the location of the data within the
 2.  **Write:** Host writes data to the Request Buffer and sets `reqSize`, `msgSeq`, and `msgType`.
 3.  **Signal:** Host atomically sets state to `SLOT_REQ_READY` and signals the Guest (via Event/Semaphore).
 4.  **Process:** Guest wakes up, reads the Request, processes it, and writes to the Response Buffer.
-5.  **Reply:** Guest sets `respSize`, updates state to `SLOT_RESP_READY`, and signals the Host.
+5.  **Reply:** Guest sets `respSize`, updates state to `SLOT_RESP_READY` and signals the Host.
 6.  **Complete:** Host wakes up, reads the Response, and sets state back to `SLOT_FREE`.
 
 ### 3.5. Guest-to-Host Flow (Guest Call)
@@ -136,6 +136,7 @@ All synchronization primitives are named based on the Shared Memory name (`SHM_N
 
 - **Request Event (Host -> Guest):** `{SHM_NAME}_slot_{INDEX}`
 - **Response Event (Guest -> Host):** `{SHM_NAME}_slot_{INDEX}_resp`
+- **Guest Call Event (Guest -> Host):** `{SHM_NAME}_guest_call` (Global event for all guest slots)
 
 *Note: On Linux, named semaphores often require a leading `/`, so the actual name might be `/SimpleIPC_slot_0`.*
 
