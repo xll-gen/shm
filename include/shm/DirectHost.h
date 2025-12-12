@@ -109,6 +109,10 @@ class DirectHost {
     // Config
     uint32_t slotSize; // Total payload size per slot
 
+    // Shared state to track DirectHost lifetime for ZeroCopySlots
+    struct SharedState {};
+    std::shared_ptr<SharedState> sharedState;
+
     /**
      * @brief Internal helper to wait for a response on a specific slot.
      * Contains the adaptive spin/yield/wait logic.
@@ -188,6 +192,7 @@ public:
     class ZeroCopySlot {
         DirectHost* host;
         int32_t slotIdx;
+        std::weak_ptr<SharedState> weakState;
 
     public:
         /**
@@ -195,34 +200,39 @@ public:
          * @param h Pointer to the DirectHost.
          * @param idx The index of the acquired slot.
          */
-        ZeroCopySlot(DirectHost* h, int32_t idx) : host(h), slotIdx(idx) {}
+        ZeroCopySlot(DirectHost* h, int32_t idx) : host(h), slotIdx(idx) {
+            if (h) weakState = h->sharedState;
+        }
 
         /**
          * @brief Destructor. Releases the slot if not already moved.
          */
         ~ZeroCopySlot() {
-            if (host && slotIdx >= 0) {
-                // Ensure slot is released if user didn't call Send?
-                // Actually, Send does NOT release the slot in this design (user reads response after Send).
-                // So Destructor MUST release the slot.
-                host->slots[slotIdx].header->state.store(SLOT_FREE, std::memory_order_release);
+            // Only release if Host is still alive
+            if (auto lock = weakState.lock()) {
+                if (host && slotIdx >= 0) {
+                    host->slots[slotIdx].header->state.store(SLOT_FREE, std::memory_order_release);
+                }
             }
         }
 
         // Move-only semantics
-        ZeroCopySlot(ZeroCopySlot&& other) noexcept : host(other.host), slotIdx(other.slotIdx) {
+        ZeroCopySlot(ZeroCopySlot&& other) noexcept : host(other.host), slotIdx(other.slotIdx), weakState(std::move(other.weakState)) {
             other.host = nullptr;
             other.slotIdx = -1;
         }
 
         ZeroCopySlot& operator=(ZeroCopySlot&& other) noexcept {
              if (this != &other) {
-                 // Release current if valid
-                 if (host && slotIdx >= 0) {
-                     host->slots[slotIdx].header->state.store(SLOT_FREE, std::memory_order_release);
+                 // Release current if valid (and Host is alive)
+                 if (auto lock = weakState.lock()) {
+                     if (host && slotIdx >= 0) {
+                         host->slots[slotIdx].header->state.store(SLOT_FREE, std::memory_order_release);
+                     }
                  }
                  host = other.host;
                  slotIdx = other.slotIdx;
+                 weakState = std::move(other.weakState);
                  other.host = nullptr;
                  other.slotIdx = -1;
              }
@@ -237,7 +247,9 @@ public:
          * @brief Checks if the slot is valid.
          * @return true if valid, false otherwise.
          */
-        bool IsValid() const { return host && slotIdx >= 0; }
+        bool IsValid() const {
+             return !weakState.expired() && host && slotIdx >= 0;
+        }
 
         /**
          * @brief Gets the pointer to the Request Buffer.
@@ -377,7 +389,9 @@ public:
     /**
      * @brief Default constructor.
      */
-    DirectHost() : shmBase(nullptr), hMapFile(0), running(false), msgSeqStride(0), responseTimeoutMs(10000) {}
+        DirectHost() : shmBase(nullptr), hMapFile(0), running(false), msgSeqStride(0), responseTimeoutMs(10000) {
+            sharedState = std::make_shared<SharedState>();
+        }
 
     /**
      * @brief Destructor. Ensures Shutdown is called.
