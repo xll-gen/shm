@@ -293,7 +293,8 @@ public:
 
             slot->header->reqSize = size;
             slot->header->msgType = msgType;
-            slot->header->msgSeq = slot->msgSeq;
+            uint32_t currentSeq = slot->msgSeq;
+            slot->header->msgSeq = currentSeq;
             slot->msgSeq += host->msgSeqStride;
 
             uint32_t t = (timeoutMs == USE_DEFAULT_TIMEOUT) ? host->responseTimeoutMs : timeoutMs;
@@ -303,6 +304,13 @@ public:
                 slotIdx = -1;
                 return Result<void>::Failure(Error::Timeout);
             }
+
+            // Verify MsgSeq
+            if (slot->header->msgSeq != currentSeq) {
+                 slotIdx = -1; // Invalidate
+                 return Result<void>::Failure(Error::ProtocolViolation);
+            }
+
             // Do NOT release slot here. User might want to read response.
             return Result<void>::Success();
         }
@@ -334,7 +342,8 @@ public:
             // Zero-Copy convention: Negative size
             slot->header->reqSize = -absSize;
             slot->header->msgType = MsgType::FLATBUFFER;
-            slot->header->msgSeq = slot->msgSeq;
+            uint32_t currentSeq = slot->msgSeq;
+            slot->header->msgSeq = currentSeq;
             slot->msgSeq += host->msgSeqStride;
 
             uint32_t t = (timeoutMs == USE_DEFAULT_TIMEOUT) ? host->responseTimeoutMs : timeoutMs;
@@ -344,6 +353,13 @@ public:
                 slotIdx = -1;
                 return Result<void>::Failure(Error::Timeout);
             }
+
+            // Verify MsgSeq
+            if (slot->header->msgSeq != currentSeq) {
+                 slotIdx = -1; // Invalidate
+                 return Result<void>::Failure(Error::ProtocolViolation);
+            }
+
             // Do NOT release slot here. User might want to read response.
             return Result<void>::Success();
         }
@@ -744,7 +760,8 @@ public:
 
         slot->header->reqSize = size;
         slot->header->msgType = msgType;
-        slot->header->msgSeq = slot->msgSeq;
+        uint32_t currentSeq = slot->msgSeq;
+        slot->header->msgSeq = currentSeq;
         slot->msgSeq += msgSeqStride;
 
         // Perform Signal and Wait
@@ -754,6 +771,13 @@ public:
         if (!ready) {
              // Timeout. Do NOT release slot (leak it) to prevent corruption.
              return Result<int>(Error::Timeout);
+        }
+
+        // Verify MsgSeq
+        if (slot->header->msgSeq != currentSeq) {
+             // Release Slot (or leak? Safer to leak if corrupted)
+             // Leaking prevents reuse of bad slot.
+             return Result<int>(Error::ProtocolViolation);
         }
 
         // Read Response

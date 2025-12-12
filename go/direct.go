@@ -103,10 +103,8 @@ type slotContext struct {
 	reqEvent   EventHandle
 	respEvent  EventHandle
     waitStrategy *WaitStrategy
-
-	// Local runtime state
-	ActiveWait int32  // Atomic boolean: 1 if this process is actively waiting on this slot
-	MsgSeq     uint32 // Local sequence number tracker
+    nextMsgSeq uint32
+    ActiveWait int32 // Atomic flag: 1 if actively waiting, 0 otherwise
 }
 
 // DirectGuest implements the Guest side of the Direct Mode IPC.
@@ -122,6 +120,7 @@ type DirectGuest struct {
 	reqOffset     uint32
 	respOffset    uint32
 	responseTimeout time.Duration
+    nextGuestSlot uint32 // Round-robin counter for Guest Call slots
 
 	slots []slotContext
 	wg    sync.WaitGroup
@@ -262,6 +261,9 @@ func NewDirectGuest(name string) (*DirectGuest, error) {
 		g.slots[i].reqEvent = evReq
 		g.slots[i].respEvent = evResp
 
+        // Initialize MsgSeq
+        g.slots[i].nextMsgSeq = uint32(i + 1)
+
         // Optimize for Single Thread (latency) vs Multi Thread (throughput)
         enableYield := numSlots > 1
         g.slots[i].waitStrategy = NewWaitStrategy(enableYield)
@@ -395,9 +397,10 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, msgType MsgType, timeou
 
 	slot.header.MsgType = msgType
 
-	// Update MsgSeq
-	slot.header.MsgSeq = slot.MsgSeq
-	slot.MsgSeq += uint32(g.numSlots + g.numGuestSlots)
+    // Set MsgSeq and Increment
+    currentSeq := slot.nextMsgSeq
+    slot.header.MsgSeq = currentSeq
+    slot.nextMsgSeq += uint32(len(g.slots)) // Stride = Total Slots
 
 	// Signal Ready
 	atomic.StoreUint32(&slot.header.State, SlotReqReady)
@@ -452,6 +455,13 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, msgType MsgType, timeou
 		Debug("SendGuestCall timed out waiting for host")
 		return nil, fmt.Errorf("timeout waiting for host")
 	}
+
+    // Verify MsgSeq
+    if slot.header.MsgSeq != currentSeq {
+         // Protocol Violation
+         // Do not free slot to prevent reuse corruption
+         return nil, fmt.Errorf("msgSeq mismatch: expected %d, got %d", currentSeq, slot.header.MsgSeq)
+    }
 
 	// Read Response
 	respSize := slot.header.RespSize

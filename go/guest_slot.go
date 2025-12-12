@@ -62,9 +62,10 @@ func (s *GuestSlot) SendWithTimeout(size int32, msgType MsgType, timeout time.Du
 	header.ReqSize = size
 	header.MsgType = msgType
 
-	// Update MsgSeq
-	header.MsgSeq = s.slot.MsgSeq
-	s.slot.MsgSeq += uint32(s.guest.numSlots + s.guest.numGuestSlots)
+    // Set MsgSeq
+    currentSeq := s.slot.nextMsgSeq
+    header.MsgSeq = currentSeq
+    s.slot.nextMsgSeq += uint32(len(s.guest.slots))
 
 	// Signal Ready
 	atomic.StoreUint32(&header.State, SlotReqReady)
@@ -118,24 +119,10 @@ func (s *GuestSlot) SendWithTimeout(size int32, msgType MsgType, timeout time.Du
 		return 0, 0, fmt.Errorf("timeout waiting for host")
 	}
 
-	// Validate Response Size (Overflow Protection)
-	respSize := header.RespSize
-	if respSize >= 0 {
-		if int(respSize) > len(s.slot.respBuffer) {
-			atomic.StoreUint32(&header.State, SlotFree) // Release
-			return 0, 0, fmt.Errorf("response size %d exceeds buffer size %d", respSize, len(s.slot.respBuffer))
-		}
-	} else {
-		rLen := -respSize
-		if rLen < 0 {
-			atomic.StoreUint32(&header.State, SlotFree)
-			return 0, 0, fmt.Errorf("invalid response size: %d", respSize)
-		}
-		if int(rLen) > len(s.slot.respBuffer) {
-			atomic.StoreUint32(&header.State, SlotFree)
-			return 0, 0, fmt.Errorf("response size %d exceeds buffer size %d", rLen, len(s.slot.respBuffer))
-		}
-	}
+    // Verify MsgSeq
+    if header.MsgSeq != currentSeq {
+        return 0, 0, fmt.Errorf("msgSeq mismatch: expected %d, got %d", currentSeq, header.MsgSeq)
+    }
 
 	return header.RespSize, header.MsgType, nil
 }
