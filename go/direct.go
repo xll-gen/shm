@@ -130,6 +130,8 @@ type DirectGuest struct {
 //
 // Returns a pointer to the initialized DirectGuest or an error if attachment fails.
 func NewDirectGuest(name string) (*DirectGuest, error) {
+	Info("Initializing DirectGuest", "name", name)
+
 	// 1. Map Header
 	// We try to map a small chunk first to read the header.
 	const HeaderMapSize = 64
@@ -258,6 +260,7 @@ func NewDirectGuest(name string) (*DirectGuest, error) {
 		ptr += uintptr(perSlotSize)
 	}
 
+	Info("Connected to DirectGuest", "name", name, "slots", numSlots)
 	return g, nil
 }
 
@@ -276,6 +279,7 @@ func (g *DirectGuest) Start(handler func(req []byte, resp []byte, msgType MsgTyp
 // Close releases shared memory resources.
 // It signals workers to exit and cleans up resources.
 func (g *DirectGuest) Close() {
+	Info("Closing DirectGuest", "name", g.name)
 	atomic.StoreInt32(&g.closing, 1)
 	g.wg.Wait()
 
@@ -432,6 +436,7 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, msgType MsgType, timeou
 	if !ready {
 		// Timeout - DO NOT free, Host might process late.
 		// Returning error will likely cause caller to retry or fail.
+		Debug("SendGuestCall timed out waiting for host")
 		return nil, fmt.Errorf("timeout waiting for host")
 	}
 

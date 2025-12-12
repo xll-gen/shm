@@ -9,6 +9,7 @@ project(shm VERSION ${SHM_VERSION_STRING} LANGUAGES CXX)
 # --- Options ---
 option(SHM_BUILD_TESTS "Build unit tests" OFF)
 option(SHM_BUILD_BENCHMARKS "Build benchmarks" OFF)
+option(SHM_DEBUG "Enable debug logging" OFF)
 
 # --- Main Interface Library ---
 add_library(shm INTERFACE)
@@ -23,6 +24,10 @@ target_include_directories(shm INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
 )
+
+if(SHM_DEBUG)
+    target_compile_definitions(shm INTERFACE SHM_DEBUG)
+endif()
 
 # Dependencies
 find_package(Threads REQUIRED)
