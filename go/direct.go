@@ -103,6 +103,7 @@ type slotContext struct {
 	reqEvent   EventHandle
 	respEvent  EventHandle
     waitStrategy *WaitStrategy
+    nextMsgSeq uint32
 }
 
 // DirectGuest implements the Guest side of the Direct Mode IPC.
@@ -253,6 +254,9 @@ func NewDirectGuest(name string) (*DirectGuest, error) {
 		g.slots[i].reqEvent = evReq
 		g.slots[i].respEvent = evResp
 
+        // Initialize MsgSeq
+        g.slots[i].nextMsgSeq = uint32(i + 1)
+
         // Optimize for Single Thread (latency) vs Multi Thread (throughput)
         enableYield := numSlots > 1
         g.slots[i].waitStrategy = NewWaitStrategy(enableYield)
@@ -382,6 +386,11 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, msgType MsgType, timeou
 
 	slot.header.MsgType = msgType
 
+    // Set MsgSeq and Increment
+    currentSeq := slot.nextMsgSeq
+    slot.header.MsgSeq = currentSeq
+    slot.nextMsgSeq += uint32(len(g.slots)) // Stride = Total Slots
+
 	// Signal Ready
 	atomic.StoreUint32(&slot.header.State, SlotReqReady)
 	SignalEvent(slot.reqEvent)
@@ -439,6 +448,13 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, msgType MsgType, timeou
 		Debug("SendGuestCall timed out waiting for host")
 		return nil, fmt.Errorf("timeout waiting for host")
 	}
+
+    // Verify MsgSeq
+    if slot.header.MsgSeq != currentSeq {
+         // Protocol Violation
+         // Do not free slot to prevent reuse corruption
+         return nil, fmt.Errorf("msgSeq mismatch: expected %d, got %d", currentSeq, slot.header.MsgSeq)
+    }
 
 	// Read Response
 	respSize := slot.header.RespSize

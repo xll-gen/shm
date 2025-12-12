@@ -15,7 +15,8 @@ enum class Error {
     InvalidArgs,
     NotConnected,
     ResourceExhausted,
-    InternalError
+    InternalError,
+    ProtocolViolation
 };
 
 /**
