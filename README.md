@@ -230,6 +230,19 @@ The default timeout for operations is 10 seconds. For operations that may exceed
 
 This ensures the 1:1 slot mapping remains available for high-frequency messages and prevents timeouts.
 
+### Nested IPC & Recursion
+
+The library supports recursive calls (e.g., calling `GetZeroCopySlot` or `Send` while already holding a slot) provided that sufficient slots are available.
+
+**Important**: If you plan to use nested IPC (e.g. `Host -> Guest -> Host` or recursive Host calls), you **must** configure `numHostSlots` to be at least `N_threads * (Depth + 1)`.
+
+*   **Example**: If you have 1 thread performing a nested call (Depth 1), you need at least **2 slots**.
+*   **Failure to do so will result in Deadlock** (the inner call waiting forever for a slot held by the outer call).
+
+For complex recursion, it is recommended to **double the slot count** to provide a safety margin.
+
+> **Note on Corruption**: "Corruption" during nested calls usually stems from the application mistakenly reusing the *same* `ZeroCopySlot` object instance for the inner call. Always call `GetZeroCopySlot()` again to acquire a distinct slot for the nested operation.
+
 ## Building
 
 ### Requirements
