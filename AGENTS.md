@@ -22,6 +22,7 @@ This file contains instructions for AI Agents working on this repository.
     *   Header-only architecture.
     *   Use `doxygen` style comments (`/** ... */`).
     *   Strict memory alignment (cache-line friendly).
+    *   **Cross-Platform:** Must compile on Linux (GCC/Clang) and Windows (MSVC 2019+). Use `Platform.h` for OS primitives.
 *   **Go:**
     *   Use `cgo` only when necessary for OS primitives (e.g. `sem_open`).
     *   Use `go fmt`.
