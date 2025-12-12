@@ -109,7 +109,10 @@ func (s *GuestSlot) SendWithTimeout(size int32, msgType MsgType, timeout time.Du
 		atomic.StoreUint32(&header.GuestState, GuestStateActive)
 	}
 
+	// Set ActiveWait before entering Wait
+	atomic.StoreInt32(&s.slot.ActiveWait, 1)
 	ready := s.slot.waitStrategy.Wait(checkReady, sleepAction)
+	atomic.StoreInt32(&s.slot.ActiveWait, 0)
 
 	if !ready {
 		// Timeout
@@ -140,17 +143,40 @@ func (g *DirectGuest) AcquireGuestSlot() (*GuestSlot, error) {
 		return nil, fmt.Errorf("no guest slots available")
 	}
 
-	startIdx := int(g.numSlots)
-	endIdx := int(g.numSlots + g.numGuestSlots)
+	// Use Round-Robin to pick a start index
+	offset := atomic.AddUint32(&g.nextGuestSlot, 1)
+	startBase := int(g.numSlots)
+	numGuest := int(g.numGuestSlots)
 
-	for i := startIdx; i < endIdx; i++ {
+	for j := 0; j < numGuest; j++ {
+		i := startBase + int((uint32(j)+offset)%uint32(numGuest))
 		s := &g.slots[i]
-		if atomic.CompareAndSwapUint32(&s.header.State, SlotFree, SlotBusy) {
-			return &GuestSlot{
-				guest:   g,
-				slotIdx: i,
-				slot:    s,
-			}, nil
+
+		currentState := atomic.LoadUint32(&s.header.State)
+
+		// Case 1: Slot is Free
+		if currentState == SlotFree {
+			if atomic.CompareAndSwapUint32(&s.header.State, SlotFree, SlotGuestBusy) { // Use SlotGuestBusy (5)
+				return &GuestSlot{
+					guest:   g,
+					slotIdx: i,
+					slot:    s,
+				}, nil
+			}
+		}
+
+		// Case 2: Slot is stuck in RESP_READY (Zombie).
+		// Reclaim ONLY if no local process is actively waiting.
+		if currentState == SlotRespReady {
+			if atomic.LoadInt32(&s.ActiveWait) == 0 {
+				if atomic.CompareAndSwapUint32(&s.header.State, SlotRespReady, SlotGuestBusy) {
+					return &GuestSlot{
+						guest:   g,
+						slotIdx: i,
+						slot:    s,
+					}, nil
+				}
+			}
 		}
 	}
 
