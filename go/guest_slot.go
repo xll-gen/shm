@@ -63,7 +63,8 @@ func (s *GuestSlot) SendWithTimeout(size int32, msgType MsgType, timeout time.Du
 	header.MsgType = msgType
 
 	// Update MsgSeq
-	header.MsgSeq = s.slot.MsgSeq
+	sentSeq := s.slot.MsgSeq
+	header.MsgSeq = sentSeq
 	s.slot.MsgSeq += uint32(s.guest.numSlots + s.guest.numGuestSlots)
 
 	// Signal Ready
@@ -116,6 +117,12 @@ func (s *GuestSlot) SendWithTimeout(size int32, msgType MsgType, timeout time.Du
 	if !ready {
 		// Timeout
 		return 0, 0, fmt.Errorf("timeout waiting for host")
+	}
+
+	// Verify MsgSeq
+	if atomic.LoadUint32(&header.MsgSeq) != sentSeq {
+		atomic.StoreUint32(&header.State, SlotFree) // Release
+		return 0, 0, fmt.Errorf("msgSeq mismatch: expected %d, got %d", sentSeq, atomic.LoadUint32(&header.MsgSeq))
 	}
 
 	// Validate Response Size (Overflow Protection)
