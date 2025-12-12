@@ -35,16 +35,19 @@ This file contains instructions for AI Agents working on this repository.
 
 ## **Tag Message Guidelines**
 
-When creating a release tag, the message must follow this format:
+When creating a release tag, follow these steps:
 
-1.  **Summary of Major Changes:**
-    Group significant changes by category (e.g., Performance, Features, Bug Fixes).
-    *   **Category Name**:
-        *   Description of change ([commit_hash](https://github.com/xll-gen/shm/commit/commit_hash))
+1.  **Update the `VERSION` file:** Before creating the tag, ensure the `VERSION` file at the root of the repository is updated to the new version number.
 
-2.  **Full Changelog:**
-    List all commits included in the release, referencing the commit hash with a hyperlink.
-    *   [commit_hash](https://github.com/xll-gen/shm/commit/commit_hash) Commit message
+2.  **Format the tag message:** The message must follow this format:
+    *   **Summary of Major Changes:**
+        Group significant changes by category (e.g., Performance, Features, Bug Fixes).
+        *   **Category Name**:
+            *   Description of change ([commit_hash](https://github.com/xll-gen/shm/commit/commit_hash))
+
+    *   **Full Changelog:**
+        List all commits included in the release, referencing the commit hash with a hyperlink.
+        *   [commit_hash](https://github.com/xll-gen/shm/commit/commit_hash) Commit message
 
 ## **General Rules**
 
