@@ -396,8 +396,7 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, msgType MsgType, timeou
 	slot.header.MsgType = msgType
 
 	// Update MsgSeq
-	sentSeq := slot.MsgSeq
-	slot.header.MsgSeq = sentSeq
+	slot.header.MsgSeq = slot.MsgSeq
 	slot.MsgSeq += uint32(g.numSlots + g.numGuestSlots)
 
 	// Signal Ready
@@ -452,12 +451,6 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, msgType MsgType, timeou
 		// Returning error will likely cause caller to retry or fail.
 		Debug("SendGuestCall timed out waiting for host")
 		return nil, fmt.Errorf("timeout waiting for host")
-	}
-
-	// Verify MsgSeq
-	if atomic.LoadUint32(&slot.header.MsgSeq) != sentSeq {
-		atomic.StoreUint32(&slot.header.State, SlotFree)
-		return nil, fmt.Errorf("msgSeq mismatch: expected %d, got %d", sentSeq, atomic.LoadUint32(&slot.header.MsgSeq))
 	}
 
 	// Read Response

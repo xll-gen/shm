@@ -291,10 +291,9 @@ public:
                 return Result<void>::Failure(Error::BufferTooSmall);
             }
 
-            uint32_t sentSeq = slot->msgSeq;
             slot->header->reqSize = size;
             slot->header->msgType = msgType;
-            slot->header->msgSeq = sentSeq;
+            slot->header->msgSeq = slot->msgSeq;
             slot->msgSeq += host->msgSeqStride;
 
             uint32_t t = (timeoutMs == USE_DEFAULT_TIMEOUT) ? host->responseTimeoutMs : timeoutMs;
@@ -304,14 +303,6 @@ public:
                 slotIdx = -1;
                 return Result<void>::Failure(Error::Timeout);
             }
-
-            // Verify MsgSeq
-            if (slot->header->msgSeq != sentSeq) {
-                // Invalidate slot
-                slotIdx = -1;
-                return Result<void>::Failure(Error::InternalError);
-            }
-
             // Do NOT release slot here. User might want to read response.
             return Result<void>::Success();
         }
@@ -341,10 +332,9 @@ public:
             }
 
             // Zero-Copy convention: Negative size
-            uint32_t sentSeq = slot->msgSeq;
             slot->header->reqSize = -absSize;
             slot->header->msgType = MsgType::FLATBUFFER;
-            slot->header->msgSeq = sentSeq;
+            slot->header->msgSeq = slot->msgSeq;
             slot->msgSeq += host->msgSeqStride;
 
             uint32_t t = (timeoutMs == USE_DEFAULT_TIMEOUT) ? host->responseTimeoutMs : timeoutMs;
@@ -354,14 +344,6 @@ public:
                 slotIdx = -1;
                 return Result<void>::Failure(Error::Timeout);
             }
-
-            // Verify MsgSeq
-            if (slot->header->msgSeq != sentSeq) {
-                // Invalidate slot
-                slotIdx = -1;
-                return Result<void>::Failure(Error::InternalError);
-            }
-
             // Do NOT release slot here. User might want to read response.
             return Result<void>::Success();
         }
@@ -760,10 +742,9 @@ public:
              return Result<int>(Error::BufferTooSmall);
         }
 
-        uint32_t sentSeq = slot->msgSeq;
         slot->header->reqSize = size;
         slot->header->msgType = msgType;
-        slot->header->msgSeq = sentSeq;
+        slot->header->msgSeq = slot->msgSeq;
         slot->msgSeq += msgSeqStride;
 
         // Perform Signal and Wait
@@ -773,12 +754,6 @@ public:
         if (!ready) {
              // Timeout. Do NOT release slot (leak it) to prevent corruption.
              return Result<int>(Error::Timeout);
-        }
-
-        // Verify MsgSeq
-        if (slot->header->msgSeq != sentSeq) {
-             slot->header->state.store(SLOT_FREE, std::memory_order_release);
-             return Result<int>(Error::InternalError);
         }
 
         // Read Response
