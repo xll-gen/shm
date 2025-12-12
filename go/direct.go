@@ -476,105 +476,147 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, msgType MsgType, timeou
 func (g *DirectGuest) workerLoop(idx int, handler func([]byte, []byte, MsgType) (int32, MsgType)) {
 	defer g.wg.Done()
 
-    // Recover from panic (caused by SHM unmap during Close)
-    defer func() {
-        if r := recover(); r != nil {
-             fmt.Printf("Worker %d recovered from panic: %v\n", idx, r)
-        }
-    }()
-
-	slot := &g.slots[idx]
-	header := slot.header
-
-    // Reset guest state
-    atomic.StoreUint32(&header.GuestState, GuestStateActive)
-
 	for {
+		// Check closing before restarting
 		if atomic.LoadInt32(&g.closing) == 1 {
 			return
 		}
 
-		// Adaptive Wait for REQ_READY using WaitStrategy
-        checkReady := func() bool {
-            return atomic.LoadUint32(&header.State) == SlotReqReady
-        }
+		shouldExit := false
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					// If closing, we expect potential panics due to unmap. Just return.
+					if atomic.LoadInt32(&g.closing) == 1 {
+						return
+					}
 
-        sleepAction := func() {
-            atomic.StoreUint32(&header.GuestState, GuestStateWaiting)
+					fmt.Printf("Worker %d panic recovered (restarting): %v\n", idx, r)
 
-            if checkReady() {
-                atomic.StoreUint32(&header.GuestState, GuestStateActive)
-                return
-            }
+					// Unblock Host if we were processing
+					// If the panic happened while we owned the slot, we must release it.
+					slot := &g.slots[idx]
+					header := slot.header
 
-            WaitForEvent(slot.reqEvent, 100)
+					// Check if state implies we are holding the slot
+					state := atomic.LoadUint32(&header.State)
+					if state == SlotReqReady || state == SlotGuestBusy {
+						// We failed during processing. Host is likely waiting.
+						// Signal generic error (RespSize 0)
+						header.RespSize = 0
+						atomic.StoreUint32(&header.State, SlotRespReady)
+						SignalEvent(slot.respEvent)
+					}
+				}
+			}()
 
-            if atomic.LoadInt32(&g.closing) == 1 {
-                return
-            }
+			shouldExit = !g.workerLoopInternal(idx, handler)
+		}()
 
-            // Check again (might fault if unmapped, handled by recover)
-            // checkReady() is called by WaitStrategy after sleepAction returns.
-            atomic.StoreUint32(&header.GuestState, GuestStateActive)
-        }
-
-        ready := slot.waitStrategy.Wait(checkReady, sleepAction)
-
-        if ready {
-             // Try to transition REQ_READY -> GUEST_BUSY to lock the slot
-             if !atomic.CompareAndSwapUint32(&header.State, SlotReqReady, SlotGuestBusy) {
-                 // Host might have timed out and reclaimed the slot. Abort.
-                 continue
-             }
-
-             // Process
-             msgType := header.MsgType
-             if msgType == MsgTypeShutdown {
-                 header.RespSize = 0
-                 atomic.StoreUint32(&header.State, SlotRespReady)
-                 if atomic.LoadUint32(&header.HostState) == HostStateWaiting {
-                     SignalEvent(slot.respEvent)
-                 }
-                 return
-             }
-
-             if msgType == MsgTypeHeartbeatReq {
-                 header.MsgType = MsgTypeHeartbeatResp
-                 header.RespSize = 0
-             } else {
-                 reqSize := header.ReqSize
-                 var reqData []byte
-
-                 if reqSize >= 0 {
-                     if reqSize > int32(len(slot.reqBuffer)) { reqSize = int32(len(slot.reqBuffer)) }
-                     reqData = slot.reqBuffer[:reqSize]
-                 } else {
-                     // Negative size means data is at the end
-                     rLen := -reqSize
-                     if rLen > int32(len(slot.reqBuffer)) { rLen = int32(len(slot.reqBuffer)) }
-                     offset := int32(len(slot.reqBuffer)) - rLen
-                     reqData = slot.reqBuffer[offset:]
-                 }
-
-                 respSize, respType := handler(reqData, slot.respBuffer, msgType)
-                 header.RespSize = respSize
-                 header.MsgType = respType
-             }
-
-             // Signal Ready (Transition GUEST_BUSY -> RESP_READY)
-             atomic.StoreUint32(&header.State, SlotRespReady)
-
-             // Wake Host
-             if atomic.LoadUint32(&header.HostState) == HostStateWaiting {
-                 SignalEvent(slot.respEvent)
-             }
-
-             // Wait for Host to ack/release (Host sets FREE)
-             // Actually, we loop back to wait for REQ_READY.
-             // If Host is slow to read, State remains RESP_READY.
-             // We must NOT process until State becomes REQ_READY again.
-             // Host transition: RESP_READY -> FREE -> BUSY -> REQ_READY.
-
-        }
+		if shouldExit {
+			return
+		}
 	}
+}
+
+func (g *DirectGuest) workerLoopInternal(idx int, handler func([]byte, []byte, MsgType) (int32, MsgType)) bool {
+	slot := &g.slots[idx]
+	header := slot.header
+
+	// Reset guest state
+	atomic.StoreUint32(&header.GuestState, GuestStateActive)
+
+	for {
+		if atomic.LoadInt32(&g.closing) == 1 {
+			return false
+		}
+
+		// Adaptive Wait for REQ_READY using WaitStrategy
+		checkReady := func() bool {
+			return atomic.LoadUint32(&header.State) == SlotReqReady
+		}
+
+		sleepAction := func() {
+			atomic.StoreUint32(&header.GuestState, GuestStateWaiting)
+
+			if checkReady() {
+				atomic.StoreUint32(&header.GuestState, GuestStateActive)
+				return
+			}
+
+			WaitForEvent(slot.reqEvent, 100)
+
+			if atomic.LoadInt32(&g.closing) == 1 {
+				return
+			}
+
+			// Check again (might fault if unmapped, handled by recover)
+			// checkReady() is called by WaitStrategy after sleepAction returns.
+			atomic.StoreUint32(&header.GuestState, GuestStateActive)
+		}
+
+		ready := slot.waitStrategy.Wait(checkReady, sleepAction)
+
+		if ready {
+			// Try to transition REQ_READY -> GUEST_BUSY to lock the slot
+			if !atomic.CompareAndSwapUint32(&header.State, SlotReqReady, SlotGuestBusy) {
+				// Host might have timed out and reclaimed the slot. Abort.
+				continue
+			}
+
+			// Process
+			msgType := header.MsgType
+			if msgType == MsgTypeShutdown {
+				header.RespSize = 0
+				atomic.StoreUint32(&header.State, SlotRespReady)
+				if atomic.LoadUint32(&header.HostState) == HostStateWaiting {
+					SignalEvent(slot.respEvent)
+				}
+				return false
+			}
+
+			if msgType == MsgTypeHeartbeatReq {
+				header.MsgType = MsgTypeHeartbeatResp
+				header.RespSize = 0
+			} else {
+				reqSize := header.ReqSize
+				var reqData []byte
+
+				if reqSize >= 0 {
+					if reqSize > int32(len(slot.reqBuffer)) {
+						reqSize = int32(len(slot.reqBuffer))
+					}
+					reqData = slot.reqBuffer[:reqSize]
+				} else {
+					// Negative size means data is at the end
+					rLen := -reqSize
+					if rLen > int32(len(slot.reqBuffer)) {
+						rLen = int32(len(slot.reqBuffer))
+					}
+					offset := int32(len(slot.reqBuffer)) - rLen
+					reqData = slot.reqBuffer[offset:]
+				}
+
+				respSize, respType := handler(reqData, slot.respBuffer, msgType)
+				header.RespSize = respSize
+				header.MsgType = respType
+			}
+
+			// Signal Ready (Transition GUEST_BUSY -> RESP_READY)
+			atomic.StoreUint32(&header.State, SlotRespReady)
+
+			// Wake Host
+			if atomic.LoadUint32(&header.HostState) == HostStateWaiting {
+				SignalEvent(slot.respEvent)
+			}
+
+			// Wait for Host to ack/release (Host sets FREE)
+			// Actually, we loop back to wait for REQ_READY.
+			// If Host is slow to read, State remains RESP_READY.
+			// We must NOT process until State becomes REQ_READY again.
+			// Host transition: RESP_READY -> FREE -> BUSY -> REQ_READY.
+
+		}
+	}
+	return true
 }
