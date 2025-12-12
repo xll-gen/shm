@@ -910,7 +910,8 @@ public:
      * @param limit Max number of requests to process per call. -1 for unlimited.
      * @return int Number of requests processed.
      */
-    int ProcessGuestCalls(GuestCallHandler handler, int limit = -1) {
+    template <typename Handler>
+    int ProcessGuestCalls(Handler&& handler, int limit = -1) {
         if (!running) return 0;
         int processed = 0;
 
@@ -919,10 +920,13 @@ public:
             Slot* slot = &slots[i];
 
             // Check for REQ_READY (Guest wrote request)
+            // Optimization: Load first to avoid CAS contention/cache invalidation on empty slots.
+            uint32_t current = slot->header->state.load(std::memory_order_acquire);
+            if (current != SLOT_REQ_READY) continue;
+
             // Use CAS to claim the slot (transition to BUSY) to prevent race conditions
             // if ProcessGuestCalls is called from multiple threads or recursively.
-            uint32_t expected = SLOT_REQ_READY;
-            if (slot->header->state.compare_exchange_strong(expected, SLOT_BUSY, std::memory_order_acq_rel)) {
+            if (slot->header->state.compare_exchange_strong(current, SLOT_BUSY, std::memory_order_acq_rel)) {
                 // Read Request
                 int32_t reqSize = slot->header->reqSize;
                 const uint8_t* reqData = nullptr;
@@ -947,10 +951,7 @@ public:
                 }
 
                 // Invoke Handler
-                int32_t respSize = 0;
-                if (handler) {
-                    respSize = handler(reqData, absReqSize, slot->respBuffer, slot->maxRespSize, slot->header->msgType);
-                }
+                int32_t respSize = handler(reqData, absReqSize, slot->respBuffer, slot->maxRespSize, slot->header->msgType);
 
                 // Validate Response Size
                 int32_t absRespSize = respSize < 0 ? -respSize : respSize;
