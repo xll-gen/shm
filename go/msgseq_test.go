@@ -54,6 +54,17 @@ func MockHostForMsgSeq(t *testing.T, name string, numSlots int) {
     guestSlotHeader := (*SlotHeader)(unsafe.Pointer(addr + uintptr(guestSlotOffset)))
 
     // Create Events
+    // Create Host Slot events (Slot 0..numSlots-1)
+    for i := 0; i < numSlots; i++ {
+        rName := fmt.Sprintf("%s_slot_%d", name, i)
+        sName := fmt.Sprintf("%s_slot_%d_resp", name, i)
+        ev1, _ := CreateEvent(rName)
+        ev2, _ := CreateEvent(sName)
+        defer CloseEvent(ev1)
+        defer CloseEvent(ev2)
+    }
+
+    // Create Guest Slot events
     reqName := fmt.Sprintf("%s_guest_call", name)
     respName := fmt.Sprintf("%s_slot_%d_resp", name, numSlots)
 
