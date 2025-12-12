@@ -13,6 +13,9 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release")
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         target_compile_options(shm_benchmark PRIVATE -O3 -march=native -flto)
         target_link_options(shm_benchmark PRIVATE -flto)
+    elseif(MSVC)
+        target_compile_options(shm_benchmark PRIVATE /O2 /Oi /Ot /GL /permissive-)
+        target_link_options(shm_benchmark PRIVATE /LTCG)
     endif()
 endif()
 
@@ -29,3 +32,7 @@ target_include_directories(shm_benchmark PRIVATE
 
 # Link against the main library
 target_link_libraries(shm_benchmark PRIVATE shm)
+
+if(MSVC)
+    target_compile_definitions(shm_benchmark PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
