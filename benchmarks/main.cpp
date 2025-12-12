@@ -210,7 +210,23 @@ int main(int argc, char** argv) {
     }
 
     // Run for Duration
-    std::this_thread::sleep_for(std::chrono::seconds(DURATION_SEC));
+    std::cout << "Running: [                                                  ] 0 %" << std::flush;
+    for (int i = 0; i < DURATION_SEC; ++i) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+
+        float progress = (float)(i + 1) / DURATION_SEC;
+        int barWidth = 50;
+
+        std::cout << "\rRunning: [";
+        int pos = (int)(barWidth * progress);
+        for (int j = 0; j < barWidth; ++j) {
+            if (j < pos) std::cout << "=";
+            else if (j == pos) std::cout << ">";
+            else std::cout << " ";
+        }
+        std::cout << "] " << int(progress * 100.0) << " %" << std::flush;
+    }
+    std::cout << std::endl;
 
     // Stop
     running = false;
