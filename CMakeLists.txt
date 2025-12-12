@@ -29,6 +29,13 @@ if(SHM_DEBUG)
     target_compile_definitions(shm INTERFACE SHM_DEBUG)
 endif()
 
+if(MSVC)
+    # Ensure consumers don't get min/max macros from windows.h
+    target_compile_definitions(shm INTERFACE NOMINMAX WIN32_LEAN_AND_MEAN)
+    # Set warning level 4 for this project's build
+    add_compile_options(/W4 /permissive-)
+endif()
+
 # Dependencies
 find_package(Threads REQUIRED)
 target_link_libraries(shm INTERFACE Threads::Threads)

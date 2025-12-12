@@ -260,18 +260,38 @@ The project uses `Taskfile` for automation (requires [Task](https://taskfile.dev
 task run:benchmark
 ```
 
-If you need to build manually:
+#### Linux (Manual)
 
 ```bash
 # Build C++ Benchmarks
 mkdir build && cd build
-cmake ../benchmarks
+cmake .. -DSHM_BUILD_BENCHMARKS=ON -DCMAKE_BUILD_TYPE=Release
 make
 
 # Build Go Benchmark Server
 cd ../benchmarks/go
 go build
 ```
+
+#### Windows (Manual with MSVC)
+
+1.  **Generate Visual Studio Solution:**
+    ```cmd
+    mkdir build
+    cd build
+    cmake -S .. -B . -DSHM_BUILD_BENCHMARKS=ON
+    ```
+
+2.  **Build with Release Configuration:**
+    ```cmd
+    cmake --build . --config Release
+    ```
+
+3.  **Run Benchmarks:**
+    Use `Taskfile` or run the executables directly from the `Release` folder.
+    ```cmd
+    task run:benchmark
+    ```
 
 ## Benchmarks
 
