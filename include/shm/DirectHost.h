@@ -14,6 +14,7 @@
 #include "IPCUtils.h"
 #include "WaitStrategy.h"
 #include "Result.h"
+#include "Logger.h"
 
 namespace shm {
 
@@ -153,6 +154,7 @@ class DirectHost {
                 // Note: If timeoutMs is 0xFFFFFFFF, elapsed >= timeoutMs might be false unless elapsed is huge.
                 // But generally safe.
                 if (timeoutMs != 0xFFFFFFFF && elapsed >= timeoutMs) {
+                    SHM_LOG_DEBUG("WaitResponse timeout after ", elapsed, "ms");
                     break; // Timeout, return and let caller fail
                 }
 
@@ -399,6 +401,11 @@ public:
      * @return Result<void> Success or Error.
      */
     Result<void> Init(const HostConfig& config) {
+        SHM_LOG_INFO("Initializing DirectHost with shmName: ", config.shmName,
+                     ", numHostSlots: ", config.numHostSlots,
+                     ", numGuestSlots: ", config.numGuestSlots,
+                     ", payloadSize: ", config.payloadSize);
+
         this->shmName = config.shmName;
         this->numSlots = config.numHostSlots;
         this->numGuestSlots = config.numGuestSlots;
@@ -479,6 +486,7 @@ public:
             slots[i].hRespEvent = Platform::CreateNamedEvent(respName.c_str());
 
             if (!slots[i].hReqEvent || !slots[i].hRespEvent) {
+                SHM_LOG_ERROR("Failed to create events for slot ", i);
                 running = true; // Enable Shutdown
                 Shutdown();
                 return Result<void>::Failure(Error::InternalError);
@@ -527,6 +535,8 @@ public:
      */
     void Shutdown() {
         if (!running) return;
+
+        SHM_LOG_INFO("Shutting down DirectHost: ", shmName);
 
         Stop(); // Stop background worker if active
 

@@ -17,6 +17,7 @@
     #include <cstring>
     #include <iostream>
     #include <immintrin.h>
+    #include "Logger.h"
 
     typedef sem_t* EventHandle;
     typedef int ShmHandle; // File Descriptor
@@ -51,7 +52,7 @@ public:
         std::string evName = "/" + std::string(name);
         EventHandle sem = sem_open(evName.c_str(), O_CREAT, 0644, 0);
         if (sem == SEM_FAILED) {
-            std::cerr << "sem_open failed: " << strerror(errno) << std::endl;
+            SHM_LOG_ERROR("sem_open failed: ", strerror(errno));
             return nullptr;
         }
         return sem;
