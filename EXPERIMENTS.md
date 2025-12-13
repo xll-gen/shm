@@ -1,5 +1,7 @@
 # Performance Tuning Experiments
 
+> **Note:** This document records historical tuning experiments (v0.1.0 - v0.2.0). For current benchmark results, please refer to [BENCHMARK_RESULTS.md](../BENCHMARK_RESULTS.md).
+
 This document records the results of tuning experiments conducted to optimize the Direct Exchange IPC in the Sandbox environment.
 
 ## Baseline (Starting Point)

@@ -15,6 +15,8 @@ SimpleIPC is a high-performance, low-latency shared-memory IPC library connectin
 *   **Zero Copy**: Data is written directly to shared memory slots.
 *   **Cross-Platform**: Supports Linux (shm_open/sem_open) and Windows (CreateFileMapping/CreateEvent).
 *   **Protocol Agnostic**: Transmits raw bytes with a minimal 8-byte Transport Header for request matching.
+*   **Guest-to-Host Calls**: Supports async notifications from Go to C++.
+*   **Header-Only C++**: Easy integration via `include/shm`.
 
 ## Performance Highlights
 
@@ -48,11 +50,11 @@ The library operates in **Direct Mode**, where a fixed pool of "Slots" is alloca
 ### Memory Layout
 
 The shared memory region consists of:
-1.  **Exchange Header** (64 bytes): Global metadata (number of slots, slot size).
+1.  **Exchange Header** (64 bytes): Global metadata (Magic, Version, number of slots, slot size).
 2.  **Slot Array**: An array of Slots.
 
 Each **Slot** (128-byte Header + Payload) contains:
-*   **SlotHeader**: Atomic state variables (`State`, `HostState`, `GuestState`) and message metadata (`ReqSize`, `MsgId`, `MsgType`).
+*   **SlotHeader**: Atomic state variables (`State`, `HostState`, `GuestState`) and message metadata (`ReqSize`, `MsgSeq`, `MsgType`).
 *   **Request Buffer**: Area where Host writes data.
 *   **Response Buffer**: Area where Guest writes data.
 
@@ -309,4 +311,5 @@ The `experiments` folder contains standalone latency tests (`pingpong`) used to 
 ## Documentation
 
 *   `AGENTS.md`: Developer guidelines and constraints.
+*   `SPECIFICATION.md`: Protocol details and memory layout.
 *   Source code is fully documented with Doxygen (C++) and GoDoc (Go) comments.
