@@ -72,9 +72,9 @@ void worker(int id, Packet* packet, int iterations, WorkerResult& result) {
     packet->guest_sleeping.store(0);
 
     // Dynamic adaptation state
-    int spin_limit = 5000;
-    const int MIN_SPIN = 100;
-    const int MAX_SPIN = 20000;
+    int spin_limit = 2000;
+    const int MIN_SPIN = 1;
+    const int MAX_SPIN = 2000;
 
     for (int i = 0; i < iterations; ++i) {
         packet->val_a = i;
@@ -103,11 +103,11 @@ void worker(int id, Packet* packet, int iterations, WorkerResult& result) {
 
         if (ready) {
             // Case A: Success - Increase spin limit (reward)
-            if (spin_limit < MAX_SPIN) spin_limit += 200;
+            if (spin_limit < MAX_SPIN) spin_limit += 100;
             if (spin_limit > MAX_SPIN) spin_limit = MAX_SPIN;
         } else {
             // Case B: Failure - Decrease spin limit (punish)
-            if (spin_limit > MIN_SPIN) spin_limit -= 100; // Less punishment
+            if (spin_limit > MIN_SPIN) spin_limit -= 500;
             if (spin_limit < MIN_SPIN) spin_limit = MIN_SPIN;
 
             // 2. Sleep Phase
