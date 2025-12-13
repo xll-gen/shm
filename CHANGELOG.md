@@ -1,15 +1,36 @@
 # Changelog
 
-## [v0.2.0] - 2025-12-05
+## [v0.5.4] - 2025-12-13
+
+### Experimental Status
+- Designated as **Experimental**. Not for production use.
+- Performance tuning for containerized environments.
+
+### Features
+- **Adaptive Wait Strategy**: Unified Hybrid Spin (Spin -> Yield -> Sleep) for Host and Guest.
+- **Zero-Copy Slot API**: Generic `Send` with negative size support for end-alignment (replacing `SendFlatBuffer`).
+- **Safety**: Added robust checks for `Init` failures (e.g., file descriptor limits).
+
+## [v0.5.0] - 2025-12-12
+
+Major protocol overhaul and architecture simplification.
+
+### Breaking Changes
+- **Protocol v0.5.0**: Added Magic (`0x584C4C21`) and Version (`0x00050000`) to ExchangeHeader.
+- **Removed Queues**: SPSC/MPSC implementations removed. Only **Direct Mode** is supported.
+- **Header-Only C++**: Library moved entirely to `include/shm/`. `src/` directory removed.
 
 ### Features
 - **Guest Call**: Allows Go Guest to initiate calls to C++ Host (Async/Callback pattern).
-- **Protocol Update**: Added `NumGuestSlots` to `ExchangeHeader` and `MSG_ID_GUEST_CALL`.
-- **Zero-Copy Support for Guest Calls**: Guest can send FlatBuffers end-aligned.
-- **Listener API**: `DirectHost::ProcessGuestCalls` for polling Guest requests.
+- **Guest Slots**: Dedicated slot range for Guest-to-Host calls.
+- **Zero-Copy Support**: `ZeroCopySlot` (C++) and `GuestSlot` (Go) for direct shared memory access.
+- **Taskfile**: Unified build and benchmark automation.
 
-### API Changes
-- Updated `DirectHost::ProcessGuestCalls` handler signature to include `maxRespSize`, enabling safe end-aligned writes for Zero-Copy workflows.
+## [v0.2.0] - 2025-12-05
+
+### Features
+- **Guest Call**: Prototype implementation.
+- **Listener API**: `DirectHost::ProcessGuestCalls` for polling Guest requests.
 
 ## [v0.1.0] - 2025-12-05
 
@@ -20,10 +41,3 @@ First stable release of the Shared Memory IPC library.
 - **Header-only C++ Host Library**: Easy integration via `include/shm/`.
 - **High-Performance Go Guest**: Zero-allocation hot path, Direct Mode support.
 - **Cross-Platform**: Support for Linux (shm/pthreads) and Windows (NamedSharedMemory/Events).
-- **Zero-Copy Support**: Optimized for large payloads and FlatBuffers.
-- **Adaptive Hybrid Wait**: Dynamic spin-backoff for efficient resource usage.
-
-### Benchmarks (Effective OPS)
-- 1 Thread: ~1.7M OPS
-- 4 Threads: ~2.2M OPS
-- 8 Threads: ~1.8M OPS
