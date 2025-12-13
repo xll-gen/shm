@@ -86,9 +86,9 @@ func worker(id int, packet *Packet, wg *sync.WaitGroup) {
 	defer C.sem_close(semHost)
 	defer C.sem_close(semGuest)
 
-	spinLimit := 2000
-	const minSpin = 1
-	const maxSpin = 2000
+	spinLimit := 5000
+	const minSpin = 100
+	const maxSpin = 20000
 
 	for {
 		// Adaptive Wait for Request
@@ -107,7 +107,7 @@ func worker(id int, packet *Packet, wg *sync.WaitGroup) {
 		if ready {
 			// Case A: Success - Increase spin limit
 			if spinLimit < maxSpin {
-				spinLimit += 100
+				spinLimit += 200
 			}
 			if spinLimit > maxSpin {
 				spinLimit = maxSpin
@@ -115,7 +115,7 @@ func worker(id int, packet *Packet, wg *sync.WaitGroup) {
 		} else {
 			// Case B: Failure - Decrease spin limit
 			if spinLimit > minSpin {
-				spinLimit -= 500
+				spinLimit -= 100
 			}
 			if spinLimit < minSpin {
 				spinLimit = minSpin
