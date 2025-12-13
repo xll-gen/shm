@@ -55,4 +55,5 @@ When creating a release tag, follow these steps:
 *   **Do not** delete this file.
 *   **Do not** create `src/` directory for C++.
 *   **Do not** use Queue-based logic (SPSC/MPSC); strictly use the Direct Exchange (Slot) model defined in `SPECIFICATION.md`.
+*   **Git Workflow:** Always resolve conflicts with the `main` branch before submitting.
 *   All documentation, code comments, commit messages, and other project-related text must be in English.
