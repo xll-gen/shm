@@ -97,9 +97,22 @@ void worker(int id, Packet* packet, int iterations, WorkerResult& result) {
             sem_post(sem_guest);
         }
 
-        // Wait for Coordinator to wake us
-        while (packet->state.load(std::memory_order_acquire) != STATE_RESP_READY) {
-            sem_wait(sem_host);
+        // 1. Optimistic Spin: Check if work is already done to avoid sleeping
+        bool ready = false;
+        const int SPIN_LIMIT = 5000;
+        for (int spin = 0; spin < SPIN_LIMIT; ++spin) {
+            if (packet->state.load(std::memory_order_acquire) == STATE_RESP_READY) {
+                ready = true;
+                break;
+            }
+            _mm_pause();
+        }
+
+        // 2. Fallback: Wait for Coordinator to wake us
+        if (!ready) {
+            while (packet->state.load(std::memory_order_acquire) != STATE_RESP_READY) {
+                sem_wait(sem_host);
+            }
         }
 
         // Verify
