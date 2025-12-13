@@ -28,6 +28,17 @@ struct BenchmarkStats {
 BenchmarkStats globalStats;
 std::atomic<bool> running{true};
 
+// UX Helper: Add commas to numbers
+std::string FormatNumber(uint64_t n) {
+    std::string s = std::to_string(n);
+    int insertPosition = static_cast<int>(s.length()) - 3;
+    while (insertPosition > 0) {
+        s.insert(insertPosition, ",");
+        insertPosition -= 3;
+    }
+    return s;
+}
+
 void WorkerThread(DirectHost* host, int id) {
     std::vector<uint8_t> req(DATA_SIZE);
     // Fill with pattern
@@ -174,8 +185,7 @@ int main(int argc, char** argv) {
     // Wait for Guest(s) to attach?
     // The DirectHost doesn't know if Guests are attached until we send and they reply.
     // We can do a warmup/handshake.
-    std::cout << "Waiting for Guest to attach..." << std::endl;
-    std::this_thread::sleep_for(std::chrono::seconds(2));
+    std::cout << "Waiting for Guest to attach..." << std::flush;
 
     // Simple handshake probe (optional)
     std::vector<uint8_t> resp;
@@ -186,13 +196,14 @@ int main(int argc, char** argv) {
         // Send generic probe
         if (host.Send(&data, 1, MsgType::NORMAL, resp).HasError()) {
             if (retries++ > 10) {
-                std::cerr << "Guest not responding. Is the Go server running?" << std::endl;
+                std::cout << "\nGuest not responding. Is the Go server running?" << std::endl;
                 // Don't exit, maybe just slow.
                 break;
             }
+            std::cout << "." << std::flush;
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
         } else {
-            std::cout << "Guest detected!" << std::endl;
+            std::cout << "\nGuest detected!" << std::endl;
             break;
         }
     }
@@ -211,12 +222,20 @@ int main(int argc, char** argv) {
 
     // Run for Duration
     std::cout << "Running: [                                                  ] 0 %" << std::flush;
-    for (int i = 0; i < DURATION_SEC; ++i) {
-        std::this_thread::sleep_for(std::chrono::seconds(1));
+    auto startTime = std::chrono::steady_clock::now();
 
-        float progress = (float)(i + 1) / DURATION_SEC;
+    while (running) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+        auto now = std::chrono::steady_clock::now();
+        auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - startTime).count();
+        double progress = (double)elapsedMs / (DURATION_SEC * 1000.0);
+
+        if (progress >= 1.0) {
+            progress = 1.0;
+        }
+
         int barWidth = 50;
-
         std::cout << "\rRunning: [";
         int pos = (int)(barWidth * progress);
         for (int j = 0; j < barWidth; ++j) {
@@ -225,6 +244,8 @@ int main(int argc, char** argv) {
             else std::cout << " ";
         }
         std::cout << "] " << int(progress * 100.0) << " %" << std::flush;
+
+        if (progress >= 1.0) break;
     }
     std::cout << std::endl;
 
@@ -243,11 +264,15 @@ int main(int argc, char** argv) {
     double avgLat = totalOps > 0 ? (double)globalStats.latencySum / totalOps : 0.0;
     double throughput = (double)totalOps / DURATION_SEC;
 
-    std::cout << "Results:" << std::endl;
-    std::cout << "  Total Ops: " << totalOps << std::endl;
-    std::cout << "  Throughput: " << std::fixed << std::setprecision(2) << throughput << " ops/s" << std::endl;
-    std::cout << "  Avg Latency: " << avgLat << " us" << std::endl;
-    std::cout << "  Errors: " << totalErr << std::endl;
+    std::cout << "\n" << "Results:" << std::endl;
+    std::cout << "  " << std::left << std::setw(15) << "Total Ops:"
+              << std::right << std::setw(15) << FormatNumber(totalOps) << std::endl;
+    std::cout << "  " << std::left << std::setw(15) << "Throughput:"
+              << std::right << std::setw(15) << std::fixed << std::setprecision(2) << throughput << " ops/s" << std::endl;
+    std::cout << "  " << std::left << std::setw(15) << "Avg Latency:"
+              << std::right << std::setw(15) << std::fixed << std::setprecision(2) << avgLat << " us" << std::endl;
+    std::cout << "  " << std::left << std::setw(15) << "Errors:"
+              << std::right << std::setw(15) << FormatNumber(totalErr) << std::endl;
 
     return 0;
 }
