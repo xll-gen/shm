@@ -2,7 +2,7 @@
 set -e
 
 echo "Compiling C++ Host..."
-g++ -O3 -pthread experiments/pingpong/main.cpp -o experiments/pingpong/host
+g++ -O3 -march=native -flto -funroll-loops -pthread experiments/pingpong/main.cpp -o experiments/pingpong/host
 
 echo "Compiling Go Guest..."
 cd experiments/pingpong/go && go build -o ../guest main.go && cd ../../..
