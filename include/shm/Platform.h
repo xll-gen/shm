@@ -13,6 +13,7 @@
     #include <sys/stat.h>
     #include <semaphore.h>
     #include <sys/mman.h>
+    #include <sys/file.h>
     #include <unistd.h>
     #include <time.h>
     #include <errno.h>
@@ -240,6 +241,65 @@ public:
         return (int)GetCurrentProcessId();
 #else
         return (int)getpid();
+#endif
+    }
+
+    /**
+     * @brief Tries to acquire an exclusive lock on the SHM region.
+     *
+     * @param hShm The shared memory handle (Linux FD).
+     * @param name The shared memory name (Windows Mutex Name).
+     * @param[out] outLockHandle The lock handle (Windows Mutex). Unused on Linux.
+     * @return true if acquired, false if already locked.
+     */
+    static bool LockShm(ShmHandle hShm, const char* name, ShmHandle& outLockHandle) {
+#ifdef _WIN32
+        std::string s_name(name);
+        std::wstring w_name(s_name.begin(), s_name.end());
+        std::wstring mutex_name = L"Local\\" + w_name + L"_lock";
+
+        HANDLE hMutex = CreateMutexW(NULL, TRUE, mutex_name.c_str());
+        if (!hMutex) return false;
+
+        if (GetLastError() == ERROR_ALREADY_EXISTS) {
+            // Mutex existed. Did we get ownership?
+            // "The bInitialOwner parameter is ignored if the mutex already exists."
+            // So we must try to wait for it.
+            DWORD res = WaitForSingleObject(hMutex, 0);
+            if (res == WAIT_OBJECT_0) {
+                outLockHandle = hMutex;
+                return true;
+            } else {
+                CloseHandle(hMutex);
+                return false;
+            }
+        }
+
+        // We created it and own it.
+        outLockHandle = hMutex;
+        return true;
+#else
+        // Linux: Lock the file descriptor
+        if (flock(hShm, LOCK_EX | LOCK_NB) == 0) {
+            return true;
+        }
+        return false;
+#endif
+    }
+
+    /**
+     * @brief Releases the SHM lock.
+     * @param hShm The shared memory handle.
+     * @param hLock The lock handle (Windows).
+     */
+    static void UnlockShm(ShmHandle hShm, ShmHandle hLock) {
+#ifdef _WIN32
+        if (hLock) {
+            ReleaseMutex(hLock);
+            CloseHandle(hLock);
+        }
+#else
+        flock(hShm, LOCK_UN);
 #endif
     }
 };

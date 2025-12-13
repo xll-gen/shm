@@ -57,6 +57,8 @@ enum class MsgType : uint32_t {
     FLATBUFFER = 10,
     /** @brief Guest Call (Guest -> Host). */
     GUEST_CALL = 11,
+    /** @brief System Error (e.g. buffer overflow, invalid state). */
+    SYSTEM_ERROR = 127,
     /** @brief Start of Application Specific message types. */
     APP_START = 128
 };
