@@ -9,15 +9,37 @@
 #include <getopt.h>
 
 #include "Aeron.h"
+#include "concurrent/BusySpinIdleStrategy.h"
 #include "common.h"
 
 using namespace aeron;
+using namespace aeron::concurrent;
 using namespace pingpong;
 
 std::atomic<bool> running(true);
 
 void sig_handler(int) {
     running.store(false);
+}
+
+// Helper to resolve publication
+std::shared_ptr<Publication> resolve_pub(std::shared_ptr<Aeron> aeron, const std::string& channel, int stream_id) {
+    int64_t reg_id = aeron->addPublication(channel, stream_id);
+    std::shared_ptr<Publication> pub;
+    while (running && !(pub = aeron->findPublication(reg_id))) {
+        std::this_thread::yield();
+    }
+    return pub;
+}
+
+// Helper to resolve subscription
+std::shared_ptr<Subscription> resolve_sub(std::shared_ptr<Aeron> aeron, const std::string& channel, int stream_id) {
+    int64_t reg_id = aeron->addSubscription(channel, stream_id);
+    std::shared_ptr<Subscription> sub;
+    while (running && !(sub = aeron->findSubscription(reg_id))) {
+        std::this_thread::yield();
+    }
+    return sub;
 }
 
 // FragmentHandler for Pong (Echo)
@@ -40,17 +62,10 @@ void pong_worker(int id, std::shared_ptr<Aeron> aeron) {
     int sub_stream_id = STREAM_ID_BASE_PING + id;
     int pub_stream_id = STREAM_ID_BASE_PONG + id;
 
-    // Create Subscription (Receive from Ping)
-    std::shared_ptr<Subscription> sub = aeron->addSubscription(CHANNEL, sub_stream_id);
+    std::shared_ptr<Subscription> sub = resolve_sub(aeron, CHANNEL, sub_stream_id);
+    std::shared_ptr<Publication> pub = resolve_pub(aeron, CHANNEL, pub_stream_id);
 
-    // Create Publication (Send to Ping)
-    std::shared_ptr<Publication> pub = aeron->addPublication(CHANNEL, pub_stream_id);
-
-    // Wait for connection
-    while (!sub->isConnected() || !pub->isConnected()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        if (!running) return;
-    }
+    if (!sub || !pub) return;
 
     auto handler = [&](const AtomicBuffer& buffer, util::index_t offset, util::index_t length, const Header& header) {
         pong_handler(buffer, offset, length, header, pub);
@@ -73,12 +88,10 @@ void ping_worker(int id, int iterations, std::shared_ptr<Aeron> aeron, PingResul
     int pub_stream_id = STREAM_ID_BASE_PING + id;
     int sub_stream_id = STREAM_ID_BASE_PONG + id;
 
-    std::shared_ptr<Publication> pub = aeron->addPublication(CHANNEL, pub_stream_id);
-    std::shared_ptr<Subscription> sub = aeron->addSubscription(CHANNEL, sub_stream_id);
+    std::shared_ptr<Publication> pub = resolve_pub(aeron, CHANNEL, pub_stream_id);
+    std::shared_ptr<Subscription> sub = resolve_sub(aeron, CHANNEL, sub_stream_id);
 
-    while (!pub->isConnected() || !sub->isConnected()) {
-        std::this_thread::yield();
-    }
+    if (!pub || !sub) return;
 
     Message msg;
     bool response_received = false;

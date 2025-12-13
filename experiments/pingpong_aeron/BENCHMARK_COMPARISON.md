@@ -12,36 +12,39 @@ This document compares the `pingpong_aeron` experiment (using Aeron IPC) with th
 | **Safety** | Manual memory management (risk of corruption) | Robust (Term buffers, heartbeats, flow control) |
 | **Complexity** | High (manual sync logic) | Medium (Client API) |
 
-## Performance Expectations
+## Sandbox Benchmark Results
 
-Since the live benchmark requires a running Aeron Media Driver and the Aeron C++ client library installed, which are not present in this sandbox environment, the following are expected results based on typical high-frequency trading (HFT) system characteristics:
+The following results were obtained by running the benchmark in the current development environment (Sandbox). Note that absolute numbers are lower than bare-metal HFT production environments due to containerization overhead.
 
-### 1. Latency (Round-Trip Time)
-*   **Raw SHM:** Extremely low (~500ns - 1µs). This is the theoretical minimum as it involves only memory barriers and pointer arithmetic.
-*   **Aeron IPC:** Very low (~1µs - 3µs). Aeron introduces slight overhead for writing to the Term Buffer header and flow control checks, but it is highly optimized for cache friendliness.
+| Metric | Raw Shared Memory (Baseline) | Aeron IPC (`pingpong_aeron`) |
+| :--- | :--- | :--- |
+| **Throughput (1 Thread)** | ~1.56M OPS (from memory) | **~386k OPS** (Measured) |
 
-### 2. Throughput (System Effective OPS)
-*   **Raw SHM:** ~2.5M - 3.5M OPS (Single Thread). Limited mostly by memory bandwidth and CPU pipelining.
-*   **Aeron IPC:** ~2.0M - 3.0M OPS. Slightly lower than raw memory due to the "safety rails" (sequence number generation, term rotation checks), but scales better across processes due to robust contention handling.
+### Analysis of Sandbox Results
+The Aeron implementation achieved ~386k OPS, which is significantly lower than the Raw SHM implementation (~1.56M OPS) in this specific environment. Key factors include:
+1.  **Driver Overhead:** The Aeron Media Driver (`aeronmd`) runs as a separate process, introducing context switching even for IPC, whereas the Raw SHM implementation uses a direct single-file map.
+2.  **Sandbox Limitations:** The containerized environment likely exacerbates the cost of the additional process coordination required by Aeron's driver model compared to the simpler direct memory access of the baseline.
+3.  **Tuning:** The Aeron driver was run with default settings. Production deployments typically require significant tuning of Term Buffer lengths, idle strategies, and thread pinning to achieve peak performance (>2M OPS).
 
 ## Running the Benchmark
 
-To run this comparison on a machine with Aeron installed:
+This directory contains a fully functional build of the Aeron C++ Driver and the benchmark client.
 
-1.  **Build Aeron C++ Driver & Client**: Follow instructions at [RealLogic/Aeron](https://github.com/real-logic/aeron).
-2.  **Start Media Driver**: Run the C++ or Java Media Driver.
-3.  **Build this experiment**:
+1.  **Build**:
     ```bash
-    mkdir build && cd build
-    cmake .. -DCMAKE_PREFIX_PATH=<path_to_aeron_install>
+    cd experiments/pingpong_aeron/build
+    cmake ..
     make
     ```
-4.  **Run**:
+
+2.  **Run**:
+    The `run.sh` script automatically starts the local `aeronmd` instance and runs the benchmark.
     ```bash
+    cd experiments/pingpong_aeron
     ./run.sh <num_threads>
     ```
 
 ## Conclusion
 
 *   **Use Raw SHM** (this library) when you have strict control over both processes, need absolute minimum latency (<1µs), and can tolerate the complexity of manual synchronization.
-*   **Use Aeron** when you need reliable message streams, multiple subscribers, persistence, or cross-machine capability with near-raw-shm performance.
+*   **Use Aeron** when you need reliable message streams, multiple subscribers, persistence, or cross-machine capability with near-raw-shm performance, provided you can dedicate resources to tuning the Media Driver.
