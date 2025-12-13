@@ -1,6 +1,6 @@
 # Changelog
 
-## [v0.5.4] - 2024-05-24
+## [v0.5.4] - 2025-12-13
 
 ### Experimental Status
 - Designated as **Experimental**. Not for production use.
@@ -11,7 +11,7 @@
 - **Zero-Copy Slot API**: Generic `Send` with negative size support for end-alignment (replacing `SendFlatBuffer`).
 - **Safety**: Added robust checks for `Init` failures (e.g., file descriptor limits).
 
-## [v0.5.0] - 2024-05-22
+## [v0.5.0] - 2025-12-12
 
 Major protocol overhaul and architecture simplification.
 
