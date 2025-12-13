@@ -120,7 +120,6 @@ type DirectGuest struct {
 	reqOffset     uint32
 	respOffset    uint32
 	responseTimeout time.Duration
-    nextGuestSlot uint32 // Round-robin counter for Guest Call slots
 
 	slots []slotContext
 	wg    sync.WaitGroup
@@ -227,7 +226,7 @@ func NewDirectGuest(name string) (*DirectGuest, error) {
         g.slots[i].respBuffer = unsafe.Slice((*byte)(respPtr), maxResp)
 
 		// Initialize MsgSeq
-		g.slots[i].MsgSeq = uint32(i + 1)
+		g.slots[i].nextMsgSeq = uint32(i + 1)
 
 		var reqName string
 		if uint32(i) < numSlots {
@@ -322,7 +321,19 @@ func (g *DirectGuest) SetTimeout(d time.Duration) {
 //
 // Returns the response payload or an error if the call fails or times out.
 func (g *DirectGuest) SendGuestCall(data []byte, msgType MsgType) ([]byte, error) {
-	return g.sendGuestCallInternal(data, msgType, g.responseTimeout)
+	return g.sendGuestCallInternal(data, nil, msgType, g.responseTimeout)
+}
+
+// SendGuestCallBuffer sends a request to the Host using a provided buffer for the response.
+// It reduces allocations by reusing the buffer.
+//
+// data: The payload to send.
+// buffer: The buffer to store the response. If nil or too small, a new buffer is allocated.
+// msgType: The message type identifier.
+//
+// Returns the response payload (slice of buffer) or an error.
+func (g *DirectGuest) SendGuestCallBuffer(data []byte, buffer []byte, msgType MsgType) ([]byte, error) {
+	return g.sendGuestCallInternal(data, buffer, msgType, g.responseTimeout)
 }
 
 // SendGuestCallWithTimeout sends a request to the Host using a Guest Slot with a custom timeout.
@@ -333,10 +344,10 @@ func (g *DirectGuest) SendGuestCall(data []byte, msgType MsgType) ([]byte, error
 //
 // Returns the response payload or an error.
 func (g *DirectGuest) SendGuestCallWithTimeout(data []byte, msgType MsgType, timeout time.Duration) ([]byte, error) {
-	return g.sendGuestCallInternal(data, msgType, timeout)
+	return g.sendGuestCallInternal(data, nil, msgType, timeout)
 }
 
-func (g *DirectGuest) sendGuestCallInternal(data []byte, msgType MsgType, timeout time.Duration) ([]byte, error) {
+func (g *DirectGuest) sendGuestCallInternal(data []byte, buffer []byte, msgType MsgType, timeout time.Duration) ([]byte, error) {
 	if g.numGuestSlots == 0 {
 		return nil, fmt.Errorf("no guest slots available")
 	}
@@ -473,7 +484,11 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, msgType MsgType, timeou
 			atomic.StoreUint32(&slot.header.State, SlotFree)
 			return nil, fmt.Errorf("response size %d exceeds buffer size %d", respSize, len(slot.respBuffer))
 		}
-		respData = make([]byte, respSize)
+		if buffer != nil && cap(buffer) >= int(respSize) {
+			respData = buffer[:respSize]
+		} else {
+			respData = make([]byte, respSize)
+		}
 		copy(respData, slot.respBuffer[:respSize])
 	} else {
 		// Negative size means data is at the end
@@ -489,7 +504,11 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, msgType MsgType, timeou
 			return nil, fmt.Errorf("response size %d exceeds buffer size %d", rLen, len(slot.respBuffer))
 		}
 		offset := int32(len(slot.respBuffer)) - rLen
-		respData = make([]byte, rLen)
+		if buffer != nil && cap(buffer) >= int(rLen) {
+			respData = buffer[:rLen]
+		} else {
+			respData = make([]byte, rLen)
+		}
 		copy(respData, slot.respBuffer[offset:])
 	}
 

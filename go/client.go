@@ -115,6 +115,18 @@ func (c *Client) SendGuestCall(data []byte, msgType MsgType) ([]byte, error) {
 	return c.guest.SendGuestCall(data, msgType)
 }
 
+// SendGuestCallBuffer sends a message to the Host (Guest Call) using a provided buffer.
+// It reduces allocations by reusing the buffer.
+//
+// data: The payload to send.
+// buffer: The buffer to store the response.
+// msgType: The message type.
+//
+// Returns the response payload or an error.
+func (c *Client) SendGuestCallBuffer(data []byte, buffer []byte, msgType MsgType) ([]byte, error) {
+	return c.guest.SendGuestCallBuffer(data, buffer, msgType)
+}
+
 // SendGuestCallWithTimeout sends a message to the Host (Guest Call) with a custom timeout.
 //
 // data: The payload to send.
