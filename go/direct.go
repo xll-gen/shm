@@ -42,6 +42,8 @@ const (
 	MsgTypeFlatbuffer    MsgType = 10
 	// MsgTypeGuestCall indicates a Guest Call payload.
 	MsgTypeGuestCall     MsgType = 11
+	// MsgTypeSystemError indicates a system-level error (e.g. overflow).
+	MsgTypeSystemError   MsgType = 127
 	// MsgTypeAppStart is the start of Application Specific message types.
 	// Types below 128 are reserved for internal protocol use.
 	// Applications should define their own message types starting from this value.
@@ -471,6 +473,13 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, buffer []byte, msgType 
          return nil, fmt.Errorf("msgSeq mismatch: expected %d, got %d", currentSeq, slot.header.MsgSeq)
     }
 
+    // Check for System Error
+    if slot.header.MsgType == MsgTypeSystemError {
+        // Release Slot
+        atomic.StoreUint32(&slot.header.State, SlotFree)
+        return nil, fmt.Errorf("system error: host rejected request (likely buffer overflow)")
+    }
+
 	// Read Response
 	respSize := slot.header.RespSize
 	var respData []byte
@@ -629,6 +638,7 @@ func (g *DirectGuest) workerLoopInternal(idx int, handler func([]byte, []byte, M
 					if reqSize > int32(len(slot.reqBuffer)) {
                         // Error: Too large. Reject.
                         header.RespSize = 0
+                        header.MsgType = MsgTypeSystemError
                         atomic.StoreUint32(&header.State, SlotRespReady)
                         if atomic.LoadUint32(&header.HostState) == HostStateWaiting {
 				            SignalEvent(slot.respEvent)
@@ -642,6 +652,7 @@ func (g *DirectGuest) workerLoopInternal(idx int, handler func([]byte, []byte, M
 					if rLen > int32(len(slot.reqBuffer)) {
                         // Error: Too large. Reject.
                         header.RespSize = 0
+                        header.MsgType = MsgTypeSystemError
                         atomic.StoreUint32(&header.State, SlotRespReady)
                         if atomic.LoadUint32(&header.HostState) == HostStateWaiting {
 				            SignalEvent(slot.respEvent)

@@ -57,6 +57,7 @@ class DirectHost {
     uint32_t numGuestSlots;
     uint64_t totalShmSize;
     ShmHandle hMapFile;
+    ShmHandle hLockFile;
     bool running;
     uint32_t responseTimeoutMs;
 
@@ -311,6 +312,13 @@ public:
                  return Result<void>::Failure(Error::ProtocolViolation);
             }
 
+            if (slot->header->msgType == MsgType::SYSTEM_ERROR) {
+                 // Release slot (or invalidate)
+                 host->slots[slotIdx].header->state.store(SLOT_FREE, std::memory_order_release);
+                 slotIdx = -1;
+                 return Result<void>::Failure(Error::InternalError);
+            }
+
             // Do NOT release slot here. User might want to read response.
             return Result<void>::Success();
         }
@@ -360,6 +368,13 @@ public:
                  return Result<void>::Failure(Error::ProtocolViolation);
             }
 
+            if (slot->header->msgType == MsgType::SYSTEM_ERROR) {
+                 // Release slot (or invalidate)
+                 host->slots[slotIdx].header->state.store(SLOT_FREE, std::memory_order_release);
+                 slotIdx = -1;
+                 return Result<void>::Failure(Error::InternalError);
+            }
+
             // Do NOT release slot here. User might want to read response.
             return Result<void>::Success();
         }
@@ -405,7 +420,7 @@ public:
     /**
      * @brief Default constructor.
      */
-        DirectHost() : shmBase(nullptr), hMapFile(0), running(false), msgSeqStride(0), responseTimeoutMs(10000) {
+        DirectHost() : shmBase(nullptr), hMapFile(0), hLockFile(0), running(false), msgSeqStride(0), responseTimeoutMs(10000) {
             sharedState = std::make_shared<SharedState>();
         }
 
@@ -473,6 +488,14 @@ public:
         bool exists = false;
         shmBase = Platform::CreateNamedShm(shmName.c_str(), totalSize, hMapFile, exists);
         if (!shmBase) return Result<void>::Failure(Error::InternalError);
+
+        // Try to acquire exclusive lock
+        if (!Platform::LockShm(hMapFile, shmName.c_str(), hLockFile)) {
+            SHM_LOG_ERROR("Failed to acquire lock on SHM: ", shmName, ". Another Host might be running.");
+            Platform::CloseShm(hMapFile, shmBase, totalShmSize);
+            shmBase = nullptr;
+            return Result<void>::Failure(Error::ResourceExhausted);
+        }
 
         // Zero out memory if new
         memset(shmBase, 0, totalSize);
@@ -580,7 +603,10 @@ public:
              Platform::UnlinkNamedEvent(respName.c_str());
         }
 
-        if (shmBase) Platform::CloseShm(hMapFile, shmBase, totalShmSize);
+        if (shmBase) {
+             Platform::UnlockShm(hMapFile, hLockFile);
+             Platform::CloseShm(hMapFile, shmBase, totalShmSize);
+        }
         Platform::UnlinkShm(shmName.c_str());
         running = false;
     }
@@ -778,6 +804,11 @@ public:
              // Release Slot (or leak? Safer to leak if corrupted)
              // Leaking prevents reuse of bad slot.
              return Result<int>(Error::ProtocolViolation);
+        }
+
+        if (slot->header->msgType == MsgType::SYSTEM_ERROR) {
+             slot->header->state.store(SLOT_FREE, std::memory_order_release);
+             return Result<int>(Error::InternalError);
         }
 
         // Read Response
@@ -982,8 +1013,9 @@ public:
 
                 // Validate Size
                 if ((uint32_t)absReqSize > slot->maxReqSize) {
-                    // Invalid size. Clear slot and signal empty response to prevent crash.
+                    // Invalid size. Signal error.
                     slot->header->respSize = 0;
+                    slot->header->msgType = MsgType::SYSTEM_ERROR;
                     slot->header->state.store(SLOT_RESP_READY, std::memory_order_seq_cst);
                     Platform::SignalEvent(slot->hRespEvent);
                     processed++;
@@ -1004,9 +1036,9 @@ public:
                 // Validate Response Size
                 int32_t absRespSize = respSize < 0 ? -respSize : respSize;
                 if ((uint32_t)absRespSize > slot->maxRespSize) {
-                    // Overflow: Signal error by returning 0 size.
-                    // Prevents sending truncated/corrupt data to Guest.
+                    // Overflow: Signal error.
                     respSize = 0;
+                    slot->header->msgType = MsgType::SYSTEM_ERROR;
                 }
 
                 // Write Response Metadata

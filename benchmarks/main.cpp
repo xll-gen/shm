@@ -152,11 +152,11 @@ int main(int argc, char** argv) {
     uint32_t numGuestSlots = GUEST_CALL_MODE ? NUM_THREADS : 0;
 
     // We add padding to slot size to accommodate header safely and ensure alignment
-    uint32_t requiredSize = DATA_SIZE + 128;
-    // Ensure sufficient size for alignment (needs at least 128 for 64 req + 64 resp)
-    // But logic in DirectHost: half = size/2; half = (half/64)*64.
-    // So if we want X bytes req, we need half >= X.
-    // So size >= 2 * ceil(X, 64).
+    // We need maxReqSize >= DATA_SIZE + 8.
+    // DirectHost splits payloadSize in half.
+    // So payloadSize must be roughly 2 * (DATA_SIZE + 8).
+    // We add extra padding to be safe.
+    uint32_t requiredSize = (DATA_SIZE + 128) * 2;
     if (requiredSize < 256) requiredSize = 256;
 
     // New HostConfig usage
