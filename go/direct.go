@@ -125,7 +125,7 @@ type DirectGuest struct {
 	wg    sync.WaitGroup
 	closing int32
 
-	nextGuestSlot uint32 // Atomic counter for Round-Robin slot selection
+    nextGuestSlot uint32 // Atomic counter for Round-Robin slot selection
 }
 
 // NewDirectGuest initializes the DirectGuest by attaching to an existing shared memory region.
@@ -224,9 +224,6 @@ func NewDirectGuest(name string) (*DirectGuest, error) {
 
 		g.slots[i].reqBuffer = unsafe.Slice((*byte)(reqPtr), maxReq)
         g.slots[i].respBuffer = unsafe.Slice((*byte)(respPtr), maxResp)
-
-		// Initialize MsgSeq
-		g.slots[i].nextMsgSeq = uint32(i + 1)
 
 		var reqName string
 		if uint32(i) < numSlots {
