@@ -1,0 +1,188 @@
+// Package main implements the Guest side of the PingPong experiment.
+package main
+
+/*
+#include <semaphore.h>
+#include <fcntl.h>
+#include <stdlib.h>
+
+int is_sem_failed(sem_t* sem) {
+    return sem == SEM_FAILED;
+}
+
+sem_t* open_sem(const char* name) {
+    return sem_open(name, 0);
+}
+*/
+import "C"
+
+import (
+	"fmt"
+	"os"
+	"strconv"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+	"unsafe"
+	"runtime"
+)
+
+const (
+	SHM_NAME         = "/pingpong_shm"
+	SHM_SIZE         = 4096 * 4
+	STATE_WAIT_REQ   = 0
+	STATE_REQ_READY  = 1
+	STATE_RESP_READY = 2
+	STATE_DONE       = 3
+)
+
+type Packet struct {
+	State         uint32
+	ReqId         uint32
+	HostSleeping  uint32
+	GuestSleeping uint32
+	ValA          int64
+	ValB          int64
+	Sum           int64
+	Pad           [24]byte
+}
+
+func worker(id int, packet *Packet, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	hName := C.CString(fmt.Sprintf("/pp_h_%d", id))
+	gName := C.CString(fmt.Sprintf("/pp_g_%d", id))
+	defer C.free(unsafe.Pointer(hName))
+	defer C.free(unsafe.Pointer(gName))
+
+	var semHost, semGuest *C.sem_t
+	for i := 0; i < 100; i++ {
+		semHost = C.open_sem(hName)
+		semGuest = C.open_sem(gName)
+		if C.is_sem_failed(semHost) == 0 && C.is_sem_failed(semGuest) == 0 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+    if C.is_sem_failed(semHost) != 0 || C.is_sem_failed(semGuest) != 0 {
+        fmt.Printf("[Guest %d] Failed to open semaphores\n", id)
+        return
+    }
+	defer C.sem_close(semHost)
+	defer C.sem_close(semGuest)
+
+	spinLimit := 2000
+    const minSpin = 1
+    const maxSpin = 2000
+
+	for {
+        // Adaptive Wait for Request
+		ready := false
+
+		// 1. Spin Phase
+		for i := 0; i < spinLimit; i++ {
+			s := atomic.LoadUint32(&packet.State)
+			if s == STATE_REQ_READY || s == STATE_DONE {
+				ready = true
+				break
+			}
+			runtime.Gosched()
+		}
+
+		if ready {
+			// Case A: Success - Increase spin limit
+			if spinLimit < maxSpin {
+				spinLimit += 100
+			}
+			if spinLimit > maxSpin {
+				spinLimit = maxSpin
+			}
+		} else {
+			// Case B: Failure - Decrease spin limit
+			if spinLimit > minSpin {
+				spinLimit -= 500
+			}
+			if spinLimit < minSpin {
+				spinLimit = minSpin
+			}
+
+			// 2. Sleep Phase
+			atomic.StoreUint32(&packet.GuestSleeping, 1)
+
+			// Double check
+			s := atomic.LoadUint32(&packet.State)
+			if s == STATE_REQ_READY || s == STATE_DONE {
+				atomic.StoreUint32(&packet.GuestSleeping, 0)
+				ready = true
+			} else {
+				C.sem_wait(semGuest)
+				atomic.StoreUint32(&packet.GuestSleeping, 0)
+			}
+		}
+
+        // Re-check state after wake
+		state := atomic.LoadUint32(&packet.State)
+		if state == STATE_DONE {
+			break
+		}
+
+		if state == STATE_REQ_READY {
+			a := packet.ValA
+			b := packet.ValB
+			packet.Sum = a + b
+
+			atomic.StoreUint32(&packet.State, STATE_RESP_READY)
+
+			if atomic.LoadUint32(&packet.HostSleeping) == 1 {
+				C.sem_post(semHost)
+			}
+		}
+	}
+}
+
+func main() {
+    fmt.Println("[Guest] Main starting...")
+	numThreads := 3
+	if len(os.Args) > 1 {
+		if n, err := strconv.Atoi(os.Args[1]); err == nil {
+			numThreads = n
+		}
+	}
+
+	var fd int
+	var err error
+    shmPath := "/dev/shm" + SHM_NAME
+	for i := 0; i < 100; i++ {
+		fd, err = syscall.Open(shmPath, syscall.O_RDWR, 0666)
+		if err == nil { break }
+		time.Sleep(100 * time.Millisecond)
+	}
+	if err != nil {
+		fmt.Printf("[Guest] Failed to open SHM: %v\n", err)
+		return
+	}
+	defer syscall.Close(fd)
+
+	data, err := syscall.Mmap(fd, 0, SHM_SIZE, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
+	if err != nil {
+		fmt.Printf("[Guest] Mmap failed: %v\n", err)
+		return
+	}
+	defer syscall.Munmap(data)
+
+	basePtr := unsafe.Pointer(&data[0])
+	packetSize := uintptr(64)
+
+	var wg sync.WaitGroup
+	fmt.Printf("[Guest] Starting %d workers...\n", numThreads)
+
+	for i := 0; i < numThreads; i++ {
+		wg.Add(1)
+		p := (*Packet)(unsafe.Pointer(uintptr(basePtr) + uintptr(i)*packetSize))
+		go worker(i, p, &wg)
+	}
+
+	wg.Wait()
+	fmt.Println("[Guest] All workers done.")
+}
