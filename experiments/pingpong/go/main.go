@@ -31,7 +31,12 @@ import (
 	"time"
 	"unsafe"
 	"runtime"
+	"flag"
+	"runtime/pprof"
+	"log"
 )
+
+var cpuprofile = flag.String("cpuprofile", "", "write cpu profile to file")
 
 // Constants for shared memory and states.
 const (
@@ -160,8 +165,24 @@ func worker(id int, packet *Packet, wg *sync.WaitGroup) {
 
 // main entry point.
 func main() {
+	flag.Parse()
+	if *cpuprofile != "" {
+		f, err := os.Create(*cpuprofile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		pprof.StartCPUProfile(f)
+		defer pprof.StopCPUProfile()
+	}
+
 	numThreads := 3 // Default to 3
-	if len(os.Args) > 1 {
+	// Simple arg parsing for threads if first arg is number
+	if flag.NArg() > 0 {
+		if n, err := strconv.Atoi(flag.Arg(0)); err == nil {
+			numThreads = n
+		}
+	} else if len(os.Args) > 1 && os.Args[1][0] != '-' {
+		// Fallback for direct invocation without flags
 		if n, err := strconv.Atoi(os.Args[1]); err == nil {
 			numThreads = n
 		}
