@@ -363,7 +363,6 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, buffer []byte, msgType 
 		s := &g.slots[idx]
 		currentState := atomic.LoadUint32(&s.header.State)
 
-		// Case 1: Slot is Free. Try to claim it.
 		if currentState == SlotFree {
 			if atomic.CompareAndSwapUint32(&s.header.State, SlotFree, SlotGuestBusy) {
 				slot = s
@@ -371,10 +370,6 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, buffer []byte, msgType 
 			}
 		}
 
-		// Case 2: Slot is stuck in RESP_READY (Zombie).
-		// This happens if a previous caller timed out and abandoned the slot,
-		// but the Host eventually processed it and set it to RESP_READY.
-		// We can safe reclaim ONLY if no local process is actively waiting on it.
 		if currentState == SlotRespReady {
 			if atomic.LoadInt32(&s.ActiveWait) == 0 {
 				if atomic.CompareAndSwapUint32(&s.header.State, SlotRespReady, SlotGuestBusy) {
@@ -389,14 +384,12 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, buffer []byte, msgType 
 		return nil, fmt.Errorf("all guest slots busy")
 	}
 
-	// Write Data
 	if len(data) > len(slot.reqBuffer) {
 		atomic.StoreUint32(&slot.header.State, SlotFree)
 		return nil, fmt.Errorf("data too large")
 	}
 
 	if msgType == MsgTypeFlatbuffer {
-		// End-aligned for Zero-Copy FlatBuffers
 		offset := len(slot.reqBuffer) - len(data)
 		copy(slot.reqBuffer[offset:], data)
 		slot.header.ReqSize = -int32(len(data))
@@ -407,16 +400,13 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, buffer []byte, msgType 
 
 	slot.header.MsgType = msgType
 
-    // Set MsgSeq and Increment
     currentSeq := slot.nextMsgSeq
     slot.header.MsgSeq = currentSeq
-    slot.nextMsgSeq += uint32(len(g.slots)) // Stride = Total Slots
+    slot.nextMsgSeq += uint32(len(g.slots))
 
-	// Signal Ready
 	atomic.StoreUint32(&slot.header.State, SlotReqReady)
 	SignalEvent(slot.reqEvent)
 
-	// Wait for Response using WaitStrategy
     checkReady := func() bool {
         return atomic.LoadUint32(&slot.header.State) == SlotRespReady
     }
@@ -428,7 +418,6 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, buffer []byte, msgType 
             return
         }
 
-        // Loop to handle spurious wakeups
         start := time.Now()
         for {
             if checkReady() {
@@ -454,39 +443,29 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, buffer []byte, msgType 
         atomic.StoreUint32(&slot.header.GuestState, GuestStateActive)
     }
 
-	// Set ActiveWait before entering Wait
 	atomic.StoreInt32(&slot.ActiveWait, 1)
     ready := slot.waitStrategy.Wait(checkReady, sleepAction)
 	atomic.StoreInt32(&slot.ActiveWait, 0)
 
 	if !ready {
-		// Timeout - DO NOT free, Host might process late.
-		// Returning error will likely cause caller to retry or fail.
 		Debug("SendGuestCall timed out waiting for host")
 		return nil, fmt.Errorf("timeout waiting for host")
 	}
 
-    // Verify MsgSeq
     if slot.header.MsgSeq != currentSeq {
-         // Protocol Violation
-         // Do not free slot to prevent reuse corruption
          return nil, fmt.Errorf("msgSeq mismatch: expected %d, got %d", currentSeq, slot.header.MsgSeq)
     }
 
-    // Check for System Error
     if slot.header.MsgType == MsgTypeSystemError {
-        // Release Slot
         atomic.StoreUint32(&slot.header.State, SlotFree)
         return nil, fmt.Errorf("system error: host rejected request (likely buffer overflow)")
     }
 
-	// Read Response
 	respSize := slot.header.RespSize
 	var respData []byte
 
 	if respSize >= 0 {
 		if int(respSize) > len(slot.respBuffer) {
-			// Response too large -> Error (Consistency with C++)
 			atomic.StoreUint32(&slot.header.State, SlotFree)
 			return nil, fmt.Errorf("response size %d exceeds buffer size %d", respSize, len(slot.respBuffer))
 		}
@@ -497,15 +476,12 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, buffer []byte, msgType 
 		}
 		copy(respData, slot.respBuffer[:respSize])
 	} else {
-		// Negative size means data is at the end
 		rLen := -respSize
-		// Check for overflow (e.g., MinInt32)
 		if rLen < 0 {
 			atomic.StoreUint32(&slot.header.State, SlotFree)
 			return nil, fmt.Errorf("invalid response size: %d", respSize)
 		}
 		if int(rLen) > len(slot.respBuffer) {
-			// Response too large -> Error
 			atomic.StoreUint32(&slot.header.State, SlotFree)
 			return nil, fmt.Errorf("response size %d exceeds buffer size %d", rLen, len(slot.respBuffer))
 		}
@@ -518,7 +494,6 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, buffer []byte, msgType 
 		copy(respData, slot.respBuffer[offset:])
 	}
 
-	// Release Slot
 	atomic.StoreUint32(&slot.header.State, SlotFree)
 
 	return respData, nil
@@ -583,7 +558,6 @@ func (g *DirectGuest) workerLoopInternal(idx int, handler func([]byte, []byte, M
 			return false
 		}
 
-		// Adaptive Wait for REQ_READY using WaitStrategy
 		checkReady := func() bool {
 			return atomic.LoadUint32(&header.State) == SlotReqReady
 		}
@@ -602,21 +576,16 @@ func (g *DirectGuest) workerLoopInternal(idx int, handler func([]byte, []byte, M
 				return
 			}
 
-			// Check again (might fault if unmapped, handled by recover)
-			// checkReady() is called by WaitStrategy after sleepAction returns.
 			atomic.StoreUint32(&header.GuestState, GuestStateActive)
 		}
 
 		ready := slot.waitStrategy.Wait(checkReady, sleepAction)
 
 		if ready {
-			// Try to transition REQ_READY -> GUEST_BUSY to lock the slot
 			if !atomic.CompareAndSwapUint32(&header.State, SlotReqReady, SlotGuestBusy) {
-				// Host might have timed out and reclaimed the slot. Abort.
 				continue
 			}
 
-			// Process
 			msgType := header.MsgType
 			if msgType == MsgTypeShutdown {
 				header.RespSize = 0
@@ -636,7 +605,6 @@ func (g *DirectGuest) workerLoopInternal(idx int, handler func([]byte, []byte, M
 
 				if reqSize >= 0 {
 					if reqSize > int32(len(slot.reqBuffer)) {
-                        // Error: Too large. Reject.
                         header.RespSize = 0
                         header.MsgType = MsgTypeSystemError
                         atomic.StoreUint32(&header.State, SlotRespReady)
@@ -647,10 +615,8 @@ func (g *DirectGuest) workerLoopInternal(idx int, handler func([]byte, []byte, M
 					}
 					reqData = slot.reqBuffer[:reqSize]
 				} else {
-					// Negative size means data is at the end
 					rLen := -reqSize
 					if rLen > int32(len(slot.reqBuffer)) {
-                        // Error: Too large. Reject.
                         header.RespSize = 0
                         header.MsgType = MsgTypeSystemError
                         atomic.StoreUint32(&header.State, SlotRespReady)
@@ -668,10 +634,8 @@ func (g *DirectGuest) workerLoopInternal(idx int, handler func([]byte, []byte, M
 				header.MsgType = respType
 			}
 
-			// Signal Ready (Transition GUEST_BUSY -> RESP_READY)
 			atomic.StoreUint32(&header.State, SlotRespReady)
 
-			// Wake Host
 			if atomic.LoadUint32(&header.HostState) == HostStateWaiting {
 				SignalEvent(slot.respEvent)
 			}

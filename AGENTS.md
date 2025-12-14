@@ -28,6 +28,11 @@ This file contains instructions for AI Agents working on this repository.
     *   Use `go fmt`.
     *   Follow standard Go idioms.
 
+*   **Comments:**
+    *   **Self-Documenting Code:** Avoid verbose or redundant comments if the code itself is self-explanatory.
+    *   **No "Chatty" Comments:** Remove comments that merely repeat what the code does (e.g., `// Increment i` before `i++`).
+    *   **Doc Comments:** Maintain Public API documentation (Doxygen/GoDoc), but keep them concise.
+
 ## **Verification**
 
 *   **Byte Alignment:** When modifying structs, verify that C++ and Go structs match exactly in size and padding.
