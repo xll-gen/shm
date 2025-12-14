@@ -179,15 +179,7 @@ class DirectHost {
     }
 
 public:
-    /**
-     * @brief Helper class for managing a Zero-Copy slot.
-     *
-     * This class acts as a smart wrapper around a slot index. It allows:
-     * 1. Direct access to the request buffer (for building FlatBuffers).
-     * 2. Sending messages without manually managing the slot index.
-     * 3. Automatic release of the slot when the object goes out of scope (RAII).
-     * 4. Zero-copy access to the response buffer.
-     */
+    /** @brief Helper class for managing a Zero-Copy slot. */
     static const uint32_t USE_DEFAULT_TIMEOUT = 0xFFFFFFFF;
 
     class ZeroCopySlot {
@@ -196,20 +188,13 @@ public:
         std::weak_ptr<SharedState> weakState;
 
     public:
-        /**
-         * @brief Constructs a ZeroCopySlot.
-         * @param h Pointer to the DirectHost.
-         * @param idx The index of the acquired slot.
-         */
+        /** @brief Constructs a ZeroCopySlot. */
         ZeroCopySlot(DirectHost* h, int32_t idx) : host(h), slotIdx(idx) {
             if (h) weakState = h->sharedState;
         }
 
-        /**
-         * @brief Destructor. Releases the slot if not already moved.
-         */
+        /** @brief Destructor. Releases the slot if not already moved. */
         ~ZeroCopySlot() {
-            // Only release if Host is still alive
             if (auto lock = weakState.lock()) {
                 if (host && slotIdx >= 0) {
                     host->slots[slotIdx].header->state.store(SLOT_FREE, std::memory_order_release);
@@ -217,7 +202,6 @@ public:
             }
         }
 
-        // Move-only semantics
         ZeroCopySlot(ZeroCopySlot&& other) noexcept : host(other.host), slotIdx(other.slotIdx), weakState(std::move(other.weakState)) {
             other.host = nullptr;
             other.slotIdx = -1;
@@ -225,7 +209,6 @@ public:
 
         ZeroCopySlot& operator=(ZeroCopySlot&& other) noexcept {
              if (this != &other) {
-                 // Release current if valid (and Host is alive)
                  if (auto lock = weakState.lock()) {
                      if (host && slotIdx >= 0) {
                          host->slots[slotIdx].header->state.store(SLOT_FREE, std::memory_order_release);
@@ -240,32 +223,21 @@ public:
              return *this;
         }
 
-        // Disable copying
         ZeroCopySlot(const ZeroCopySlot&) = delete;
         ZeroCopySlot& operator=(const ZeroCopySlot&) = delete;
 
-        /**
-         * @brief Checks if the slot is valid.
-         * @return true if valid, false otherwise.
-         */
+        /** @brief Checks if the slot is valid. */
         bool IsValid() const {
              return !weakState.expired() && host && slotIdx >= 0;
         }
 
-        /**
-         * @brief Gets the pointer to the Request Buffer.
-         * Use this to write your data (e.g. build a FlatBuffer).
-         * @return Pointer to the buffer.
-         */
+        /** @brief Gets the pointer to the Request Buffer. */
         uint8_t* GetReqBuffer() {
             if (!IsValid()) return nullptr;
             return host->slots[slotIdx].reqBuffer;
         }
 
-        /**
-         * @brief Gets the maximum size of the Request Buffer.
-         * @return Size in bytes.
-         */
+        /** @brief Gets the maximum size of the Request Buffer. */
         int32_t GetMaxReqSize() {
              if (!IsValid()) return 0;
              return host->slots[slotIdx].maxReqSize;
@@ -273,12 +245,6 @@ public:
 
         /**
          * @brief Sends a request using the zero-copy buffer.
-         *
-         * Allows sending arbitrary message types with control over alignment.
-         *
-         * @param size Size of the data. Positive: Start-aligned. Negative: End-aligned.
-         * @param msgType The message Type.
-         * @param timeoutMs Per-call timeout. Default USE_DEFAULT_TIMEOUT.
          * @return Result<void> Success or Error.
          */
         Result<void> Send(int32_t size, MsgType msgType, uint32_t timeoutMs = USE_DEFAULT_TIMEOUT) {
@@ -286,7 +252,6 @@ public:
 
             Slot* slot = &host->slots[slotIdx];
 
-            // Bounds check
             int32_t absSize = size < 0 ? -size : size;
             if ((uint32_t)absSize > slot->maxReqSize) {
                 return Result<void>::Failure(Error::BufferTooSmall);
@@ -300,40 +265,26 @@ public:
 
             uint32_t t = (timeoutMs == USE_DEFAULT_TIMEOUT) ? host->responseTimeoutMs : timeoutMs;
             if (!host->WaitResponse(slot, t)) {
-                // Timeout. Invalidate slot to prevent accidental reuse or freeing.
-                // Leak the slot to prevent corruption.
                 slotIdx = -1;
                 return Result<void>::Failure(Error::Timeout);
             }
 
-            // Verify MsgSeq
             if (slot->header->msgSeq != currentSeq) {
-                 slotIdx = -1; // Invalidate
+                 slotIdx = -1;
                  return Result<void>::Failure(Error::ProtocolViolation);
             }
 
             if (slot->header->msgType == MsgType::SYSTEM_ERROR) {
-                 // Release slot (or invalidate)
                  host->slots[slotIdx].header->state.store(SLOT_FREE, std::memory_order_release);
                  slotIdx = -1;
                  return Result<void>::Failure(Error::InternalError);
             }
 
-            // Do NOT release slot here. User might want to read response.
             return Result<void>::Success();
         }
 
         /**
          * @brief Sends the FlatBuffer request.
-         *
-         * This method:
-         * 1. Sets the message Type to MsgType::FLATBUFFER.
-         * 2. Sets the request size to negative (indicating end-aligned Zero-Copy).
-         * 3. Signals the Guest and waits for completion.
-         *
-         * @param size The size of the FlatBuffer data (positive integer).
-         *             The method automatically negates it for the protocol.
-         * @param timeoutMs Per-call timeout. Default USE_DEFAULT_TIMEOUT.
          * @return Result<void> Success or Error.
          */
         Result<void> SendFlatBuffer(int32_t size, uint32_t timeoutMs = USE_DEFAULT_TIMEOUT) {
@@ -341,13 +292,11 @@ public:
 
             Slot* slot = &host->slots[slotIdx];
 
-            // Bounds check
             int32_t absSize = size;
             if ((uint32_t)absSize > slot->maxReqSize) {
                 return Result<void>::Failure(Error::BufferTooSmall);
             }
 
-            // Zero-Copy convention: Negative size
             slot->header->reqSize = -absSize;
             slot->header->msgType = MsgType::FLATBUFFER;
             uint32_t currentSeq = slot->msgSeq;
@@ -356,44 +305,32 @@ public:
 
             uint32_t t = (timeoutMs == USE_DEFAULT_TIMEOUT) ? host->responseTimeoutMs : timeoutMs;
             if (!host->WaitResponse(slot, t)) {
-                // Timeout. Invalidate slot to prevent accidental reuse or freeing.
-                // Leak the slot to prevent corruption.
                 slotIdx = -1;
                 return Result<void>::Failure(Error::Timeout);
             }
 
-            // Verify MsgSeq
             if (slot->header->msgSeq != currentSeq) {
-                 slotIdx = -1; // Invalidate
+                 slotIdx = -1;
                  return Result<void>::Failure(Error::ProtocolViolation);
             }
 
             if (slot->header->msgType == MsgType::SYSTEM_ERROR) {
-                 // Release slot (or invalidate)
                  host->slots[slotIdx].header->state.store(SLOT_FREE, std::memory_order_release);
                  slotIdx = -1;
                  return Result<void>::Failure(Error::InternalError);
             }
 
-            // Do NOT release slot here. User might want to read response.
             return Result<void>::Success();
         }
 
-        /**
-         * @brief Gets the pointer to the Response Buffer.
-         * Call this AFTER SendFlatBuffer() returns.
-         *
-         * @return Pointer to the response data.
-         */
+        /** @brief Gets the pointer to the Response Buffer. */
         uint8_t* GetRespBuffer() {
              if (!IsValid()) return nullptr;
              Slot* slot = &host->slots[slotIdx];
              int32_t rSize = slot->header->respSize;
 
-             // If positive, start-aligned. If negative, end-aligned.
              if (rSize >= 0) return slot->respBuffer;
 
-             // End-aligned: Calculate offset
              uint32_t absRSize = (0u - (uint32_t)rSize);
              if (absRSize > slot->maxRespSize) absRSize = slot->maxRespSize;
 
@@ -401,10 +338,7 @@ public:
              return slot->respBuffer + offset;
         }
 
-        /**
-         * @brief Gets the size of the Response data.
-         * @return Size in bytes.
-         */
+        /** @brief Gets the size of the Response data. */
         int32_t GetRespSize() {
              if (!IsValid()) return 0;
              Slot* slot = &host->slots[slotIdx];
@@ -569,29 +503,23 @@ public:
         return Init(config);
     }
 
-    /**
-     * @brief Sends shutdown signal to all guest workers.
-     * Blocks until all slots have been signaled.
-     */
+    /** @brief Sends shutdown signal to all guest workers. */
     void SendShutdown() {
         if (!running) return;
 
         for (uint32_t i = 0; i < numSlots; ++i) {
             std::vector<uint8_t> dummy;
-            // Use short timeout (1000ms) to avoid hanging on stuck slots
             SendToSlot(i, nullptr, 0, MsgType::SHUTDOWN, dummy, 1000);
         }
     }
 
-    /**
-     * @brief Shuts down the host, closing all handles and unmapping memory.
-     */
+    /** @brief Shuts down the host, closing all handles and unmapping memory. */
     void Shutdown() {
         if (!running) return;
 
         SHM_LOG_INFO("Shutting down DirectHost: ", shmName);
 
-        Stop(); // Stop background worker if active
+        Stop();
 
         for (uint32_t i = 0; i < slots.size(); ++i) {
              Platform::CloseEvent(slots[i].hReqEvent);
@@ -613,8 +541,6 @@ public:
 
     /**
      * @brief Acquires a free slot for Zero-Copy usage.
-     * Blocks until a slot is available using the same adaptive strategy as Send.
-     *
      * @return The index of the acquired slot, or -1 if not running.
      */
     int32_t AcquireSlot() {
@@ -624,15 +550,11 @@ public:
         Slot* slot = nullptr;
         int32_t resultIdx = -1;
 
-        // Fast Path: Try cached slot
         if (cachedSlotIdx < numSlots) {
             Slot& s = slots[cachedSlotIdx];
             uint32_t current = s.header->state.load(std::memory_order_acquire);
             bool canClaim = (current == SLOT_FREE);
             if (!canClaim) {
-                 // Recovery logic:
-                 // 1. SLOT_RESP_READY or SLOT_REQ_READY and Host not waiting -> Previous transaction abandoned.
-                 // 2. SLOT_GUEST_BUSY and Host not waiting -> Guest crashed or timed out during transaction.
                  if (current == SLOT_RESP_READY || current == SLOT_REQ_READY || current == SLOT_GUEST_BUSY) {
                       if (!s.activeWait.load(std::memory_order_acquire)) {
                           canClaim = true;
@@ -648,7 +570,6 @@ public:
             }
         }
 
-        // Slow Path: Search
         if (!slot) {
             int retries = 0;
             uint32_t idx = nextSlot.fetch_add(1, std::memory_order_relaxed) % numSlots;
@@ -668,7 +589,7 @@ public:
                 if (canClaim) {
                     if (s.header->state.compare_exchange_strong(current, SLOT_BUSY, std::memory_order_acquire)) {
                         slot = &s;
-                        cachedSlotIdx = idx; // Update Cache
+                        cachedSlotIdx = idx;
                         resultIdx = (int32_t)idx;
                         break;
                     }
@@ -765,22 +686,14 @@ public:
 
     /**
      * @brief Sends a request using an acquired slot (Zero-Copy flow).
-     *
-     * @param slotIdx The index of the acquired slot.
-     * @param size Size of the data. Negative means End-Aligned (Zero-Copy).
-     * @param msgType The message Type.
-     * @param[out] outResp Vector to store the response data.
-     * @param timeoutMs Per-call timeout. Default USE_DEFAULT_TIMEOUT.
      * @return Result<int> Bytes read (response size) on success, or Error on failure.
      */
     Result<int> SendAcquired(int32_t slotIdx, int32_t size, MsgType msgType, std::vector<uint8_t>& outResp, uint32_t timeoutMs = USE_DEFAULT_TIMEOUT) {
         if (slotIdx < 0 || slotIdx >= (int32_t)numSlots) return Result<int>(Error::InvalidArgs);
         Slot* slot = &slots[slotIdx];
 
-        // Bounds Check
         int32_t absSize = size < 0 ? -size : size;
         if ((uint32_t)absSize > slot->maxReqSize) {
-             // Release Slot
              slot->header->state.store(SLOT_FREE, std::memory_order_release);
              return Result<int>(Error::BufferTooSmall);
         }
@@ -791,19 +704,14 @@ public:
         slot->header->msgSeq = currentSeq;
         slot->msgSeq += msgSeqStride;
 
-        // Perform Signal and Wait
         uint32_t t = (timeoutMs == USE_DEFAULT_TIMEOUT) ? responseTimeoutMs : timeoutMs;
         bool ready = WaitResponse(slot, t);
 
         if (!ready) {
-             // Timeout. Do NOT release slot (leak it) to prevent corruption.
              return Result<int>(Error::Timeout);
         }
 
-        // Verify MsgSeq
         if (slot->header->msgSeq != currentSeq) {
-             // Release Slot (or leak? Safer to leak if corrupted)
-             // Leaking prevents reuse of bad slot.
              return Result<int>(Error::ProtocolViolation);
         }
 
@@ -812,7 +720,6 @@ public:
              return Result<int>(Error::InternalError);
         }
 
-        // Read Response
         int resultSize = 0;
         if (ready) {
             int32_t respSize = slot->header->respSize;
@@ -823,10 +730,8 @@ public:
             outResp.resize(absResp);
             if (absResp > 0) {
                 if (respSize >= 0) {
-                    // Start-aligned
                     memcpy(outResp.data(), slot->respBuffer, absResp);
                 } else {
-                    // End-aligned (Zero-Copy Guest)
                     uint32_t offset = slot->maxRespSize - absResp;
                     memcpy(outResp.data(), slot->respBuffer + offset, absResp);
                 }
@@ -834,7 +739,6 @@ public:
             resultSize = absResp;
         }
 
-        // Release Slot
         slot->header->state.store(SLOT_FREE, std::memory_order_release);
 
         return Result<int>(resultSize);
@@ -842,12 +746,6 @@ public:
 
     /**
      * @brief Sends a request to a specific slot.
-     * @param slotIdx The index of the slot to use.
-     * @param data Pointer to the request data.
-     * @param size Size of the request data.
-     * @param msgType The message Type.
-     * @param[out] outResp Vector to store the response data.
-     * @param timeoutMs Per-call timeout. Default USE_DEFAULT_TIMEOUT.
      * @return Result<int> Bytes read (response size) on success, or Error on failure.
      */
     Result<int> SendToSlot(uint32_t slotIdx, const uint8_t* data, int32_t size, MsgType msgType, std::vector<uint8_t>& outResp, uint32_t timeoutMs = USE_DEFAULT_TIMEOUT) {
@@ -856,7 +754,6 @@ public:
 
         if (size != 0) {
             if (!data) {
-                // Invalid Argument: size > 0 but data is null.
                 slots[idx].header->state.store(SLOT_FREE, std::memory_order_release);
                 return Result<int>(Error::InvalidArgs);
             }
@@ -865,7 +762,6 @@ public:
             uint32_t uAbsSize = (size < 0) ? (0u - (uint32_t)size) : (uint32_t)size;
 
             if (uAbsSize > (uint32_t)max) {
-                // Release Slot
                 slots[idx].header->state.store(SLOT_FREE, std::memory_order_release);
                 return Result<int>(Error::BufferTooSmall);
             }
@@ -873,7 +769,6 @@ public:
             if (size >= 0) {
                 memcpy(GetReqBuffer(idx), data, uAbsSize);
             } else {
-                // End-aligned
                 uint32_t offset = (uint32_t)max - uAbsSize;
                 memcpy(GetReqBuffer(idx) + offset, data, uAbsSize);
             }
@@ -883,11 +778,6 @@ public:
 
     /**
      * @brief Sends a request using any available slot.
-     * @param data Pointer to the request data.
-     * @param size Size of the request data.
-     * @param msgType The message Type.
-     * @param[out] outResp Vector to store the response data.
-     * @param timeoutMs Per-call timeout. Default USE_DEFAULT_TIMEOUT.
      * @return Result<int> Bytes read (response size) on success, or Error on failure.
      */
     Result<int> Send(const uint8_t* data, int32_t size, MsgType msgType, std::vector<uint8_t>& outResp, uint32_t timeoutMs = USE_DEFAULT_TIMEOUT) {
@@ -896,7 +786,6 @@ public:
 
         if (size != 0) {
             if (!data) {
-                // Invalid Argument: size > 0 but data is null.
                 slots[idx].header->state.store(SLOT_FREE, std::memory_order_release);
                 return Result<int>(Error::InvalidArgs);
             }
@@ -905,7 +794,6 @@ public:
             uint32_t uAbsSize = (size < 0) ? (0u - (uint32_t)size) : (uint32_t)size;
 
             if (uAbsSize > (uint32_t)max) {
-                // Release Slot
                 slots[idx].header->state.store(SLOT_FREE, std::memory_order_release);
                 return Result<int>(Error::BufferTooSmall);
             }
@@ -913,7 +801,6 @@ public:
             if (size >= 0) {
                 memcpy(GetReqBuffer(idx), data, uAbsSize);
             } else {
-                // End-aligned
                 uint32_t offset = (uint32_t)max - uAbsSize;
                 memcpy(GetReqBuffer(idx) + offset, data, uAbsSize);
             }
@@ -982,12 +869,6 @@ public:
 
     /**
      * @brief Processes any pending Guest Calls (Guest -> Host).
-     * This method is intended to be called in a loop by a background thread.
-     *
-     * @param handler A function to process the request.
-     *                Args: reqData, reqSize, respBuffer, maxRespSize, msgType.
-     *                Returns: respSize.
-     * @param limit Max number of requests to process per call. -1 for unlimited.
      * @return int Number of requests processed.
      */
     template <typename Handler>
@@ -999,22 +880,15 @@ public:
             if (limit > 0 && processed >= limit) break;
             Slot* slot = &slots[i];
 
-            // Check for REQ_READY (Guest wrote request)
-            // Optimization: Load first to avoid CAS contention/cache invalidation on empty slots.
             uint32_t current = slot->header->state.load(std::memory_order_acquire);
             if (current != SLOT_REQ_READY) continue;
 
-            // Use CAS to claim the slot (transition to BUSY) to prevent race conditions
-            // if ProcessGuestCalls is called from multiple threads or recursively.
             if (slot->header->state.compare_exchange_strong(current, SLOT_BUSY, std::memory_order_acq_rel)) {
-                // Read Request
                 int32_t reqSize = slot->header->reqSize;
                 const uint8_t* reqData = nullptr;
                 int32_t absReqSize = reqSize < 0 ? -reqSize : reqSize;
 
-                // Validate Size
                 if ((uint32_t)absReqSize > slot->maxReqSize) {
-                    // Invalid size. Signal error.
                     slot->header->respSize = 0;
                     slot->header->msgType = MsgType::SYSTEM_ERROR;
                     slot->header->state.store(SLOT_RESP_READY, std::memory_order_seq_cst);
@@ -1026,29 +900,21 @@ public:
                 if (reqSize >= 0) {
                      reqData = slot->reqBuffer;
                 } else {
-                     // End-aligned (Zero-Copy Guest)
                      uint32_t offset = slot->maxReqSize - absReqSize;
                      reqData = slot->reqBuffer + offset;
                 }
 
-                // Invoke Handler
                 int32_t respSize = handler(reqData, absReqSize, slot->respBuffer, slot->maxRespSize, slot->header->msgType);
 
-                // Validate Response Size
                 int32_t absRespSize = respSize < 0 ? -respSize : respSize;
                 if ((uint32_t)absRespSize > slot->maxRespSize) {
-                    // Overflow: Signal error.
                     respSize = 0;
                     slot->header->msgType = MsgType::SYSTEM_ERROR;
                 }
 
-                // Write Response Metadata
                 slot->header->respSize = respSize;
 
-                // State Transition: BUSY -> RESP_READY
                 slot->header->state.store(SLOT_RESP_READY, std::memory_order_seq_cst);
-
-                // Signal Guest (Guest waits on RespEvent)
                 Platform::SignalEvent(slot->hRespEvent);
 
                 processed++;

@@ -54,34 +54,25 @@ std::string FormatNumber(double n) {
 
 void WorkerThread(DirectHost* host, int id) {
     std::vector<uint8_t> req(DATA_SIZE);
-    // Fill with pattern
     for (int i = 0; i < DATA_SIZE; ++i) req[i] = (uint8_t)(i % 256);
 
-    // Header for protocol matching
-    // For this benchmark, we will manually prepend a 8-byte ID to mimic TransportHeader.
     uint64_t localReqId = 0;
     std::vector<uint8_t> resp;
     resp.reserve(DATA_SIZE + 8);
 
-    // Pre-allocate buffer with space for header
     std::vector<uint8_t> sendBuf(DATA_SIZE + 8);
 
-    // Error logging limiter
     int errorLogCount = 0;
     const int MAX_ERROR_LOGS = 5;
 
     while (running) {
         localReqId++;
 
-        // Write Header
         memcpy(sendBuf.data(), &localReqId, 8);
-        // Write Data
         memcpy(sendBuf.data() + 8, req.data(), DATA_SIZE);
 
         auto start = std::chrono::steady_clock::now();
 
-        // Send to specific slot (1:1 mapping)
-        // Note: DirectHost::SendToSlot blocks until response.
         auto res = host->SendToSlot(id, sendBuf.data(), (int32_t)sendBuf.size(), MsgType::NORMAL, resp);
 
         auto end = std::chrono::steady_clock::now();
@@ -97,7 +88,6 @@ void WorkerThread(DirectHost* host, int id) {
 
         int read = res.Value();
 
-        // Verify Response
         if (read >= 8) {
             uint64_t respId = 0;
             memcpy(&respId, resp.data(), 8);
@@ -109,7 +99,6 @@ void WorkerThread(DirectHost* host, int id) {
                 }
                 continue;
             }
-            // Success
             globalStats.ops++;
             auto lat = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
             globalStats.latencySum += lat;
@@ -168,19 +157,11 @@ int main(int argc, char** argv) {
     std::cout << "  Guest Call Mode: " << (GUEST_CALL_MODE ? "Enabled" : "Disabled") << std::endl;
 
     DirectHost host;
-    // Init Host
-    // If Guest Call Mode, allocate Guest Slots.
     uint32_t numGuestSlots = GUEST_CALL_MODE ? NUM_THREADS : 0;
 
-    // We add padding to slot size to accommodate header safely and ensure alignment
-    // We need maxReqSize >= DATA_SIZE + 8.
-    // DirectHost splits payloadSize in half.
-    // So payloadSize must be roughly 2 * (DATA_SIZE + 8).
-    // We add extra padding to be safe.
     uint32_t requiredSize = (DATA_SIZE + 128) * 2;
     if (requiredSize < 256) requiredSize = 256;
 
-    // New HostConfig usage
     HostConfig config;
     config.shmName = SHM_NAME;
     config.numHostSlots = NUM_THREADS;
@@ -192,17 +173,13 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Wait for Guest(s) to attach?
     std::cout << "Waiting for Guest to attach..." << std::endl;
     std::this_thread::sleep_for(std::chrono::seconds(2));
 
-    // Simple handshake probe (optional)
     std::vector<uint8_t> resp;
     uint8_t data = 0;
-    // We try to send to slot 0. If it fails (timeout), we wait more.
     int retries = 0;
     while (true) {
-        // Send generic probe
         if (host.Send(&data, 1, MsgType::NORMAL, resp).HasError()) {
             if (retries++ > 10) {
                 std::cerr << "Guest not responding. Is the Go server running?" << std::endl;
