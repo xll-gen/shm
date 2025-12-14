@@ -673,7 +673,8 @@ public:
                         break;
                     }
                 }
-                idx = (idx + 1) % numSlots;
+                idx++;
+                if (idx >= numSlots) idx = 0;
                 retries++;
                 if (retries > (int)numSlots * 100) {
                     Platform::ThreadYield();
