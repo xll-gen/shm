@@ -6,6 +6,7 @@
 #include <chrono>
 #include <iomanip>
 #include <cstring>
+#include <sstream>
 #include <shm/DirectHost.h>
 #include <shm/IPCUtils.h>
 
@@ -28,25 +29,35 @@ struct BenchmarkStats {
 BenchmarkStats globalStats;
 std::atomic<bool> running{true};
 
+std::string FormatNumber(uint64_t n) {
+    std::string s = std::to_string(n);
+    int insertAt = s.length() - 3;
+    while (insertAt > 0) {
+        s.insert(insertAt, ",");
+        insertAt -= 3;
+    }
+    return s;
+}
+
+std::string FormatNumber(double n) {
+    std::stringstream ss;
+    ss << std::fixed << std::setprecision(2) << n;
+    std::string s = ss.str();
+    size_t decimalPos = s.find('.');
+    int insertAt = (int)decimalPos - 3;
+    while (insertAt > 0) {
+        s.insert(insertAt, ",");
+        insertAt -= 3;
+    }
+    return s;
+}
+
 void WorkerThread(DirectHost* host, int id) {
     std::vector<uint8_t> req(DATA_SIZE);
     // Fill with pattern
     for (int i = 0; i < DATA_SIZE; ++i) req[i] = (uint8_t)(i % 256);
 
-    // Header for protocol matching (optional, but good for verification)
-    // Here we just send raw bytes as the Go server expects raw bytes or structured?
-    // The Go server in benchmarks/go/main.go expects:
-    // [TransportHeader][Payload] if we were using IPCHost.
-    // But DirectHost sends raw payload.
-    // However, the Go server *does* parse TransportHeader in its generic handler!
-    // Let's check Go server code.
-    // Go server:
-    // func handler(req []byte, resp []byte, msgType shm.MsgType) ...
-    // It assumes [8 bytes reqId] [payload].
-    // So we MUST prepend 8 bytes if we want to match the Go server logic?
-    // Wait, the Go server logic in `benchmarks/go/main.go` reads 8 bytes.
-    // IF we are running "Direct Exchange" benchmark, we should match.
-
+    // Header for protocol matching
     // For this benchmark, we will manually prepend a 8-byte ID to mimic TransportHeader.
     uint64_t localReqId = 0;
     std::vector<uint8_t> resp;
@@ -133,6 +144,16 @@ void GuestCallListener(DirectHost* host) {
 int main(int argc, char** argv) {
     // Parse Args
     for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            std::cout << "Usage: " << argv[0] << " [options]" << std::endl;
+            std::cout << "Options:" << std::endl;
+            std::cout << "  -t <n>          Number of threads (default: 1)" << std::endl;
+            std::cout << "  -s <bytes>      Data size in bytes (default: 64)" << std::endl;
+            std::cout << "  -d <seconds>    Duration in seconds (default: 10)" << std::endl;
+            std::cout << "  -v              Verbose logging" << std::endl;
+            std::cout << "  --guest-call    Enable Guest Call mode" << std::endl;
+            return 0;
+        }
         if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) NUM_THREADS = atoi(argv[++i]);
         if (strcmp(argv[i], "-s") == 0 && i + 1 < argc) DATA_SIZE = atoi(argv[++i]);
         if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) DURATION_SEC = atoi(argv[++i]);
@@ -172,8 +193,6 @@ int main(int argc, char** argv) {
     }
 
     // Wait for Guest(s) to attach?
-    // The DirectHost doesn't know if Guests are attached until we send and they reply.
-    // We can do a warmup/handshake.
     std::cout << "Waiting for Guest to attach..." << std::endl;
     std::this_thread::sleep_for(std::chrono::seconds(2));
 
@@ -244,10 +263,10 @@ int main(int argc, char** argv) {
     double throughput = (double)totalOps / DURATION_SEC;
 
     std::cout << "Results:" << std::endl;
-    std::cout << "  Total Ops: " << totalOps << std::endl;
-    std::cout << "  Throughput: " << std::fixed << std::setprecision(2) << throughput << " ops/s" << std::endl;
-    std::cout << "  Avg Latency: " << avgLat << " us" << std::endl;
-    std::cout << "  Errors: " << totalErr << std::endl;
+    std::cout << "  Total Ops:      " << FormatNumber(totalOps) << std::endl;
+    std::cout << "  Throughput:     " << FormatNumber(throughput) << " ops/s" << std::endl;
+    std::cout << "  Avg Latency:    " << std::fixed << std::setprecision(2) << avgLat << " us" << std::endl;
+    std::cout << "  Errors:         " << FormatNumber(totalErr) << std::endl;
 
     return 0;
 }
