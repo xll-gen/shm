@@ -319,3 +319,9 @@ The `experiments` folder contains standalone latency tests (`pingpong`) used to 
 *   `AGENTS.md`: Developer guidelines and constraints.
 *   `SPECIFICATION.md`: Protocol details and memory layout.
 *   Source code is fully documented with Doxygen (C++) and GoDoc (Go) comments.
+
+## License and Third Party Notices
+
+This project is licensed under the GPLv3 License. See [LICENSE](LICENSE) for details.
+
+This project uses third-party open source software. For a list of third-party dependencies and their licenses, please see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
