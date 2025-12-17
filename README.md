@@ -24,14 +24,14 @@ The project's "Direct Exchange" IPC mode significantly outperforms traditional m
 
 **Sandbox Environment (Containerized):**
 *   **1 Thread**:
-    *   **Throughput**: ~1.90M ops/s
-    *   **Avg Latency (RTT)**: 0.53 us
+    *   **Throughput**: ~1.48M ops/s
+    *   **Avg Latency (RTT)**: 0.67 us
 *   **4 Threads**:
-    *   **Throughput**: ~2.73M ops/s
-    *   **Avg Latency (RTT)**: 1.46 us
+    *   **Throughput**: ~1.87M ops/s
+    *   **Avg Latency (RTT)**: 2.14 us
 *   **8 Threads**:
-    *   **Throughput**: ~2.03M ops/s
-    *   **Avg Latency (RTT)**: 3.94 us
+    *   **Throughput**: ~1.92M ops/s
+    *   **Avg Latency (RTT)**: 4.17 us
 
 **AMD Ryzen 9 3900x (Bare-metal):**
 *   **1 Thread**: 1.74M ops/s (0.58 us)
@@ -79,15 +79,20 @@ shm::HostConfig config;
 config.shmName = "MyIPC";
 config.numHostSlots = 4;
 config.payloadSize = 1024 * 1024; // 1MB payload per slot
+config.numGuestSlots = 0; // Set to >0 to enable Guest Calls
 
-if (!host.Init(config)) {
+if (!host.Init(config).IsSuccess()) {
+    std::cerr << "Failed to init host" << std::endl;
     return -1;
 }
 
 std::vector<uint8_t> resp;
 // Send 4 bytes to any available slot
 // Note: This blocks until response is received.
-host.Send((const uint8_t*)"test", 4, shm::MsgType::NORMAL, resp);
+auto result = host.Send((const uint8_t*)"test", 4, shm::MsgType::NORMAL, resp);
+if (result.HasError()) {
+    // Handle error
+}
 ```
 
 ### Zero-Copy (FlatBuffers)
@@ -105,7 +110,9 @@ flatbuffers::FlatBufferBuilder builder(slot.GetMaxReqSize(), nullptr, false, slo
 
 // 3. Send Request
 // Signals MSG_TYPE_FLATBUFFER and handles negative size internally
-slot.SendFlatBuffer(builder.GetSize());
+// Returns Result<void>
+auto res = slot.SendFlatBuffer(builder.GetSize());
+if (res.HasError()) { /* Handle Error */ }
 
 // 4. Access Response Directly (Zero-Copy)
 uint8_t* respData = slot.GetRespBuffer();
@@ -199,17 +206,16 @@ config.numHostSlots = 4;
 config.numGuestSlots = 2; // 2 Async Slots
 host.Init(config);
 
-// In a background thread:
-while (running) {
-    host.ProcessGuestCalls([](const uint8_t* req, int32_t reqSize, uint8_t* resp, uint32_t maxRespSize, shm::MsgType msgType) -> int32_t {
-        if (msgType == shm::MsgType::GUEST_CALL) {
-             // Process Guest Request
-        }
-        return 0; // Return response size
-    });
-    // Sleep/Yield to avoid 100% CPU if polling
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-}
+// Start background worker for Guest Calls
+host.Start([](const uint8_t* req, int32_t reqSize, uint8_t* resp, uint32_t maxRespSize, shm::MsgType msgType) -> int32_t {
+    if (msgType == shm::MsgType::GUEST_CALL) {
+         // Process Guest Request
+    }
+    return 0; // Return response size
+});
+
+// To stop:
+// host.Stop();
 ```
 
 **Go Guest (Caller):**
@@ -228,7 +234,7 @@ The default timeout for operations is 10 seconds. For operations that may exceed
 2.  **Guest** receives the request, starts the job in a background goroutine, and **immediately** returns an acknowledgement (Ack).
 3.  **Host** receives the Ack and is free to process other tasks.
 4.  When the job completes, the **Guest** sends the result back to the Host using a **Guest Call** (`SendGuestCall`).
-5.  **Host** processes the result via `ProcessGuestCalls`.
+5.  **Host** processes the result via the handler registered in `Start()`.
 
 This ensures the 1:1 slot mapping remains available for high-frequency messages and prevents timeouts.
 

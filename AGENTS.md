@@ -11,15 +11,16 @@ This file contains instructions for AI Agents working on this repository.
 
 ## **Project Structure**
 
-*   **include/shm/**: C++ Header-only library. **Do not create .cpp files for the library.**
+*   **include/shm/**: C++ Header-only library. **Do not create .cpp files for the library logic.** Implementation goes in `.h` files.
 *   **go.mod**: Go module definition (at root).
 *   **go/**: Go library source code. **Do not use external dependencies.**
 *   **benchmarks/**: Performance tests and examples.
+*   **tests/**: Regression and unit tests.
 
 ## **Coding Standards**
 
 *   **C++:**
-    *   Header-only architecture.
+    *   **Header-only architecture.**
     *   Use `doxygen` style comments (`/** ... */`).
     *   Strict memory alignment (cache-line friendly).
     *   **Cross-Platform:** Must compile on Linux (GCC/Clang) and Windows (MSVC 2019+). Use `Platform.h` for OS primitives.
