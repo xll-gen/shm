@@ -23,23 +23,23 @@ The benchmark evaluates the "System Effective OPS" (Total successful operations 
 | 24 | 1,784,417 |
 
 ### Sandbox (Containerized)
-**Environment:** Sandbox (Containerized)
+**Environment:** Sandbox (Containerized, 16 vCPUs)
 **Payload:** 64 bytes (Ping-Pong)
 
 ### 1 Thread
-*   **Throughput**: 1,426,102 ops/s
-*   **Avg Latency (RTT)**: 0.70 us
+*   **Throughput**: 1,480,997 ops/s
+*   **Avg Latency (RTT)**: 0.67 us
 
 ### 4 Threads
-*   **Throughput**: 1,864,378 ops/s
-*   **Avg Latency (RTT)**: 2.15 us
+*   **Throughput**: 1,871,576 ops/s
+*   **Avg Latency (RTT)**: 2.14 us
 
 ### 8 Threads
-*   **Throughput**: 2,200,666 ops/s
-*   **Avg Latency (RTT)**: 3.63 us
+*   **Throughput**: 1,916,499 ops/s
+*   **Avg Latency (RTT)**: 4.17 us
 
 ## Optimization Notes
-*   **Single Thread Optimization**: `runtime.Gosched()` is automatically disabled when `NumSlots == 1`, prioritizing single-thread latency. This restores performance significantly compared to the proactive yielding baseline.
+*   **Single Thread Optimization**: `runtime.Gosched()` is automatically disabled when `NumSlots == 1`, prioritizing single-thread latency.
 *   **Throughput Optimization**: For multi-thread scenarios (`NumSlots > 1`), `runtime.Gosched()` is enabled (every 128 iterations) to prevent starvation in oversubscribed environments.
 *   **Wait Strategy**: Tuned to MaxSpin=5000 to accommodate Guest-side memory copy latency.
 
@@ -52,4 +52,4 @@ This scenario validates the bidirectional communication capability where the Gue
 
 ### 1 Thread
 *   **Throughput**: ~950,000 ops/s
-*   **Avg Latency (RTT)**: ~1.0 us
+*   **Avg Latency (RTT)**: ~1.05 us
