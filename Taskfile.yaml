@@ -5,6 +5,11 @@ tasks:
     cmds:
       - task: run:benchmark
 
+  install:task:
+    desc: Installs go-task (task runner)
+    cmds:
+      - go install github.com/go-task/task/v3/cmd/task@latest
+
   build:cpp:
     cmds:
       - cmd: cmake -S . -B build -DSHM_BUILD_BENCHMARKS=ON -DCMAKE_BUILD_TYPE=Release
