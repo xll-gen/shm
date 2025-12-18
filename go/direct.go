@@ -138,8 +138,6 @@ type DirectGuest struct {
 func NewDirectGuest(name string) (*DirectGuest, error) {
 	Info("Initializing DirectGuest", "name", name)
 
-	// 1. Map Header
-	// We try to map a small chunk first to read the header.
 	const HeaderMapSize = 64
 	h, addr, err := OpenShm(name, HeaderMapSize)
 	if err != nil {
@@ -174,7 +172,6 @@ func NewDirectGuest(name string) (*DirectGuest, error) {
 
 	CloseShm(h, addr, HeaderMapSize)
 
-	// 2. Map Full
 	headerSize := uint64(unsafe.Sizeof(ExchangeHeader{}))
 	if headerSize < 64 {
 		headerSize = 64
@@ -219,8 +216,6 @@ func NewDirectGuest(name string) (*DirectGuest, error) {
         reqPtr := unsafe.Pointer(dataBase + uintptr(reqOffset))
         respPtr := unsafe.Pointer(dataBase + uintptr(respOffset))
 
-        // Calculate sizes
-        // Assuming split at respOffset
         maxReq := respOffset - reqOffset
         maxResp := slotSize - respOffset
 
@@ -259,7 +254,6 @@ func NewDirectGuest(name string) (*DirectGuest, error) {
 		g.slots[i].reqEvent = evReq
 		g.slots[i].respEvent = evResp
 
-        // Initialize MsgSeq
         g.slots[i].nextMsgSeq = uint32(i + 1)
 
         // Optimize for Single Thread (latency) vs Multi Thread (throughput)
@@ -357,7 +351,6 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, buffer []byte, msgType 
 	numGuest := int(g.numGuestSlots)
 
 	var slot *slotContext
-	// Scan for free slots AND reclaim zombie slots
 	for j := 0; j < numGuest; j++ {
 		idx := startBase + int((uint32(j)+offset)%uint32(numGuest))
 		s := &g.slots[idx]
@@ -504,7 +497,6 @@ func (g *DirectGuest) workerLoop(idx int, handler func([]byte, []byte, MsgType) 
 	defer g.wg.Done()
 
 	for {
-		// Check closing before restarting
 		if atomic.LoadInt32(&g.closing) == 1 {
 			return
 		}
@@ -550,7 +542,6 @@ func (g *DirectGuest) workerLoopInternal(idx int, handler func([]byte, []byte, M
 	slot := &g.slots[idx]
 	header := slot.header
 
-	// Reset guest state
 	atomic.StoreUint32(&header.GuestState, GuestStateActive)
 
 	for {
