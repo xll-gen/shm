@@ -9,6 +9,12 @@ This file contains instructions for AI Agents working on this repository.
 *   **Tests:** New features must include regression tests.
 *   **Versioning:** Patch version updates (x.y.Z) must maintain API compatibility and memory layout (ABI) compatibility. Breaking changes require a Major version update.
 
+## **Development Environment**
+
+*   **Task Runner:** For better Developer Experience (DX), install `go-task` (Taskfile runner) at the start of work.
+    *   Command: `go install github.com/go-task/task/v3/cmd/task@latest`
+    *   Run `task --list` to check available tasks.
+
 ## **Project Structure**
 
 *   **include/shm/**: C++ Header-only library. **Do not create .cpp files for the library logic.** Implementation goes in `.h` files.
