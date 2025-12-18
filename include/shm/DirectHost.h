@@ -124,40 +124,31 @@ class DirectHost {
     bool WaitResponse(Slot* slot, uint32_t timeoutMs) {
         slot->activeWait.store(true, std::memory_order_relaxed);
 
-        // Reset Host State
         slot->header->hostState.store(HOST_STATE_ACTIVE, std::memory_order_relaxed);
 
-        // Signal Ready
         slot->header->state.store(SLOT_REQ_READY, std::memory_order_seq_cst);
 
-        // Wake Guest if waiting
         if (slot->header->guestState.load(std::memory_order_seq_cst) == GUEST_STATE_WAITING) {
             Platform::SignalEvent(slot->hReqEvent);
         }
 
-        // Condition lambda
         auto checkReady = [&]() -> bool {
             return slot->header->state.load(std::memory_order_acquire) == SLOT_RESP_READY;
         };
 
-        // Sleep/Wait lambda
         auto sleepAction = [&]() {
             slot->header->hostState.store(HOST_STATE_WAITING, std::memory_order_seq_cst);
 
-            // Double check
             if (checkReady()) {
                 slot->header->hostState.store(HOST_STATE_ACTIVE, std::memory_order_relaxed);
                 return;
             }
 
-            // Wait with timeout
             auto start = std::chrono::steady_clock::now();
             while (!checkReady()) {
                 auto now = std::chrono::steady_clock::now();
                 auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
 
-                // Note: If timeoutMs is 0xFFFFFFFF, elapsed >= timeoutMs might be false unless elapsed is huge.
-                // But generally safe.
                 if (timeoutMs != 0xFFFFFFFF && elapsed >= timeoutMs) {
                     SHM_LOG_DEBUG("WaitResponse timeout after ", elapsed, "ms");
                     break; // Timeout, return and let caller fail
@@ -390,20 +381,15 @@ public:
         this->numGuestSlots = config.numGuestSlots;
         this->slotSize = config.payloadSize;
 
-        // Calculate Stride for Global Uniqueness (Interleaved)
-        // stride = Total Slots.
         this->msgSeqStride = numSlots + numGuestSlots;
 
-        // Split strategy: 50/50
         uint32_t halfSize = slotSize / 2;
-        // Align to 64 bytes
         halfSize = (halfSize / 64) * 64;
         if (halfSize < 64) halfSize = 64;
 
         uint32_t reqOffset = 0;
         uint32_t respOffset = halfSize;
 
-        // Ensure total fits
         if (respOffset + halfSize > slotSize) {
              slotSize = respOffset + halfSize;
         }
@@ -412,7 +398,6 @@ public:
         if (exchangeHeaderSize < 64) exchangeHeaderSize = 64;
 
         size_t slotHeaderSize = sizeof(SlotHeader);
-        // Should be 128
 
         size_t perSlotTotal = slotHeaderSize + slotSize;
         size_t totalSlots = numSlots + numGuestSlots;
@@ -423,7 +408,6 @@ public:
         shmBase = Platform::CreateNamedShm(shmName.c_str(), totalSize, hMapFile, exists);
         if (!shmBase) return Result<void>::Failure(Error::InternalError);
 
-        // Try to acquire exclusive lock
         if (!Platform::LockShm(hMapFile, shmName.c_str(), hLockFile)) {
             SHM_LOG_ERROR("Failed to acquire lock on SHM: ", shmName, ". Another Host might be running.");
             Platform::CloseShm(hMapFile, shmBase, totalShmSize);
@@ -431,10 +415,8 @@ public:
             return Result<void>::Failure(Error::ResourceExhausted);
         }
 
-        // Zero out memory if new
         memset(shmBase, 0, totalSize);
 
-        // Write ExchangeHeader
         ExchangeHeader* exHeader = (ExchangeHeader*)shmBase;
         exHeader->magic = SHM_MAGIC;
         exHeader->version = SHM_VERSION;
@@ -456,15 +438,12 @@ public:
             slots[i].maxRespSize = slotSize - respOffset;
             // waitStrategy initialized by default constructor
 
-            // Initial msgSeq = Index + 1
             slots[i].msgSeq = i + 1;
 
-            // Events
             std::string reqName;
             if (i < numSlots) {
                 reqName = shmName + "_slot_" + std::to_string(i);
             } else {
-                // Shared event for all Guest Calls to allow single-thread draining
                 reqName = shmName + "_guest_call";
             }
             std::string respName = shmName + "_slot_" + std::to_string(i) + "_resp";
@@ -479,7 +458,6 @@ public:
                 return Result<void>::Failure(Error::InternalError);
             }
 
-            // Initialize Header
             slots[i].header->state.store(SLOT_FREE, std::memory_order_relaxed);
             slots[i].header->hostState.store(HOST_STATE_ACTIVE, std::memory_order_relaxed);
             slots[i].header->guestState.store(GUEST_STATE_ACTIVE, std::memory_order_relaxed);
@@ -832,12 +810,6 @@ private:
                  std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
 
-            // Drain events (Process until empty or limit reached)
-            // Note: On Linux semaphores, WaitEvent consumes 1 count.
-            // If multiple requests came in, sem value > 0.
-            // However, ProcessGuestCalls iterates ALL slots.
-            // So one Wakeup might process N requests.
-            // Subsequent WaitEvents might return immediately (spurious wakeups), which is fine.
             int processed = ProcessGuestCalls(handler, maxBatchSize);
             (void)processed;
         }
