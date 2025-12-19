@@ -82,14 +82,16 @@ public:
      *
      * @param h The event handle.
      * @param timeoutMs Timeout in milliseconds. Default 0xFFFFFFFF (Infinite).
+     * @return true if signaled, false if timeout or error.
      */
-    static void WaitEvent(EventHandle h, uint32_t timeoutMs = 0xFFFFFFFF) {
-        if (!h) return;
+    static bool WaitEvent(EventHandle h, uint32_t timeoutMs = 0xFFFFFFFF) {
+        if (!h) return false;
 #ifdef _WIN32
-        WaitForSingleObject(h, timeoutMs);
+        DWORD res = WaitForSingleObject(h, timeoutMs);
+        return (res == WAIT_OBJECT_0);
 #else
         if (timeoutMs == 0xFFFFFFFF) {
-            sem_wait(h);
+            return (sem_wait(h) == 0);
         } else {
             struct timespec ts;
             clock_gettime(CLOCK_REALTIME, &ts);
@@ -99,7 +101,7 @@ public:
                 ts.tv_sec++;
                 ts.tv_nsec -= 1000000000;
             }
-            sem_timedwait(h, &ts);
+            return (sem_timedwait(h, &ts) == 0);
         }
 #endif
     }
