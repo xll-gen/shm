@@ -57,6 +57,10 @@ enum class MsgType : uint32_t {
     FLATBUFFER = 10,
     /** @brief Guest Call (Guest -> Host). */
     GUEST_CALL = 11,
+    /** @brief Stream Start (Host -> Guest). used for initializing a stream. */
+    STREAM_START = 13,
+    /** @brief Stream Chunk (Host -> Guest). used for sending a chunk of a stream. */
+    STREAM_CHUNK = 14,
     /** @brief System Error (e.g. buffer overflow, invalid state). */
     SYSTEM_ERROR = 127,
     /** @brief Start of Application Specific message types. */

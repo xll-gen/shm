@@ -663,6 +663,122 @@ public:
     }
 
     /**
+     * @brief Sends a request asynchronously using an acquired slot.
+     * Does not wait for response. The slot remains BUSY until WaitForSlot is called.
+     * @return Result<void> Success or Error.
+     */
+    Result<void> SendAcquiredAsync(int32_t slotIdx, int32_t size, MsgType msgType) {
+        if (slotIdx < 0 || slotIdx >= (int32_t)numSlots) return Result<void>::Failure(Error::InvalidArgs);
+        Slot* slot = &slots[slotIdx];
+
+        int32_t absSize = size < 0 ? -size : size;
+        if ((uint32_t)absSize > slot->maxReqSize) {
+             slot->header->state.store(SLOT_FREE, std::memory_order_release);
+             return Result<void>::Failure(Error::BufferTooSmall);
+        }
+
+        slot->header->reqSize = size;
+        slot->header->msgType = msgType;
+        slot->header->msgSeq = slot->msgSeq;
+        slot->msgSeq += msgSeqStride;
+
+        // Mark activeWait to prevent theft during async operation
+        slot->activeWait.store(true, std::memory_order_relaxed);
+
+        slot->header->hostState.store(HOST_STATE_ACTIVE, std::memory_order_relaxed);
+        slot->header->state.store(SLOT_REQ_READY, std::memory_order_seq_cst);
+
+        if (slot->header->guestState.load(std::memory_order_seq_cst) == GUEST_STATE_WAITING) {
+            Platform::SignalEvent(slot->hReqEvent);
+        }
+
+        return Result<void>::Success();
+    }
+
+    /**
+     * @brief Waits for a specific slot to receive a response.
+     * Completes the transaction started by SendAcquiredAsync.
+     * @return Result<int> Response size.
+     */
+    Result<int> WaitForSlot(int32_t slotIdx, std::vector<uint8_t>& outResp, uint32_t timeoutMs = USE_DEFAULT_TIMEOUT) {
+        if (slotIdx < 0 || slotIdx >= (int32_t)numSlots) return Result<int>(Error::InvalidArgs);
+        Slot* slot = &slots[slotIdx];
+
+        auto checkReady = [&]() -> bool {
+            return slot->header->state.load(std::memory_order_acquire) == SLOT_RESP_READY;
+        };
+
+        uint32_t t = (timeoutMs == USE_DEFAULT_TIMEOUT) ? responseTimeoutMs : timeoutMs;
+
+        // Ensure activeWait is true (it should be from SendAcquiredAsync)
+        slot->activeWait.store(true, std::memory_order_relaxed);
+        slot->header->hostState.store(HOST_STATE_ACTIVE, std::memory_order_relaxed);
+
+        auto sleepAction = [&]() {
+            slot->header->hostState.store(HOST_STATE_WAITING, std::memory_order_seq_cst);
+            if (checkReady()) {
+                slot->header->hostState.store(HOST_STATE_ACTIVE, std::memory_order_relaxed);
+                return;
+            }
+
+            auto start = std::chrono::steady_clock::now();
+            while (!checkReady()) {
+                auto now = std::chrono::steady_clock::now();
+                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
+
+                if (t != 0xFFFFFFFF && elapsed >= t) {
+                    break;
+                }
+
+                uint32_t remaining = (t == 0xFFFFFFFF) ? 0xFFFFFFFF : (t - (uint32_t)elapsed);
+                uint32_t waitTime = (remaining > 100) ? 100 : remaining;
+                if (t == 0xFFFFFFFF) waitTime = 100;
+
+                Platform::WaitEvent(slot->hRespEvent, waitTime);
+            }
+            slot->header->hostState.store(HOST_STATE_ACTIVE, std::memory_order_relaxed);
+        };
+
+        bool ready = slot->waitStrategy.Wait(checkReady, sleepAction);
+
+        slot->activeWait.store(false, std::memory_order_release);
+
+        if (!ready) {
+             return Result<int>(Error::Timeout);
+        }
+
+        uint32_t expectedSeq = slot->msgSeq - msgSeqStride;
+        if (slot->header->msgSeq != expectedSeq) {
+             return Result<int>(Error::ProtocolViolation);
+        }
+
+        if (slot->header->msgType == MsgType::SYSTEM_ERROR) {
+             slot->header->state.store(SLOT_FREE, std::memory_order_release);
+             return Result<int>(Error::InternalError);
+        }
+
+        int resultSize = 0;
+        int32_t respSize = slot->header->respSize;
+        int32_t absResp = respSize < 0 ? -respSize : respSize;
+
+        if ((uint32_t)absResp > slot->maxRespSize) absResp = (int32_t)slot->maxRespSize;
+
+        outResp.resize(absResp);
+        if (absResp > 0) {
+            if (respSize >= 0) {
+                memcpy(outResp.data(), slot->respBuffer, absResp);
+            } else {
+                uint32_t offset = slot->maxRespSize - absResp;
+                memcpy(outResp.data(), slot->respBuffer + offset, absResp);
+            }
+        }
+        resultSize = absResp;
+
+        slot->header->state.store(SLOT_FREE, std::memory_order_release);
+        return Result<int>(resultSize);
+    }
+
+    /**
      * @brief Sends a request using an acquired slot (Zero-Copy flow).
      * @return Result<int> Bytes read (response size) on success, or Error on failure.
      */

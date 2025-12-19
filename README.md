@@ -226,6 +226,56 @@ host.Start([](const uint8_t* req, int32_t reqSize, uint8_t* resp, uint32_t maxRe
 resp, err := client.SendGuestCall([]byte("AsyncData"), shm.MsgTypeGuestCall)
 ```
 
+### Large Data Streaming (Double Buffering)
+
+For sending large datasets (exceeding slot size) efficiently, the library provides a Streaming API. This API splits the data into chunks and uses multiple slots in parallel ("Double Buffering" or "N-Buffering") to maximize throughput.
+
+#### C++ Host
+
+Use `shm::StreamSender` to send large data:
+
+```cpp
+#include <shm/DirectHost.h>
+#include <shm/Stream.h>
+
+shm::DirectHost host;
+host.Init(config);
+
+shm::StreamSender sender(&host);
+std::vector<uint8_t> bigData(10 * 1024 * 1024); // 10MB
+
+// Send data with Stream ID 12345
+auto result = sender.Send(bigData.data(), bigData.size(), 12345);
+if (result.HasError()) {
+    // Handle error
+}
+```
+
+#### Go Guest
+
+Use `shm.NewStreamReassembler` to handle streams:
+
+```go
+package main
+
+import "github.com/xll-gen/shm/go"
+
+func main() {
+    guest, _ := shm.NewDirectGuest("MyIPC")
+
+    // Define stream handler
+    onStream := func(streamID uint64, data []byte) {
+        fmt.Printf("Received stream %d: %d bytes\n", streamID, len(data))
+    }
+
+    // Wrap your existing handler or use fallback
+    handler := shm.NewStreamReassembler(onStream, myNormalMsgHandler)
+
+    guest.Start(handler)
+    guest.Wait()
+}
+```
+
 ### Handling Long-Running Operations (Async Call Pattern)
 
 The default timeout for operations is 10 seconds. For operations that may exceed this duration, or for asynchronous workflows, do **not** block the IPC channel. Instead, use the following pattern:

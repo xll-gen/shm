@@ -42,6 +42,10 @@ const (
 	MsgTypeFlatbuffer    MsgType = 10
 	// MsgTypeGuestCall indicates a Guest Call payload.
 	MsgTypeGuestCall     MsgType = 11
+	// MsgTypeStreamStart indicates a Stream Start payload.
+	MsgTypeStreamStart   MsgType = 13
+	// MsgTypeStreamChunk indicates a Stream Chunk payload.
+	MsgTypeStreamChunk   MsgType = 14
 	// MsgTypeSystemError indicates a system-level error (e.g. overflow).
 	MsgTypeSystemError   MsgType = 127
 	// MsgTypeAppStart is the start of Application Specific message types.
