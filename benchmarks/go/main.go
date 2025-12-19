@@ -24,6 +24,7 @@ var (
 	cpuProfile    = flag.String("cpuprofile", "", "Write cpu profile to file")
 	memProfile    = flag.String("memprofile", "", "Write memory profile to file")
 	guestCallMode = flag.Bool("guest-call", false, "Enable Guest Call benchmark mode")
+	streamMode    = flag.Bool("stream", false, "Enable Stream benchmark mode")
 )
 
 func main() {
@@ -44,6 +45,7 @@ func main() {
 	fmt.Printf("  SHM Name: %s\n", *shmName)
 	fmt.Printf("  Workers: %d\n", *numWorkers)
 	fmt.Printf("  Guest Call Mode: %v\n", *guestCallMode)
+	fmt.Printf("  Stream Mode: %v\n", *streamMode)
 
 	// High-level Client API
 	client, err := shm.Connect(shm.ClientConfig{
@@ -56,8 +58,8 @@ func main() {
 	}
 	defer client.Close()
 
-	// Handler
-	handler := func(req []byte, respBuf []byte, msgType shm.MsgType) (int32, shm.MsgType) {
+	// Base Handler
+	baseHandler := func(req []byte, respBuf []byte, msgType shm.MsgType) (int32, shm.MsgType) {
 		// Verify Header?
 		// Benchmark C++ client sends [8 byte ID][Payload]
 		// We just echo it back.
@@ -68,6 +70,22 @@ func main() {
 		// Just copy req to respBuf
 		copy(respBuf, req)
 		return int32(len(req)), shm.MsgTypeNormal
+	}
+
+	var handler func(req []byte, respBuf []byte, msgType shm.MsgType) (int32, shm.MsgType)
+	if *streamMode {
+		streamCount := uint64(0)
+		handler = shm.NewStreamReassembler(func(streamID uint64, data []byte) {
+			newVal := atomic.AddUint64(&streamCount, 1)
+			if *verbose {
+				fmt.Printf("Received Stream: ID=%d, Size=%d\n", streamID, len(data))
+			}
+			if newVal%100 == 0 {
+				// Log occasionally?
+			}
+		}, baseHandler)
+	} else {
+		handler = baseHandler
 	}
 
 	client.Handle(handler)
