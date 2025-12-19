@@ -55,7 +55,7 @@ std::string FormatNumber(double n) {
     return s;
 }
 
-void WorkerThread(DirectHost* host, int id) {
+void WorkerThread(DirectHost* host, int id, int totalSlots) {
     std::vector<uint8_t> req(DATA_SIZE);
     for (int i = 0; i < DATA_SIZE; ++i) req[i] = (uint8_t)(i % 256);
 
@@ -68,7 +68,19 @@ void WorkerThread(DirectHost* host, int id) {
     int errorLogCount = 0;
     const int MAX_ERROR_LOGS = 5;
 
-    StreamSender streamSender(host);
+    // Calculate maxInFlight based on totalSlots.
+    // If we have N threads and N slots, each thread can only use 1 slot effectively.
+    // To support pipelining (maxInFlight > 1), we need numHostSlots > NUM_THREADS.
+    // But in this benchmark, numHostSlots = NUM_THREADS.
+    // So we must set maxInFlight = 1 to avoid deadlock.
+    // If the user wants to test pipelining, they should run with fewer threads or we should allocate more slots.
+    // For now, let's clamp to 1 if slots/threads ratio is tight.
+    int maxInFlight = 1;
+
+    // If we had more slots, we could increase this.
+    // But currently main sets numHostSlots = NUM_THREADS.
+
+    StreamSender streamSender(host, maxInFlight);
 
     while (running) {
         localReqId++;
@@ -252,7 +264,7 @@ int main(int argc, char** argv) {
     // Start Workers
     std::vector<std::thread> threads;
     for (int i = 0; i < NUM_THREADS; ++i) {
-        threads.emplace_back(WorkerThread, &host, i);
+        threads.emplace_back(WorkerThread, &host, i, NUM_THREADS);
     }
 
     // Run for Duration
