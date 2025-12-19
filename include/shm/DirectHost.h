@@ -663,6 +663,27 @@ public:
     }
 
     /**
+     * @brief Manually signals the Request Event for a slot.
+     * Used for custom protocols like RingBuffer.
+     */
+    void SignalSlot(int32_t slotIdx) {
+        if (slotIdx < 0 || slotIdx >= (int32_t)numSlots) return;
+        Platform::SignalEvent(slots[slotIdx].hReqEvent);
+    }
+
+    /**
+     * @brief Manually waits on the Response Event for a slot.
+     * Used for custom protocols like RingBuffer.
+     * @param slotIdx The slot index.
+     * @param timeoutMs Timeout in milliseconds.
+     * @return true if signaled, false if timeout.
+     */
+    bool WaitForSlotEvent(int32_t slotIdx, uint32_t timeoutMs = 0xFFFFFFFF) {
+        if (slotIdx < 0 || slotIdx >= (int32_t)numSlots) return false;
+        return Platform::WaitEvent(slots[slotIdx].hRespEvent, timeoutMs);
+    }
+
+    /**
      * @brief Sends a request asynchronously using an acquired slot.
      * Does not wait for response. The slot remains BUSY until WaitForSlot is called.
      * @return Result<void> Success or Error.
