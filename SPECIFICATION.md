@@ -100,8 +100,8 @@ The `state` field in `SlotHeader` manages the ownership of the slot.
 | `MSG_TYPE_SHUTDOWN` | 3 | Signal to terminate worker loop. |
 | `MSG_TYPE_FLATBUFFER` | 10 | Zero-Copy FlatBuffer (End-aligned). |
 | `MSG_TYPE_GUEST_CALL` | 11 | Guest-initiated call to Host. |
-| `MSG_TYPE_STREAM_START` | 13 | Start of a streaming transfer (Host -> Guest). |
-| `MSG_TYPE_STREAM_CHUNK` | 14 | Chunk of a streaming transfer (Host -> Guest). |
+| `MSG_TYPE_STREAM_START` | 13 | Start of a streaming transfer. |
+| `MSG_TYPE_STREAM_CHUNK` | 14 | Chunk of a streaming transfer. |
 | `MSG_TYPE_APP_START` | 128 | Start of user-defined message types. |
 
 ### 3.3. Streaming Protocol
