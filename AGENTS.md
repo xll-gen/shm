@@ -64,3 +64,26 @@ When creating a release tag, follow these steps:
 *   **Streaming:** For large data transfer, use the Streaming API (`shm::StreamSender` / `shm.NewStreamReassembler`) which implements double-buffering over the Direct Exchange model.
 *   **Git Workflow:** Always resolve conflicts with the `main` branch before submitting.
 *   All documentation, code comments, commit messages, and other project-related text must be in English.
+
+## **Co-Change Clusters**
+
+Certain parts of the codebase are tightly coupled and must be updated together to preserve consistency.
+
+### **Protocol & Memory Layout**
+The Shared Memory layout is the contract between C++ (Host) and Go (Guest).
+1.  **Specification**: `SPECIFICATION.md` is the Single Source of Truth. Update this first.
+2.  **C++ Headers**: `include/shm/IPCUtils.h` (Structs like `ExchangeHeader`, `SlotHeader`).
+3.  **Go Types**: `go/direct.go` (Structs like `ExchangeHeader`, `SlotHeader`).
+**Constraint**: These must be byte-compatible. Check alignment and padding carefully.
+
+### **Platform Primitives**
+Synchronization primitives must behave identically across languages and OSs.
+1.  **C++ Interface**: `include/shm/Platform.h`.
+2.  **Go Implementation**: `go/platform.go`, `go/platform_linux.go`, `go/platform_windows.go`.
+**Constraint**: If you add a feature (e.g., timeout) to C++, you must implement it in Go.
+
+### **Feature Parity (Host <-> Guest)**
+Logic changes often require symmetric updates.
+1.  **Host Logic**: `include/shm/DirectHost.h` (e.g., `Send`, `ProcessGuestCalls`).
+2.  **Guest Logic**: `go/direct.go` / `go/client.go` (e.g., `workerLoop`, `SendGuestCall`).
+**Constraint**: A new message type or flow (e.g., Streaming) must be supported on both sides.
