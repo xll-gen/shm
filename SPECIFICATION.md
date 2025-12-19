@@ -100,9 +100,39 @@ The `state` field in `SlotHeader` manages the ownership of the slot.
 | `MSG_TYPE_SHUTDOWN` | 3 | Signal to terminate worker loop. |
 | `MSG_TYPE_FLATBUFFER` | 10 | Zero-Copy FlatBuffer (End-aligned). |
 | `MSG_TYPE_GUEST_CALL` | 11 | Guest-initiated call to Host. |
+| `MSG_TYPE_STREAM_START` | 13 | Start of a streaming transfer (Host -> Guest). |
+| `MSG_TYPE_STREAM_CHUNK` | 14 | Chunk of a streaming transfer (Host -> Guest). |
 | `MSG_TYPE_APP_START` | 128 | Start of user-defined message types. |
 
-### 3.3. Data Alignment (Negative Size)
+### 3.3. Streaming Protocol
+
+For large data transfers, the `STREAM_START` and `STREAM_CHUNK` message types are used. These messages contain specific headers within the Request Buffer.
+
+#### 3.3.1. StreamHeader (MSG_TYPE_STREAM_START)
+
+| Field | Type | Offset | Description |
+| :--- | :--- | :--- | :--- |
+| `streamId` | `uint64` | 0 | Unique identifier for the stream. |
+| `totalSize` | `uint64` | 8 | Total size of the data to be transferred. |
+| `totalChunks` | `uint32` | 16 | Total number of chunks. |
+| `reserved` | `uint32` | 20 | Reserved (Padding to 24 bytes). |
+
+**Total Size:** 24 Bytes.
+
+#### 3.3.2. ChunkHeader (MSG_TYPE_STREAM_CHUNK)
+
+| Field | Type | Offset | Description |
+| :--- | :--- | :--- | :--- |
+| `streamId` | `uint64` | 0 | Unique identifier for the stream. |
+| `chunkIndex` | `uint32` | 8 | Index of this chunk (0-based). |
+| `payloadSize` | `uint32` | 12 | Size of the payload following this header. |
+| `reserved` | `uint32` | 16 | Reserved. |
+| `padding` | `uint32` | 20 | Padding to ensure 8-byte alignment (Total 24 bytes). |
+
+**Total Size:** 24 Bytes.
+The payload follows immediately after the `ChunkHeader`.
+
+### 3.4. Data Alignment (Negative Size)
 
 The `reqSize` and `respSize` fields indicate the location of the data within the buffer:
 - **Positive (> 0):** Data starts at the beginning of the buffer (Offset 0).
