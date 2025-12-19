@@ -117,14 +117,12 @@ public:
 
                  auto res = host->SendAcquiredAsync(slotIdx, sizeof(ChunkHeader) + currentChunkSize, MsgType::STREAM_CHUNK);
                  if (res.HasError()) {
-                      // Release acquired slot if failed
-                      // Actually SendAcquiredAsync failures are rare (Args) and it doesn't leak activeWait unless success?
-                      // Wait. SendAcquiredAsync logic:
-                      // if (slotIdx invalid) return Fail
-                      // if (buffer too small) store(FREE); return Fail
-                      // Success -> sets REQ_READY, signals.
-                      // So if it fails, slot is FREE.
-                      // If it succeeds, slot is BUSY/REQ_READY.
+                      while (!pendingSlots.empty()) {
+                          int32_t s = pendingSlots.front();
+                          pendingSlots.pop();
+                          std::vector<uint8_t> dummy;
+                          host->WaitForSlot(s, dummy, 1);
+                      }
                       return Result<void>::Failure(res.GetError());
                  }
 
@@ -143,6 +141,12 @@ public:
                   pendingSlots.pop();
 
                   if (res.HasError()) {
+                       while (!pendingSlots.empty()) {
+                           int32_t s2 = pendingSlots.front();
+                           pendingSlots.pop();
+                           std::vector<uint8_t> d2;
+                           host->WaitForSlot(s2, d2, 1);
+                       }
                        return Result<void>::Failure(res.GetError());
                   }
              }
