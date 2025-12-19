@@ -1,5 +1,19 @@
 # Changelog
 
+## [v0.6.0] - 2025-12-14
+
+### Streaming API (Double Buffering)
+- Introduced `StreamSender` (C++) and `NewStreamReassembler` (Go) for high-throughput large data transfer.
+- Implements Double Buffering (pipelining) over the Direct Exchange protocol.
+- Added `MSG_TYPE_STREAM_START` (13) and `MSG_TYPE_STREAM_CHUNK` (14).
+
+### API Additions
+- `DirectHost::SendAcquiredAsync`: Non-blocking send for pipelining.
+- `DirectHost::WaitForSlot`: Deferred response waiting.
+
+### Documentation
+- Updated `README.md` and `SPECIFICATION.md` with Streaming details.
+
 ## [v0.5.4] - 2025-12-13
 
 ### Experimental Status

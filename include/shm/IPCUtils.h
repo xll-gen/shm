@@ -34,11 +34,11 @@ namespace shm {
 static const uint32_t SHM_MAGIC = 0x584C4C21;
 
 /**
- * @brief Protocol Version v0.5.0 (0x00050000).
+ * @brief Protocol Version v0.6.0 (0x00060000).
  * High 16 bits: Major, Low 16 bits: Minor.
  * Breaking changes increment Major version.
  */
-static const uint32_t SHM_VERSION = 0x00050000;
+static const uint32_t SHM_VERSION = 0x00060000;
 
 /**
  * @brief Message Types for control messages.

@@ -61,8 +61,8 @@ const (
 
 	// Magic is the magic number for validating shared memory ("XLL!").
 	Magic uint32 = 0x584C4C21
-	// Version is the current protocol version (v0.5.0).
-	Version uint32 = 0x00050000
+	// Version is the current protocol version (v0.6.0).
+	Version uint32 = 0x00060000
 
 	// HostStateActive indicates the Host is spinning or processing.
 	HostStateActive  = 0

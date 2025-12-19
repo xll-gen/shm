@@ -1,4 +1,4 @@
-# Shared Memory IPC Specification (v0.5.3)
+# Shared Memory IPC Specification (v0.6.0)
 
 This document defines the specification for the `xll-gen/shm` Shared Memory IPC system. It serves as the authoritative reference for implementing the protocol in any language (C++, Go, Python, Rust, etc.).
 
