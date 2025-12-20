@@ -2,6 +2,7 @@ package shm
 
 import (
 	"fmt"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -345,6 +346,10 @@ func (g *DirectGuest) SendGuestCallWithTimeout(data []byte, msgType MsgType, tim
 }
 
 func (g *DirectGuest) sendGuestCallInternal(data []byte, buffer []byte, msgType MsgType, timeout time.Duration) ([]byte, error) {
+	if len(data) > math.MaxInt32 {
+		return nil, fmt.Errorf("data too large: %d exceeds max int32", len(data))
+	}
+
 	if g.numGuestSlots == 0 {
 		return nil, fmt.Errorf("no guest slots available")
 	}
