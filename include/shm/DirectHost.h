@@ -371,6 +371,11 @@ public:
      * @return Result<void> Success or Error.
      */
     Result<void> Init(const HostConfig& config) {
+        // Ensure sharedState is valid for this new session
+        if (!sharedState) {
+            sharedState = std::make_shared<SharedState>();
+        }
+
         SHM_LOG_INFO("Initializing DirectHost with shmName: ", config.shmName,
                      ", numHostSlots: ", config.numHostSlots,
                      ", numGuestSlots: ", config.numGuestSlots,
@@ -494,6 +499,10 @@ public:
     /** @brief Shuts down the host, closing all handles and unmapping memory. */
     void Shutdown() {
         if (!running) return;
+
+        // Invalidate all outstanding ZeroCopySlots immediately.
+        // This prevents Use-After-Free in ZeroCopySlot destructors if they race with unmapping.
+        sharedState.reset();
 
         SHM_LOG_INFO("Shutting down DirectHost: ", shmName);
 
