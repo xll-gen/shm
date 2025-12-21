@@ -1,12 +1,11 @@
 #pragma once
 
-#include "DirectHost.h"
 #include "Stream.h"
-#include <map>
 #include <vector>
-#include <mutex>
+#include <unordered_map>
 #include <functional>
 #include <cstring>
+#include <mutex>
 #include <chrono>
 
 namespace shm {
@@ -16,113 +15,178 @@ namespace shm {
  * @brief Configuration limits for StreamReassembler.
  */
 struct StreamReassemblerConfig {
-    uint64_t maxStreamSize = 256 * 1024 * 1024; // 256 MB Limit
-    uint32_t maxChunks = 65536;                 // 64k chunks
+    size_t maxStreamSize = 128 * 1024 * 1024; // 128MB
+    size_t maxStreams = 100;
+    uint32_t streamTimeoutMs = 10000;
 };
 
 /**
  * @class StreamReassembler
  * @brief Helper class to reassemble streams received via Guest Calls.
+ * Thread-safe.
  */
 class StreamReassembler {
 public:
-    using OnStreamCallback = std::function<void(uint64_t streamId, const std::vector<uint8_t>& data)>;
-    using FallbackHandler = std::function<int32_t(const uint8_t*, int32_t, uint8_t*, uint32_t, MsgType)>;
+    /**
+     * @brief Callback function invoked when a stream is fully reassembled.
+     * @param streamId The ID of the stream.
+     * @param data The reassembled data.
+     */
+    using OnStreamFn = std::function<void(uint64_t streamId, const std::vector<uint8_t>& data)>;
 
 private:
     struct StreamContext {
         uint64_t totalSize;
         uint32_t totalChunks;
-        uint32_t chunksReceived;
-        std::vector<std::vector<uint8_t>> chunks; // Store chunks until reassembly
+        uint32_t receivedChunks;
+        std::vector<std::vector<uint8_t>> chunks;
         std::chrono::steady_clock::time_point startTime;
     };
 
-    std::map<uint64_t, StreamContext> streams;
-    std::mutex mutex;
-    OnStreamCallback onStream;
-    FallbackHandler fallback;
+    std::unordered_map<uint64_t, StreamContext> streams;
+    std::mutex streamsMutex;
+    OnStreamFn onStream;
     StreamReassemblerConfig config;
+
+    void PruneInternal() {
+        auto now = std::chrono::steady_clock::now();
+        for (auto it = streams.begin(); it != streams.end(); ) {
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - it->second.startTime).count();
+            if (elapsed > config.streamTimeoutMs) {
+                it = streams.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
 
 public:
     /**
      * @brief Constructs a StreamReassembler.
-     * @param onStreamCb Callback invoked when a stream is fully reassembled.
-     * @param fallbackCb Callback invoked for non-stream messages.
-     * @param cfg Configuration limits.
+     * @param callback Function to call when a stream is completed.
+     * @param cfg Configuration object.
      */
-    StreamReassembler(OnStreamCallback onStreamCb, FallbackHandler fallbackCb = nullptr, StreamReassemblerConfig cfg = StreamReassemblerConfig())
-        : onStream(onStreamCb), fallback(fallbackCb), config(cfg) {}
+    StreamReassembler(OnStreamFn callback, StreamReassemblerConfig cfg = StreamReassemblerConfig())
+        : onStream(callback), config(cfg) {}
 
     /**
-     * @brief Handles a Guest Call message.
-     * Matches the signature required by DirectHost::ProcessGuestCalls.
+     * @brief Handles a guest call message.
+     * Use this within your DirectHost::ProcessGuestCalls handler.
+     *
+     * @param req Pointer to request buffer.
+     * @param reqSize Size of request.
+     * @param resp Pointer to response buffer.
+     * @param respSize Reference to response size (output).
+     * @param msgType Reference to message type (input/output).
+     * @return true if the message was a stream message and was handled.
      */
-    int32_t Handle(const uint8_t* reqData, int32_t reqSize, uint8_t* respBuf, uint32_t maxRespSize, MsgType msgType) {
+    bool Handle(const void* req, size_t reqSize, void* resp, size_t& respSize, MsgType& msgType) {
         if (msgType == MsgType::STREAM_START) {
-            if (reqSize < (int32_t)sizeof(StreamHeader)) {
-                return 0; // Error, but we just ACK with 0 to clear slot
+            if (reqSize < sizeof(StreamHeader)) {
+                msgType = MsgType::SYSTEM_ERROR;
+                respSize = 0;
+                return true;
             }
-            StreamHeader header;
-            memcpy(&header, reqData, sizeof(StreamHeader));
 
-            if (header.totalSize > config.maxStreamSize) {
-                // Reject: Too large
-                return 0;
-            }
-            if (header.totalChunks > config.maxChunks) {
-                // Reject: Too many chunks (DoS protection for vector resize)
-                return 0;
-            }
-            if (header.totalChunks == 0 && header.totalSize > 0) return 0; // Invalid
+            const StreamHeader* header = static_cast<const StreamHeader*>(req);
 
-            std::unique_lock<std::mutex> lock(mutex);
-            StreamContext& ctx = streams[header.streamId];
-            ctx.totalSize = header.totalSize;
-            ctx.totalChunks = header.totalChunks;
-            ctx.chunksReceived = 0;
-            try {
-                ctx.chunks.resize(header.totalChunks);
-            } catch (...) {
-                streams.erase(header.streamId);
-                return 0; // Alloc fail
+            // Checks
+            if (header->totalSize > config.maxStreamSize) {
+                 msgType = MsgType::SYSTEM_ERROR;
+                 respSize = 0;
+                 return true;
             }
+
+            // Empty Stream or Zero Chunks
+            if (header->totalSize == 0 || header->totalChunks == 0) {
+                 std::vector<uint8_t> empty;
+                 onStream(header->streamId, empty);
+                 msgType = MsgType::NORMAL;
+                 respSize = 0;
+                 return true;
+            }
+
+            std::lock_guard<std::mutex> lock(streamsMutex);
+            if (streams.size() >= config.maxStreams) {
+                PruneInternal();
+                if (streams.size() >= config.maxStreams) {
+                     msgType = MsgType::SYSTEM_ERROR; // Too many streams
+                     respSize = 0;
+                     return true;
+                }
+            }
+
+            StreamContext ctx;
+            ctx.totalSize = header->totalSize;
+            ctx.totalChunks = header->totalChunks;
+            ctx.receivedChunks = 0;
             ctx.startTime = std::chrono::steady_clock::now();
 
-            return 0; // ACK
+            try {
+                ctx.chunks.resize(ctx.totalChunks);
+            } catch (...) {
+                msgType = MsgType::SYSTEM_ERROR; // OOM
+                respSize = 0;
+                return true;
+            }
+
+            streams[header->streamId] = std::move(ctx);
+
+            msgType = MsgType::NORMAL;
+            respSize = 0;
+            return true;
         }
 
         if (msgType == MsgType::STREAM_CHUNK) {
-            if (reqSize < (int32_t)sizeof(ChunkHeader)) {
-                return 0;
-            }
-            ChunkHeader header;
-            memcpy(&header, reqData, sizeof(ChunkHeader));
-
-            uint32_t headerSize = sizeof(ChunkHeader);
-            if ((int32_t)header.payloadSize > reqSize - (int32_t)headerSize) {
-                // Truncated payload?
-                return 0;
+            if (reqSize < sizeof(ChunkHeader)) {
+                msgType = MsgType::SYSTEM_ERROR;
+                respSize = 0;
+                return true;
             }
 
-            std::unique_lock<std::mutex> lock(mutex);
-            auto it = streams.find(header.streamId);
+            const ChunkHeader* header = static_cast<const ChunkHeader*>(req);
+            if (reqSize < sizeof(ChunkHeader) + header->payloadSize) {
+                 msgType = MsgType::SYSTEM_ERROR;
+                 respSize = 0;
+                 return true;
+            }
+
+            std::unique_lock<std::mutex> lock(streamsMutex);
+            auto it = streams.find(header->streamId);
             if (it == streams.end()) {
-                return 0; // Unknown stream (or timed out/rejected)
+                 msgType = MsgType::SYSTEM_ERROR;
+                 respSize = 0;
+                 return true;
             }
 
             StreamContext& ctx = it->second;
-            if (header.chunkIndex >= ctx.chunks.size()) {
-                return 0; // Invalid index
+
+            if (header->chunkIndex >= ctx.chunks.size()) {
+                 msgType = MsgType::SYSTEM_ERROR;
+                 respSize = 0;
+                 return true;
             }
 
-            if (ctx.chunks[header.chunkIndex].empty()) {
-                ctx.chunks[header.chunkIndex].assign(reqData + headerSize, reqData + headerSize + header.payloadSize);
-                ctx.chunksReceived++;
+            // Idempotency: If already received, ignore
+            if (!ctx.chunks[header->chunkIndex].empty()) {
+                msgType = MsgType::NORMAL;
+                respSize = 0;
+                return true;
             }
 
-            if (ctx.chunksReceived == ctx.totalChunks) {
-                // Reassemble
+            const uint8_t* payloadPtr = static_cast<const uint8_t*>(req) + sizeof(ChunkHeader);
+            try {
+                ctx.chunks[header->chunkIndex].assign(payloadPtr, payloadPtr + header->payloadSize);
+            } catch (...) {
+                 msgType = MsgType::SYSTEM_ERROR;
+                 respSize = 0;
+                 return true;
+            }
+
+            ctx.receivedChunks++;
+
+            if (ctx.receivedChunks == ctx.totalChunks) {
+                // Assemble
                 std::vector<uint8_t> fullData;
                 try {
                     fullData.reserve(ctx.totalSize);
@@ -131,44 +195,31 @@ public:
                     }
                 } catch(...) {
                      streams.erase(it);
-                     return 0;
+                     msgType = MsgType::SYSTEM_ERROR;
+                     respSize = 0;
+                     return true;
                 }
 
-                uint64_t sId = header.streamId;
                 streams.erase(it);
-                lock.unlock(); // Explicit unlock before callback
+                lock.unlock(); // Unlock before callback to prevent deadlock
 
-                if (onStream) {
-                    onStream(sId, fullData);
-                }
+                onStream(header->streamId, fullData);
             }
 
-            return 0; // ACK
+            msgType = MsgType::NORMAL;
+            respSize = 0;
+            return true;
         }
 
-        if (fallback) {
-            return fallback(reqData, reqSize, respBuf, maxRespSize, msgType);
-        }
-
-        return 0; // Default ACK
+        return false;
     }
 
     /**
-     * @brief Removes incomplete streams that have exceeded the timeout.
-     * Call this method periodically.
-     * @param timeout Max duration a stream can stay in memory.
+     * @brief Prunes timed-out streams.
      */
-    void Prune(std::chrono::milliseconds timeout) {
-        auto now = std::chrono::steady_clock::now();
-        std::unique_lock<std::mutex> lock(mutex);
-        for (auto it = streams.begin(); it != streams.end(); ) {
-            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - it->second.startTime);
-            if (elapsed > timeout) {
-                 it = streams.erase(it);
-            } else {
-                 ++it;
-            }
-        }
+    void Prune() {
+        std::lock_guard<std::mutex> lock(streamsMutex);
+        PruneInternal();
     }
 };
 

@@ -3,96 +3,205 @@ package shm
 import (
 	"encoding/binary"
 	"fmt"
-	"math"
+	"sync"
+	"time"
 	"unsafe"
 )
 
-// StreamSender allows the Guest to send large data streams to the Host.
+// StreamSender helps sending large data streams to the Host (Guest Stream).
 type StreamSender struct {
-	guest *DirectGuest
+	client      *Client
+	maxInFlight int
 }
 
-// NewStreamSender creates a new StreamSender for the given DirectGuest.
-func NewStreamSender(g *DirectGuest) *StreamSender {
+// NewStreamSender creates a new StreamSender.
+// c: The Client instance.
+// maxInFlight: Max number of concurrent chunks (pipelining). Default 2.
+func NewStreamSender(c *Client, maxInFlight int) *StreamSender {
+	if maxInFlight <= 0 {
+		maxInFlight = 2
+	}
 	return &StreamSender{
-		guest: g,
+		client:      c,
+		maxInFlight: maxInFlight,
 	}
 }
 
-// NewStreamSenderFromClient creates a new StreamSender using the Client's underlying DirectGuest.
-func NewStreamSenderFromClient(c *Client) *StreamSender {
-	return &StreamSender{
-		guest: c.guest,
-	}
-}
-
-// Send sends data to the Host as a stream.
-// It splits the data into chunks and sends them sequentially using Guest Calls.
-// This function blocks until the entire stream is sent or an error occurs.
+// Send sends a large payload as a stream.
+// It blocks until the stream is fully sent.
 func (s *StreamSender) Send(data []byte, streamID uint64) error {
-	if s.guest == nil {
-		return fmt.Errorf("guest is nil")
+	if s.client == nil {
+		return fmt.Errorf("client is nil")
 	}
+
+	// 1. Send Stream Start (Synchronous)
+	{
+		// Acquire a slot
+		var slot *GuestSlot
+		var err error
+		for i := 0; i < 1000; i++ {
+			slot, err = s.client.AcquireGuestSlot()
+			if err == nil {
+				break
+			}
+			time.Sleep(1 * time.Millisecond)
+		}
+		if slot == nil {
+			return fmt.Errorf("failed to acquire slot for Stream Start: %v", err)
+		}
+
+		reqBuf := slot.RequestBuffer()
+
+		headerSize := int(unsafe.Sizeof(StreamHeader{}))
+		if len(reqBuf) < headerSize {
+			slot.Release()
+			return fmt.Errorf("slot buffer too small for StreamHeader")
+		}
+
+		// Calculate chunks
+		chunkHeaderSize := int(unsafe.Sizeof(ChunkHeader{}))
+		maxPayload := len(reqBuf) - chunkHeaderSize
+		if maxPayload <= 0 {
+			slot.Release()
+			return fmt.Errorf("slot buffer too small for ChunkHeader")
+		}
+
+		totalChunks := (len(data) + maxPayload - 1) / maxPayload
+		if len(data) == 0 {
+			totalChunks = 0
+		}
+
+		// Write Header manually
+        if len(reqBuf) < 24 { // StreamHeader is 24 bytes
+            slot.Release()
+            return fmt.Errorf("buffer too small")
+        }
+
+        binary.LittleEndian.PutUint64(reqBuf[0:], streamID)
+        binary.LittleEndian.PutUint64(reqBuf[8:], uint64(len(data)))
+        binary.LittleEndian.PutUint32(reqBuf[16:], uint32(totalChunks))
+        binary.LittleEndian.PutUint32(reqBuf[20:], 0) // Reserved
+
+		// Send
+		_, _, err = slot.Send(int32(headerSize), MsgTypeStreamStart)
+		slot.Release()
+		if err != nil {
+			return fmt.Errorf("failed to send Stream Start: %v", err)
+		}
+	}
+
+	// 2. Send Chunks
 	if len(data) == 0 {
 		return nil
 	}
 
-	// Calculate Max Payload Size per chunk
-	maxReq := int(s.guest.respOffset - s.guest.reqOffset)
-	chunkHeaderSize := int(unsafe.Sizeof(ChunkHeader{}))
+	// Use a semaphore to limit concurrent chunks
+	sem := make(chan struct{}, s.maxInFlight)
+	errChan := make(chan error, 1)
+	var wg sync.WaitGroup
 
-	if maxReq <= chunkHeaderSize {
-		return fmt.Errorf("slot size too small for stream chunk header")
-	}
-
-	maxPayload := maxReq - chunkHeaderSize
-	totalSize := uint64(len(data))
-	totalChunks := uint32(math.Ceil(float64(totalSize) / float64(maxPayload)))
-
-	// 1. Send Stream Start
-	// StreamHeader: StreamID(8) + TotalSize(8) + TotalChunks(4) + Reserved(4) = 24 bytes
-	headerBuf := make([]byte, 24)
-	binary.LittleEndian.PutUint64(headerBuf[0:8], streamID)
-	binary.LittleEndian.PutUint64(headerBuf[8:16], totalSize)
-	binary.LittleEndian.PutUint32(headerBuf[16:20], totalChunks)
-	// Reserved is 0
-
-	_, err := s.guest.SendGuestCall(headerBuf, MsgTypeStreamStart)
-	if err != nil {
-		return fmt.Errorf("failed to send stream start: %v", err)
-	}
-
-	// 2. Send Chunks
 	offset := 0
-	for i := uint32(0); i < totalChunks; i++ {
+	chunkIndex := uint32(0)
+
+	for offset < len(data) {
+		// Check for errors
+		select {
+		case err := <-errChan:
+			wg.Wait()
+			return err
+		default:
+		}
+
+		sem <- struct{}{} // Acquire token
+		wg.Add(1)
+
+		// Acquire Slot Loop
+		var slot *GuestSlot
+		var err error
+		for {
+			slot, err = s.client.AcquireGuestSlot()
+			if err == nil {
+				break
+			}
+
+			// Check if any error occurred while waiting
+			select {
+			case e := <-errChan:
+				<-sem // Release token
+				wg.Done()
+				return e
+			default:
+			}
+
+			time.Sleep(100 * time.Microsecond)
+		}
+
+		reqBuf := slot.RequestBuffer()
+		chunkHeaderSize := int(unsafe.Sizeof(ChunkHeader{}))
+		maxPayload := len(reqBuf) - chunkHeaderSize
+
 		end := offset + maxPayload
 		if end > len(data) {
 			end = len(data)
 		}
-		chunkPayload := data[offset:end]
-		payloadSize := uint32(len(chunkPayload))
 
-		// ChunkHeader: StreamID(8) + ChunkIndex(4) + PayloadSize(4) + Reserved(4) + Padding(4) = 24 bytes?
-		// Wait, ChunkHeader in Go is defined in stream.go
-		// type ChunkHeader struct { ... Padding uint32 }
-		// Manual serialization:
+		chunkData := data[offset:end]
+		chunkSize := len(chunkData)
 
-		msgBuf := make([]byte, chunkHeaderSize+int(payloadSize))
+		go func(slot *GuestSlot, chunkSlice []byte, idx uint32) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			defer slot.Release()
 
-		binary.LittleEndian.PutUint64(msgBuf[0:8], streamID)
-		binary.LittleEndian.PutUint32(msgBuf[8:12], i)
-		binary.LittleEndian.PutUint32(msgBuf[12:16], payloadSize)
-		// Reserved (16-20) is 0
-		// Padding (20-24) is 0
+			reqBuf := slot.RequestBuffer()
 
-		copy(msgBuf[chunkHeaderSize:], chunkPayload)
+			if len(reqBuf) < chunkHeaderSize+len(chunkSlice) {
+				select {
+				case errChan <- fmt.Errorf("buffer overflow"):
+				default:
+				}
+				return
+			}
 
-		_, err := s.guest.SendGuestCall(msgBuf, MsgTypeStreamChunk)
-		if err != nil {
-			return fmt.Errorf("failed to send stream chunk %d: %v", i, err)
-		}
+			// Write Header manually
+            // ChunkHeader is 24 bytes (with padding)
+            if len(reqBuf) < 24 {
+                select {
+				case errChan <- fmt.Errorf("buffer too small for ChunkHeader"):
+				default:
+				}
+                return
+            }
 
-		offset += int(payloadSize)
+            binary.LittleEndian.PutUint64(reqBuf[0:], streamID)
+            binary.LittleEndian.PutUint32(reqBuf[8:], idx)
+            binary.LittleEndian.PutUint32(reqBuf[12:], uint32(len(chunkSlice)))
+            binary.LittleEndian.PutUint32(reqBuf[16:], 0) // Reserved
+            binary.LittleEndian.PutUint32(reqBuf[20:], 0) // Padding
+
+			// Write Data
+			copy(reqBuf[chunkHeaderSize:], chunkSlice)
+
+			// Send
+			_, _, err := slot.Send(int32(chunkHeaderSize+len(chunkSlice)), MsgTypeStreamChunk)
+			if err != nil {
+				select {
+				case errChan <- err:
+				default:
+				}
+			}
+		}(slot, chunkData, chunkIndex)
+
+		offset += chunkSize
+		chunkIndex++
+	}
+
+	wg.Wait()
+
+	select {
+	case err := <-errChan:
+		return err
+	default:
 	}
 
 	return nil
