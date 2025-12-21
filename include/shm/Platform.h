@@ -121,6 +121,28 @@ public:
     }
 
     /**
+     * @brief Opens an existing named event.
+     *
+     * @param name The name of the event.
+     * @return EventHandle The handle.
+     */
+    static EventHandle OpenEvent(const char* name) {
+#ifdef _WIN32
+        std::string s_name(name);
+        std::wstring w_name(s_name.begin(), s_name.end());
+        std::wstring final_ev_name = L"Local\\" + w_name;
+        return OpenEventW(EVENT_ALL_ACCESS, FALSE, final_ev_name.c_str());
+#else
+        std::string evName = "/" + std::string(name);
+        EventHandle sem = sem_open(evName.c_str(), 0);
+        if (sem == SEM_FAILED) {
+            return nullptr;
+        }
+        return sem;
+#endif
+    }
+
+    /**
      * @brief Unlinks the named event (removes it from the system).
      *
      * @param name The name of the event.
@@ -194,6 +216,57 @@ public:
 #else
         if (addr) munmap(addr, size);
         if (h >= 0) close(h);
+#endif
+    }
+
+    /**
+     * @brief Opens an existing named shared memory region.
+     *
+     * @param name The name of the shared memory region.
+     * @param size The expected size (for mapping).
+     * @param[out] outRealSize The actual size of the region.
+     * @param[out] outAddr The mapped address.
+     * @return ShmHandle The handle.
+     */
+    static ShmHandle OpenShm(const char* name, uint64_t size, uint64_t& outRealSize, void*& outAddr) {
+        outAddr = nullptr;
+        outRealSize = 0;
+#ifdef _WIN32
+        std::string s_name(name);
+        std::wstring w_name(s_name.begin(), s_name.end());
+        std::wstring final_shm_name = L"Local\\" + w_name;
+        ShmHandle h = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, final_shm_name.c_str());
+        if (!h) return 0;
+
+        outAddr = MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0, 0);
+        if (outAddr) {
+             MEMORY_BASIC_INFORMATION info;
+             VirtualQuery(outAddr, &info, sizeof(info));
+             outRealSize = info.RegionSize;
+        }
+        return h;
+#else
+        std::string shmName = "/" + std::string(name);
+        int fd = shm_open(shmName.c_str(), O_RDWR, 0666);
+        if (fd < 0) return -1;
+
+        struct stat st;
+        if (fstat(fd, &st) == -1) {
+            close(fd);
+            return -1;
+        }
+        outRealSize = st.st_size;
+
+        if (size == 0) size = st.st_size;
+
+        void* addr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (addr == MAP_FAILED) {
+            close(fd);
+            outAddr = nullptr;
+            return -1;
+        }
+        outAddr = addr;
+        return fd;
 #endif
     }
 
