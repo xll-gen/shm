@@ -13,12 +13,13 @@ package shm
 // Helper to open semaphore
 sem_t* create_sem(const char* name) {
 	// O_CREAT with permissions 0644, init value 0
-	return sem_open(name, O_CREAT, 0644, 0);
+    // O_CLOEXEC to prevent leak to child processes
+	return sem_open(name, O_CREAT | O_CLOEXEC, 0644, 0);
 }
 
 sem_t* open_sem_existing(const char* name) {
     // No O_CREAT
-    return sem_open(name, 0);
+    return sem_open(name, O_CLOEXEC);
 }
 
 // Helper for timed wait
@@ -35,12 +36,12 @@ int wait_sem(sem_t* sem, int ms) {
 }
 
 int create_shm_fd(const char* name) {
-	return shm_open(name, O_CREAT | O_RDWR, 0666);
+	return shm_open(name, O_CREAT | O_RDWR | O_CLOEXEC, 0666);
 }
 
 int open_shm_fd(const char* name) {
     // No O_CREAT
-    return shm_open(name, O_RDWR, 0666);
+    return shm_open(name, O_RDWR | O_CLOEXEC, 0666);
 }
 
 long get_file_size(int fd) {

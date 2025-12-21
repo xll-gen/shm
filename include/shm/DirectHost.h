@@ -243,8 +243,8 @@ public:
 
             Slot* slot = &host->slots[slotIdx];
 
-            int32_t absSize = size < 0 ? -size : size;
-            if ((uint32_t)absSize > slot->maxReqSize) {
+            uint32_t absSize = (size < 0) ? (0u - (uint32_t)size) : (uint32_t)size;
+            if (absSize > slot->maxReqSize) {
                 return Result<void>::Failure(Error::BufferTooSmall);
             }
 
@@ -701,8 +701,8 @@ public:
         if (slotIdx < 0 || slotIdx >= (int32_t)numSlots) return Result<void>::Failure(Error::InvalidArgs);
         Slot* slot = &slots[slotIdx];
 
-        int32_t absSize = size < 0 ? -size : size;
-        if ((uint32_t)absSize > slot->maxReqSize) {
+        uint32_t absSize = (size < 0) ? (0u - (uint32_t)size) : (uint32_t)size;
+        if (absSize > slot->maxReqSize) {
              slot->header->state.store(SLOT_FREE, std::memory_order_release);
              return Result<void>::Failure(Error::BufferTooSmall);
         }
@@ -789,9 +789,9 @@ public:
 
         int resultSize = 0;
         int32_t respSize = slot->header->respSize;
-        int32_t absResp = respSize < 0 ? -respSize : respSize;
+        uint32_t absResp = (respSize < 0) ? (0u - (uint32_t)respSize) : (uint32_t)respSize;
 
-        if ((uint32_t)absResp > slot->maxRespSize) absResp = (int32_t)slot->maxRespSize;
+        if (absResp > slot->maxRespSize) absResp = slot->maxRespSize;
 
         outResp.resize(absResp);
         if (absResp > 0) {
@@ -802,7 +802,7 @@ public:
                 memcpy(outResp.data(), slot->respBuffer + offset, absResp);
             }
         }
-        resultSize = absResp;
+        resultSize = (int)absResp;
 
         slot->header->state.store(SLOT_FREE, std::memory_order_release);
         return Result<int>(resultSize);
@@ -816,8 +816,8 @@ public:
         if (slotIdx < 0 || slotIdx >= (int32_t)numSlots) return Result<int>(Error::InvalidArgs);
         Slot* slot = &slots[slotIdx];
 
-        int32_t absSize = size < 0 ? -size : size;
-        if ((uint32_t)absSize > slot->maxReqSize) {
+        uint32_t absSize = (size < 0) ? (0u - (uint32_t)size) : (uint32_t)size;
+        if (absSize > slot->maxReqSize) {
              slot->header->state.store(SLOT_FREE, std::memory_order_release);
              return Result<int>(Error::BufferTooSmall);
         }
@@ -847,9 +847,9 @@ public:
         int resultSize = 0;
         if (ready) {
             int32_t respSize = slot->header->respSize;
-            int32_t absResp = respSize < 0 ? -respSize : respSize;
+            uint32_t absResp = (respSize < 0) ? (0u - (uint32_t)respSize) : (uint32_t)respSize;
 
-            if ((uint32_t)absResp > slot->maxRespSize) absResp = (int32_t)slot->maxRespSize;
+            if (absResp > slot->maxRespSize) absResp = slot->maxRespSize;
 
             outResp.resize(absResp);
             if (absResp > 0) {
@@ -860,7 +860,7 @@ public:
                     memcpy(outResp.data(), slot->respBuffer + offset, absResp);
                 }
             }
-            resultSize = absResp;
+            resultSize = (int)absResp;
         }
 
         slot->header->state.store(SLOT_FREE, std::memory_order_release);
@@ -1004,9 +1004,9 @@ public:
             if (slot->header->state.compare_exchange_strong(current, SLOT_BUSY, std::memory_order_acq_rel)) {
                 int32_t reqSize = slot->header->reqSize;
                 const uint8_t* reqData = nullptr;
-                int32_t absReqSize = reqSize < 0 ? -reqSize : reqSize;
+                uint32_t absReqSize = (reqSize < 0) ? (0u - (uint32_t)reqSize) : (uint32_t)reqSize;
 
-                if ((uint32_t)absReqSize > slot->maxReqSize) {
+                if (absReqSize > slot->maxReqSize) {
                     slot->header->respSize = 0;
                     slot->header->msgType = MsgType::SYSTEM_ERROR;
                     slot->header->state.store(SLOT_RESP_READY, std::memory_order_seq_cst);
@@ -1022,10 +1022,10 @@ public:
                      reqData = slot->reqBuffer + offset;
                 }
 
-                int32_t respSize = handler(reqData, absReqSize, slot->respBuffer, slot->maxRespSize, slot->header->msgType);
+                int32_t respSize = handler(reqData, (int32_t)absReqSize, slot->respBuffer, slot->maxRespSize, slot->header->msgType);
 
-                int32_t absRespSize = respSize < 0 ? -respSize : respSize;
-                if ((uint32_t)absRespSize > slot->maxRespSize) {
+                uint32_t absRespSize = (respSize < 0) ? (0u - (uint32_t)respSize) : (uint32_t)respSize;
+                if (absRespSize > slot->maxRespSize) {
                     respSize = 0;
                     slot->header->msgType = MsgType::SYSTEM_ERROR;
                 }
