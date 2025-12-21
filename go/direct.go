@@ -616,7 +616,7 @@ func (g *DirectGuest) workerLoopInternal(idx int, handler func([]byte, []byte, M
 					reqData = slot.reqBuffer[:reqSize]
 				} else {
 					rLen := -reqSize
-					if rLen > int32(len(slot.reqBuffer)) {
+					if rLen < 0 || rLen > int32(len(slot.reqBuffer)) {
                         header.RespSize = 0
                         header.MsgType = MsgTypeSystemError
                         atomic.StoreUint32(&header.State, SlotRespReady)
