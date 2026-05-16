@@ -261,6 +261,11 @@ public:
             }
 
             if (slot->header->msgSeq != currentSeq) {
+                 // Release the slot back to SLOT_FREE before disowning it; otherwise
+                 // the slot stays in SLOT_RESP_READY (or worse, in whatever state the
+                 // misbehaving peer published) and can only be reclaimed by the
+                 // zombie path. Restoring SLOT_FREE here closes that hole.
+                 slot->header->state.store(SLOT_FREE, std::memory_order_release);
                  slotIdx = -1;
                  return Result<void>::Failure(Error::ProtocolViolation);
             }
@@ -301,6 +306,10 @@ public:
             }
 
             if (slot->header->msgSeq != currentSeq) {
+                 // See identical comment in Send(): release slot back to SLOT_FREE
+                 // so it does not remain stuck in SLOT_RESP_READY when the peer
+                 // returns a stale msgSeq.
+                 slot->header->state.store(SLOT_FREE, std::memory_order_release);
                  slotIdx = -1;
                  return Result<void>::Failure(Error::ProtocolViolation);
             }
@@ -779,6 +788,10 @@ public:
 
         uint32_t expectedSeq = slot->msgSeq - msgSeqStride;
         if (slot->header->msgSeq != expectedSeq) {
+             // Release the slot before reporting the violation; otherwise the
+             // slot stays in SLOT_RESP_READY indefinitely (the happy-path
+             // SLOT_FREE store below is only reached on success).
+             slot->header->state.store(SLOT_FREE, std::memory_order_release);
              return Result<int>(Error::ProtocolViolation);
         }
 
@@ -836,6 +849,10 @@ public:
         }
 
         if (slot->header->msgSeq != currentSeq) {
+             // Release the slot before reporting the violation; otherwise the
+             // slot stays in SLOT_RESP_READY indefinitely (the happy-path
+             // SLOT_FREE store below is only reached on success).
+             slot->header->state.store(SLOT_FREE, std::memory_order_release);
              return Result<int>(Error::ProtocolViolation);
         }
 

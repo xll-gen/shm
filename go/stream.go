@@ -24,6 +24,17 @@ type ChunkHeader struct {
     Padding     uint32 // Padding to match C++ alignment (24 bytes)
 }
 
+// Compile-time size assertions for streaming protocol headers.
+// StreamHeader must be exactly 24 bytes per SPECIFICATION.md §3.3.1.
+// ChunkHeader is currently 24 bytes in Go; see the C++ side for the matching
+// definition. Any size drift triggers a build failure here.
+var (
+	_ [24 - unsafe.Sizeof(StreamHeader{})]byte
+	_ [unsafe.Sizeof(StreamHeader{}) - 24]byte
+	_ [24 - unsafe.Sizeof(ChunkHeader{})]byte
+	_ [unsafe.Sizeof(ChunkHeader{}) - 24]byte
+)
+
 // StreamHandler is a function type for processing assembled streams.
 type StreamHandler func(streamID uint64, data []byte)
 

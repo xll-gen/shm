@@ -75,8 +75,15 @@ enum class MsgType : uint32_t {
  * This structure resides in shared memory and coordinates the state
  * of a single request/response transaction.
  * Aligned to 128 bytes to prevent false sharing between slots.
+ *
+ * @note The `alignas(64)` specifier matches the x86/x64 cache-line size,
+ *       which is the only supported deployment target (see
+ *       `AGENTS.md` §"Platform Targets"). Each slot is sized to exactly
+ *       128 bytes, so consecutive slots occupy back-to-back cache lines
+ *       and false sharing is avoided in practice regardless of whether
+ *       a future host happens to use 128-byte lines.
  */
-struct SlotHeader {
+struct alignas(64) SlotHeader {
     /**
      * @brief Padding to ensure cache line alignment and avoid false sharing with ExchangeHeader or previous slot.
      */
@@ -134,6 +141,11 @@ struct SlotHeader {
     uint8_t reserved[36];
 };
 
+// ABI safety: SlotHeader must remain exactly 128 bytes and at least 64-byte
+// aligned. These asserts are textual guards; layout is frozen.
+static_assert(sizeof(SlotHeader) == 128, "SlotHeader must be exactly 128 bytes (ABI)");
+static_assert(alignof(SlotHeader) >= 64, "SlotHeader must be at least 64-byte aligned");
+
 // Slot State Constants
 /**
  * @brief Enumeration of possible Slot states.
@@ -145,7 +157,9 @@ enum SlotState {
     SLOT_REQ_READY = 1,
     /** @brief Response data is written. Ready for Host to read. */
     SLOT_RESP_READY = 2,
-    /** @brief Transaction complete (transient state). */
+    /** @brief Transaction complete (transient state).
+     *  SLOT_DONE = 3 (reserved; not currently used by the protocol but
+     *  retained for future flow extensions). */
     SLOT_DONE = 3,
     /** @brief Slot is claimed by Host, writing request. */
     SLOT_BUSY = 4,
@@ -179,5 +193,8 @@ struct ExchangeHeader {
     /** @brief Reserved for future use. */
     uint8_t reserved[36];
 };
+
+// ABI safety: ExchangeHeader must remain exactly 64 bytes. Layout is frozen.
+static_assert(sizeof(ExchangeHeader) == 64, "ExchangeHeader must be exactly 64 bytes (ABI)");
 
 }

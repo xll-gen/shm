@@ -7,12 +7,22 @@
 - Implements Double Buffering (pipelining) over the Direct Exchange protocol.
 - Added `MSG_TYPE_STREAM_START` (13) and `MSG_TYPE_STREAM_CHUNK` (14).
 
+### Protocol Additions
+- Formalized `MSG_TYPE_SYSTEM_ERROR` (127) as the receiver's out-of-band rejection sentinel (e.g., buffer overflow, malformed request). Senders must check `msgType` against this value before parsing response data.
+
 ### API Additions
 - `DirectHost::SendAcquiredAsync`: Non-blocking send for pipelining.
 - `DirectHost::WaitForSlot`: Deferred response waiting.
 
+### ABI Safety
+- Added `alignas(64)` to C++ `SlotHeader` and `static_assert`s for `SlotHeader`/`ExchangeHeader`/`StreamHeader` sizes. Layout is unchanged; these are compile-time guards against accidental drift.
+- Added compile-time size assertions to Go `SlotHeader`, `ExchangeHeader`, `StreamHeader`, and `ChunkHeader` using the zero-length-array pattern.
+
 ### Documentation
 - Updated `README.md` and `SPECIFICATION.md` with Streaming details.
+- Codified the memory-ordering contract for the `state` synchronizing variable in `SPECIFICATION.md` §4.4 (release/acquire pairing, data-region ordering, defensive re-checks).
+- Corrected `SPECIFICATION.md` §2.1 `version` field example to `0x00060000`.
+- Documented `SLOT_DONE` (3) as reserved (not currently used by protocol transitions).
 
 ## [v0.5.4] - 2025-12-13
 

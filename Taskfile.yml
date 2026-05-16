@@ -1,0 +1,14 @@
+version: '3'
+
+tasks:
+  verify:
+    desc: Run Go vet, build, and tests on the Go guest implementation under -race.
+    cmds:
+      - go vet ./go/...
+      - go build ./go/...
+      - go test -race -count=1 -timeout=60s ./go/...
+
+  benchmark:
+    desc: Run performance benchmarks against the Go guest.
+    cmds:
+      - go test -run=NONE -bench=. -benchmem -count=1 -timeout=300s ./go/...

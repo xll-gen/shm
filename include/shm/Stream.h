@@ -15,13 +15,40 @@ struct StreamHeader {
     uint32_t reserved;
 };
 
+// ABI safety: StreamHeader must remain exactly 24 bytes. Layout is frozen.
+static_assert(sizeof(StreamHeader) == 24, "StreamHeader must be exactly 24 bytes (ABI)");
+
 /** @brief Header payload for STREAM_CHUNK message. */
 struct ChunkHeader {
     uint64_t streamId;
     uint32_t chunkIndex;
     uint32_t payloadSize;
     uint32_t reserved;
+    /**
+     * @brief Explicit padding to ensure cross-language size parity.
+     *
+     * Without this field the C++ struct would be 20 bytes (no trailing padding
+     * is required by the natural alignment of `uint64_t streamId` on its own,
+     * since the largest member is 8 bytes and the total of the prior fields is
+     * already a multiple of 8). However, the Go counterpart in
+     * `go/stream.go` carries an explicit `Padding uint32` field, making
+     * `unsafe.Sizeof(ChunkHeader{}) == 24`. SPECIFICATION.md §3.3.2 likewise
+     * defines the wire layout as 24 bytes, with `padding` at offset 20.
+     *
+     * The C++ sender writes the chunk payload at `offset = sizeof(ChunkHeader)`
+     * and the Go reassembler reads it at the same offset on its side. Without
+     * matching sizes the two ends disagree by 4 bytes on every chunk, silently
+     * corrupting cross-language streams. This field forces parity and must not
+     * be removed without updating Go and the SPECIFICATION in lockstep.
+     */
+    uint32_t padding;
 };
+
+// ABI safety: ChunkHeader must remain exactly 24 bytes for cross-language
+// parity with Go's `ChunkHeader` (see `go/stream.go`) and SPECIFICATION.md
+// §3.3.2. Layout is frozen.
+static_assert(sizeof(ChunkHeader) == 24,
+              "ChunkHeader must be 24 bytes for cross-language parity with Go and SPECIFICATION.md §3.3.2");
 
 /**
  * @class StreamSender

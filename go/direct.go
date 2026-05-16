@@ -25,6 +25,8 @@ const (
 	// SlotRespReady indicates the Guest has written a response and it is ready for the Host.
 	SlotRespReady = 2
 	// SlotDone is a transient state indicating transaction completion.
+	// SLOT_DONE = 3 (reserved; not currently used by the protocol but
+	// retained for future flow extensions).
 	SlotDone      = 3
 	// SlotBusy indicates the Host has claimed the slot and is writing data.
 	SlotBusy      = 4
@@ -102,6 +104,18 @@ type ExchangeHeader struct {
 	_             [36]byte // Reserved
 }
 
+// Compile-time size assertions: any layout drift versus the C++ ABI causes a
+// build failure here. The trick uses a zero-length array indexed by the
+// difference between the expected size and the actual size; a non-zero diff
+// yields a negative array length (build error) or non-zero length (which we
+// reject via the matching dual expression).
+var (
+	_ [128 - unsafe.Sizeof(SlotHeader{})]byte
+	_ [unsafe.Sizeof(SlotHeader{}) - 128]byte
+	_ [64 - unsafe.Sizeof(ExchangeHeader{})]byte
+	_ [unsafe.Sizeof(ExchangeHeader{}) - 64]byte
+)
+
 // slotContext holds local runtime state for a slot.
 type slotContext struct {
 	header     *SlotHeader
@@ -173,6 +187,24 @@ func NewDirectGuest(name string) (*DirectGuest, error) {
 	if slotSize == 0 || slotSize > 1024*1024*1024 {
 		CloseShm(h, addr, HeaderMapSize)
 		return nil, fmt.Errorf("invalid slotSize: %d", slotSize)
+	}
+
+	// Validate relative offset ordering. The C++ host writes these fields to
+	// shared memory; a corrupted or buggy host that produces inverted offsets
+	// would underflow the uint32 subtractions for maxReq/maxResp below and
+	// produce an enormous slice via unsafe.Slice that escapes the mmap'd region.
+	// Reject early with a clear error instead.
+	if reqOffset >= slotSize {
+		CloseShm(h, addr, HeaderMapSize)
+		return nil, fmt.Errorf("shm: invalid ExchangeHeader: reqOffset (%d) >= slotSize (%d)", reqOffset, slotSize)
+	}
+	if respOffset <= reqOffset {
+		CloseShm(h, addr, HeaderMapSize)
+		return nil, fmt.Errorf("shm: invalid ExchangeHeader: respOffset (%d) <= reqOffset (%d)", respOffset, reqOffset)
+	}
+	if respOffset >= slotSize {
+		CloseShm(h, addr, HeaderMapSize)
+		return nil, fmt.Errorf("shm: invalid ExchangeHeader: respOffset (%d) >= slotSize (%d)", respOffset, slotSize)
 	}
 
 	CloseShm(h, addr, HeaderMapSize)

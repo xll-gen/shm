@@ -29,7 +29,7 @@ The first 64 bytes of the shared memory are reserved for the `ExchangeHeader`. T
 | Field | Type | Offset | Description |
 | :--- | :--- | :--- | :--- |
 | `magic` | `uint32` | 0 | Magic Number (0x584C4C21). |
-| `version` | `uint32` | 4 | Protocol Version (0x00050000). |
+| `version` | `uint32` | 4 | Protocol Version (0x00060000). |
 | `numSlots` | `uint32` | 8 | Number of Host-to-Guest slots. |
 | `numGuestSlots` | `uint32` | 12 | Number of Guest-to-Host (Guest Call) slots. |
 | `slotSize` | `uint32` | 16 | Total size of a single slot in bytes. |
@@ -90,6 +90,8 @@ The `state` field in `SlotHeader` manages the ownership of the slot.
 | `SLOT_BUSY` | 4 | Slot is claimed by Host (for Host Slots), data is being written. |
 | `SLOT_GUEST_BUSY` | 5 | Slot is claimed by Guest (for Guest Slots), data is being written. |
 
+*Note: `SLOT_DONE` (3) is reserved for future flow extensions and is not currently used by any transition in the protocol. Implementations must define the constant for parity, but should not produce or consume it.*
+
 ### 3.2. Message Types
 
 | Constant | Value | Description |
@@ -102,6 +104,7 @@ The `state` field in `SlotHeader` manages the ownership of the slot.
 | `MSG_TYPE_GUEST_CALL` | 11 | Guest-initiated call to Host. |
 | `MSG_TYPE_STREAM_START` | 13 | Start of a streaming transfer. |
 | `MSG_TYPE_STREAM_CHUNK` | 14 | Chunk of a streaming transfer. |
+| `MSG_TYPE_SYSTEM_ERROR` | 127 | System-level rejection (e.g., buffer overflow, malformed request). Sent by receiver in lieu of NORMAL response. The receiver overwrites `msgType` to SYSTEM_ERROR in the response slot; payload may be empty. Senders must check for this value before parsing response data. |
 | `MSG_TYPE_APP_START` | 128 | Start of user-defined message types. |
 
 ### 3.3. Streaming Protocol
@@ -184,6 +187,22 @@ Implementations should use a hybrid wait strategy for optimal latency:
 | **Shared Memory** | `shm_open` / `mmap` | `CreateFileMapping` / `MapViewOfFile` |
 | **Signaling** | Named Semaphores (`sem_open`) | Named Events (`CreateEvent`) |
 | **Atomic Wait** | `sem_wait` / `sem_post` | `WaitForSingleObject` / `SetEvent` |
+
+### 4.4. Memory Ordering Contract
+
+The `state` field of `SlotHeader` is the synchronizing variable that publishes ownership transfers between Host and Guest. All implementations must respect the following ordering rules:
+
+- **Publishing transitions** (state -> `REQ_READY`, state -> `RESP_READY`, state -> `FREE`-after-completion) **MUST use at least release semantics** (C++: `memory_order_release` or stronger; Go: `sync/atomic.Store*` which is sequentially consistent).
+
+- **Consuming transitions** (acquire-load of state expecting `REQ_READY`, `RESP_READY`, or `FREE`; CAS attempts to claim a free slot) **MUST use at least acquire semantics** (C++: `memory_order_acquire` or stronger; Go: `sync/atomic.Load*` / `sync/atomic.CompareAndSwap*`).
+
+- **Data-region fields** (`msgSeq`, `msgType`, `reqSize`, `respSize`, slot payload bytes) are NOT individually atomic. They MUST be written by the producer BEFORE the publishing release-store of `state`, and read by the consumer AFTER the consuming acquire-load of `state`. Re-ordering of any data-region access across the synchronizing atomic is a protocol violation.
+
+- **No plain (non-atomic) access** to `state` is permitted in any implementation. `memory_order_relaxed` is NOT acceptable on synchronizing operations.
+
+- **Defensive re-checks** (e.g., re-reading `msgSeq` after acquire-load to detect zombie slots, range-checking `reqSize` / `respSize` against `maxReqSize`) are part of the contract; they protect against ABA hazards and msgSeq epoch confusion. Implementations MUST preserve them.
+
+**Rationale**: The primary deployment target is Windows x86/x64, where TSO hardware ordering covers most reorderings the C++/Go memory models permit. Even on this strongly-ordered ISA, however, compilers may reorder data-region accesses across non-atomic stores; only the atomic operations on `state` act as compiler barriers. Implementations must therefore use the rules above as a *language-level* contract, not a hardware-level one — `relaxed` is unsafe even on x86 because of compiler-side reordering of the surrounding data writes/reads. (Per `AGENTS.md` §"Platform Targets", ARM is explicitly not supported, but the same rules would also keep the protocol correct on weakly-ordered ISAs should that ever change.)
 
 ## 5. Implementation Guidelines
 
