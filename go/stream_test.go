@@ -30,16 +30,26 @@ func setupHost(t *testing.T, name string, numSlots, slotSize int) (int, func()) 
 	header.ReqOffset = 0
 	header.RespOffset = uint32(slotSize / 2)
 
-	// Initialize Slots
+	// Initialize Slots and pre-create the per-slot named events.
+	// On Windows, a named event is destroyed when its last handle is closed,
+	// so we must HOLD the handles until the guest has had a chance to open
+	// them. Closing eagerly here would cause `NewDirectGuest` (which calls
+	// OpenEvent) to fail with "system cannot find the file specified".
+	eventHandles := make([]EventHandle, 0, 2*numSlots)
 	ptr := addr + uintptr(headerSize)
 	for i := 0; i < numSlots; i++ {
 		slot := (*SlotHeader)(unsafe.Pointer(ptr))
 		atomic.StoreUint32(&slot.State, SlotFree)
 
-        hReq, _ := CreateEvent(fmt.Sprintf("%s_slot_%d", name, i))
-        hResp, _ := CreateEvent(fmt.Sprintf("%s_slot_%d_resp", name, i))
-        CloseEvent(hReq)
-        CloseEvent(hResp)
+		hReq, err := CreateEvent(fmt.Sprintf("%s_slot_%d", name, i))
+		if err != nil {
+			t.Fatalf("CreateEvent(req[%d]) failed: %v", i, err)
+		}
+		hResp, err := CreateEvent(fmt.Sprintf("%s_slot_%d_resp", name, i))
+		if err != nil {
+			t.Fatalf("CreateEvent(resp[%d]) failed: %v", i, err)
+		}
+		eventHandles = append(eventHandles, hReq, hResp)
 
 		ptr += uintptr(perSlotSize)
 	}
@@ -47,11 +57,14 @@ func setupHost(t *testing.T, name string, numSlots, slotSize int) (int, func()) 
 	return totalSize, func() {
 		CloseShm(h, addr, uint64(totalSize))
 		UnlinkShm(name)
-        // Unlink events too
-        for i := 0; i < numSlots; i++ {
-             UnlinkEvent(fmt.Sprintf("%s_slot_%d", name, i))
-             UnlinkEvent(fmt.Sprintf("%s_slot_%d_resp", name, i))
-        }
+		// Close the host-side event handles, then unlink the names.
+		for _, eh := range eventHandles {
+			CloseEvent(eh)
+		}
+		for i := 0; i < numSlots; i++ {
+			UnlinkEvent(fmt.Sprintf("%s_slot_%d", name, i))
+			UnlinkEvent(fmt.Sprintf("%s_slot_%d_resp", name, i))
+		}
 	}
 }
 

@@ -673,5 +673,4 @@ func (g *DirectGuest) workerLoopInternal(idx int, handler func([]byte, []byte, M
 			}
 		}
 	}
-	return true
 }
