@@ -351,6 +351,51 @@ func (g *DirectGuest) SetTimeout(d time.Duration) {
 	g.responseTimeout = d
 }
 
+// TryReclaimAbandonedSlot attempts to reclaim a slot whose Lease is older
+// than maxLeaseAge.
+//
+// For crash recovery: if the slot's current owner crashed, its lease will
+// not refresh and the slot will sit in a non-FREE state forever. This
+// method reads State and Lease, and if the lease is stale by the
+// threshold, attempts to CAS State back to SlotFree.
+//
+// Safety: the CAS ensures we never reclaim a slot a live peer just
+// advanced. If a live peer heartbeats between the lease read and the
+// CAS, the CAS succeeds (state still matches what we observed) and the
+// slot becomes Free; the peer's next state write will fail or be a CAS
+// from a stale state. The dangerous case — reclaiming while the peer is
+// mid-write — is probabilistically protected by the lease window: the
+// peer either heartbeated recently (lease fresh, no reclaim) or it
+// didn't (lease stale, reclaim is correct).
+//
+// v0.7.1 ships this as an opt-in API only. Auto-reclamation inside
+// WaitStrategy and an end-to-end crash-process test will follow.
+//
+// Returns true if the slot was reclaimed. Returns false if: the slot is
+// already Free, the lease is fresher than the threshold, the lease is
+// zero (peer never heartbeated — likely a v0.6.x peer, refuse to
+// reclaim), or the CAS lost to a concurrent legitimate state change.
+func (g *DirectGuest) TryReclaimAbandonedSlot(slotIdx int, maxLeaseAge time.Duration) bool {
+	if slotIdx < 0 || slotIdx >= len(g.slots) {
+		return false
+	}
+	s := &g.slots[slotIdx]
+
+	state := atomic.LoadUint32(&s.header.State)
+	if state == SlotFree {
+		return false
+	}
+	lease := atomic.LoadUint64(&s.header.Lease)
+	if lease == 0 {
+		return false
+	}
+	now := MonotonicNanos()
+	if now <= lease || (now-lease) <= uint64(maxLeaseAge.Nanoseconds()) {
+		return false
+	}
+	return atomic.CompareAndSwapUint32(&s.header.State, state, SlotFree)
+}
+
 // SendGuestCall sends a request to the Host using a Guest Slot.
 // It blocks until a response is received or the default timeout occurs.
 //

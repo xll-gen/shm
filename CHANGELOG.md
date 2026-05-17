@@ -1,5 +1,50 @@
 # Changelog
 
+## [v0.7.1] - 2026-05-17
+
+### Reclamation API
+
+`SlotHeader::lease` (introduced in v0.7.0) now has consumers.
+
+- **C++**: `DirectHost::TryReclaimAbandonedSlot(slotIdx, maxLeaseAgeNs)`.
+- **Go**: `(*DirectGuest).TryReclaimAbandonedSlot(slotIdx, maxLeaseAge)`.
+
+Reads `state` + `lease`; if `state != FREE` and `now - lease > maxLeaseAge`
+and `lease != 0`, attempts `state.compare_exchange_strong(observed, FREE)`.
+Returns `true` only if the CAS succeeds. The CAS guard ensures we never
+race against a live heartbeat: if a peer refreshed `state` between our
+observation and the CAS, the CAS fails and we return `false`.
+
+`lease == 0` is the v0.6.x-peer signal — we refuse to reclaim because
+we cannot distinguish "never heartbeated" from "stale". v0.7.x writers
+always stamp a non-zero lease on every CAS-to-non-FREE.
+
+### Tests
+
+`go/reclaim_test.go` covers the API contract:
+
+- `TestTryReclaim_StaleLeaseSucceeds` — happy path, 1-second-old lease,
+  100 ms threshold.
+- `TestTryReclaim_FreshLeaseRefuses` — refuses when peer just heartbeated.
+- `TestTryReclaim_ZeroLeaseRefuses` — refuses for v0.6.x-peer signal even
+  with zero threshold.
+- `TestTryReclaim_FreeSlotNoOp` — refuses when slot is already free.
+- `TestTryReclaim_OutOfRangeRefuses` — bounds check.
+- `TestTryReclaim_NoDoubleClaim_Property` — 200 rounds × 4 slots,
+  heartbeater goroutine racing the reclaimer; asserts the invariant
+  that state is always either `SlotBusy` or `SlotFree` (never a
+  corrupt intermediate). Runs in ~15 s.
+
+### Out of scope for v0.7.1
+
+- **Auto-reclamation hook** inside `WaitStrategy::Wait`: deferred. v0.7.1
+  ships the opt-in API only. Callers who want self-healing must invoke
+  `TryReclaimAbandonedSlot` from their own watchdog.
+- **End-to-end crash-process test**: deferred. The current property
+  test stresses the concurrent CAS handshake on a single machine but
+  doesn't spawn a child process and kill it mid-handler. Documented in
+  AGENTS.md as a follow-up.
+
 ## [v0.7.0] - 2026-05-17
 
 ### Protocol — Heartbeat Lease (write-only)

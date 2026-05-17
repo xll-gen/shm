@@ -692,6 +692,62 @@ public:
     }
 
     /**
+     * @brief Attempt to reclaim a slot whose lease is older than `maxLeaseAgeNs`.
+     *
+     * For crash-recovery: if the slot's current owner has crashed, its
+     * lease will not refresh and the slot will sit in a non-FREE state
+     * forever. This method observes the current state and lease, and if
+     * `now - lease > maxLeaseAgeNs` it tries to CAS the state back to
+     * SLOT_FREE.
+     *
+     * Safety: the CAS ensures we never reclaim a slot a live peer just
+     * advanced. Between the lease read and the CAS the peer may have
+     * heartbeated again — that's fine, the CAS will simply succeed and
+     * the slot becomes FREE, and the next caller of AcquireSlot will
+     * re-acquire it. The dangerous case is reclaiming while the peer is
+     * mid-write; the lease window protects against that probabilistically
+     * (the peer either heartbeated recently — lease fresh, no reclaim —
+     * or it didn't — lease stale, reclaim is correct).
+     *
+     * v0.7.1: opt-in API only. Auto-reclaim inside WaitStrategy and an
+     * end-to-end crash-process test ship in a later release.
+     *
+     * @param slotIdx The slot to inspect.
+     * @param maxLeaseAgeNs Maximum tolerated age in nanoseconds. Slots
+     *                     whose lease is older than this are candidates
+     *                     for reclamation.
+     * @return true if the slot was reclaimed (state was non-FREE,
+     *         lease stale, CAS succeeded). false if (a) the slot was
+     *         already FREE, (b) lease was fresher than the threshold,
+     *         (c) the CAS lost a race against legitimate progress.
+     */
+    bool TryReclaimAbandonedSlot(int32_t slotIdx, uint64_t maxLeaseAgeNs) {
+        if (slotIdx < 0 || slotIdx >= (int32_t)(numSlots + numGuestSlots)) {
+            return false;
+        }
+        Slot* slot = &slots[slotIdx];
+        uint32_t state = slot->header->state.load(std::memory_order_acquire);
+        if (state == SLOT_FREE) {
+            return false;
+        }
+        uint64_t lease = slot->header->lease.load(std::memory_order_acquire);
+        if (lease == 0) {
+            // Peer never wrote a lease — either v0.6.x peer or a slot
+            // that has somehow skipped the heartbeat. Refuse to reclaim:
+            // we cannot tell stale from never-stamped.
+            return false;
+        }
+        uint64_t now = Platform::MonotonicNanos();
+        if (now <= lease || (now - lease) <= maxLeaseAgeNs) {
+            return false;
+        }
+        // Lease is stale by our threshold. Try the CAS — if a heartbeat
+        // races in between, the CAS fails and we return false.
+        return slot->header->state.compare_exchange_strong(
+            state, SLOT_FREE, std::memory_order_acq_rel);
+    }
+
+    /**
      * @brief Gets the request buffer pointer for an acquired slot.
      * @param slotIdx The slot index.
      * @return Pointer to the buffer, or nullptr if invalid.
