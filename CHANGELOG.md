@@ -1,5 +1,22 @@
 # Changelog
 
+## [v0.6.4] - 2026-05-17
+
+### API
+- `Client.Start()` now returns `error` instead of panicking when the
+  handler isn't registered. Callers that ignored the return value (Go
+  allows it) keep the same happy-path behavior; misconfigured callers
+  can now surface the failure gracefully. Closes the long-standing
+  backlog item from AGENTS.md "Known Improvement Backlog".
+
+## [v0.6.3] - 2026-05-17
+
+### Hygiene
+- Remove `.jules/` and `.Jules/` tracked agent-scratch dirs. v0.6.0/v0.6.1
+  could not be downloaded as Go modules from case-insensitive
+  filesystems (Windows) because git tracked both case variants of the
+  same directory. v0.6.2 only got half the rename; v0.6.3 completes it.
+
 ## [v0.6.1] - 2026-05-17
 
 ### WaitStrategy (Go)

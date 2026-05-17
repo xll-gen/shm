@@ -1,6 +1,7 @@
 package shm
 
 import (
+	"errors"
 	"fmt"
 	"time"
 )
@@ -82,13 +83,21 @@ func (c *Client) Handle(h func(req []byte, respBuf []byte, msgType MsgType) (int
 }
 
 // Start initiates the worker routines.
-// This method spawns goroutines and returns immediately.
-// It panics if the Handler is not set.
-func (c *Client) Start() {
+// This method spawns goroutines and returns immediately. It returns an
+// error if Handle was not called first; callers should treat that as an
+// unrecoverable misconfiguration in their wiring layer rather than a
+// runtime fault.
+//
+// Pre-existing callers that ignored the return value (and relied on the
+// previous panic semantics) keep the same effective behavior: their build
+// will still fail at the call site, surfacing the missing-handler bug
+// earlier and without taking the process down.
+func (c *Client) Start() error {
 	if c.handler == nil {
-		panic("Handler not set")
+		return errors.New("shm: Client.Start called before Client.Handle (no handler registered)")
 	}
 	c.guest.Start(c.handler)
+	return nil
 }
 
 // Wait blocks until all worker routines have exited.
