@@ -110,6 +110,13 @@ class DirectHost {
     // Config
     uint32_t slotSize; // Total payload size per slot
 
+    // v0.7.2: auto-reclaim threshold. When AcquireSlot's slow path
+    // completes a configurable number of full sweeps without finding a
+    // free slot, it attempts TryReclaimAbandonedSlot on each non-FREE
+    // slot with this threshold. Zero (default) disables auto-reclaim —
+    // callers who want it must SetAutoReclaimTimeoutNs(N).
+    std::atomic<uint64_t> autoReclaimTimeoutNs{0};
+
     // Shared state to track DirectHost lifetime for ZeroCopySlots
     struct SharedState {};
     std::shared_ptr<SharedState> sharedState;
@@ -621,6 +628,27 @@ public:
                         diagnosticEmitted = true;
                     }
 #endif
+                    // v0.7.2: auto-reclaim. After a full sweep with no
+                    // free slot, scan every non-FREE slot once and try
+                    // to reclaim any whose lease is stale by
+                    // `autoReclaimTimeoutNs`. Zero (default) disables
+                    // this entirely. CAS guard inside
+                    // TryReclaimAbandonedSlot keeps the operation safe
+                    // against concurrent live heartbeats.
+                    const uint64_t reclaimThresh =
+                        autoReclaimTimeoutNs.load(std::memory_order_relaxed);
+                    if (reclaimThresh > 0) {
+                        for (uint32_t i = 0; i < numSlots; ++i) {
+                            if (TryReclaimAbandonedSlot(
+                                    static_cast<int32_t>(i), reclaimThresh)) {
+                                SHM_LOG_WARN(
+                                    "DirectHost::AcquireSlot: reclaimed "
+                                    "abandoned slot ", i,
+                                    " (lease older than ", reclaimThresh,
+                                    " ns)");
+                            }
+                        }
+                    }
                 }
                 retries++;
                 if (retries > (int)numSlots * 100) {
@@ -689,6 +717,34 @@ public:
              }
         }
         return slotIdx;
+    }
+
+    /**
+     * @brief Enable AcquireSlot auto-reclaim with the given lease-age threshold.
+     *
+     * When AcquireSlot's slow-path slot scan completes a full sweep
+     * without finding a free slot, it walks every non-FREE slot and
+     * calls `TryReclaimAbandonedSlot(idx, timeoutNs)`. Zero disables
+     * auto-reclaim entirely (the default — opt-in for safety).
+     *
+     * Typical values: 5× `responseTimeoutMs` converted to ns. Too short
+     * and you race a slow-but-live peer (CAS guard catches it, but you
+     * burn cycles); too long and you wait forever when a peer truly
+     * crashed.
+     *
+     * Safe to call at any time; thread-safe atomic store.
+     *
+     * @param timeoutNs Threshold in nanoseconds. 0 = disabled.
+     */
+    void SetAutoReclaimTimeoutNs(uint64_t timeoutNs) {
+        autoReclaimTimeoutNs.store(timeoutNs, std::memory_order_relaxed);
+    }
+
+    /**
+     * @brief Returns the current auto-reclaim threshold (0 = disabled).
+     */
+    uint64_t GetAutoReclaimTimeoutNs() const {
+        return autoReclaimTimeoutNs.load(std::memory_order_relaxed);
     }
 
     /**

@@ -191,3 +191,22 @@ func TestReclaim_AssumesLeaseOffset96(t *testing.T) {
 		t.Fatalf("Lease offset = %d, reclaim test assumes 96", off)
 	}
 }
+
+// TestAutoReclaimTimeout_RoundTrip exercises the v0.7.2 setter/getter pair.
+// The actual auto-reclaim integration in sendGuestCallInternal piggybacks
+// on TryReclaimAbandonedSlot which TestTryReclaim_NoDoubleClaim_Property
+// already covers; this test only pins the API contract for the knob.
+func TestAutoReclaimTimeout_RoundTrip(t *testing.T) {
+	g := &DirectGuest{}
+	if got := g.GetAutoReclaimTimeout(); got != 0 {
+		t.Fatalf("default GetAutoReclaimTimeout = %v, want 0 (opt-in)", got)
+	}
+	g.SetAutoReclaimTimeout(500 * time.Millisecond)
+	if got := g.GetAutoReclaimTimeout(); got != 500*time.Millisecond {
+		t.Fatalf("GetAutoReclaimTimeout after set = %v, want 500ms", got)
+	}
+	g.SetAutoReclaimTimeout(0)
+	if got := g.GetAutoReclaimTimeout(); got != 0 {
+		t.Fatalf("GetAutoReclaimTimeout after zero = %v, want 0", got)
+	}
+}

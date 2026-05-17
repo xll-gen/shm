@@ -1,5 +1,40 @@
 # Changelog
 
+## [v0.7.2] - 2026-05-17
+
+### Auto-Reclaim Integration
+
+Wires the v0.7.1 `TryReclaimAbandonedSlot` API into the natural "I need
+a slot but none are free" code paths, opt-in via a single knob:
+
+- **C++**: `DirectHost::SetAutoReclaimTimeoutNs(uint64_t timeoutNs)` /
+  `GetAutoReclaimTimeoutNs()`. When `AcquireSlot`'s slow-path slot scan
+  completes a full sweep without finding a free slot, it walks every
+  slot and calls `TryReclaimAbandonedSlot(idx, timeoutNs)`. Zero
+  (default) disables auto-reclaim entirely.
+- **Go**: `(*DirectGuest).SetAutoReclaimTimeout(d time.Duration)` /
+  `GetAutoReclaimTimeout()`. In `sendGuestCallInternal`'s fail path
+  ("all guest slots busy"), if the threshold is non-zero, walk every
+  guest slot and try to reclaim, then retry the acquisition once.
+
+Both paths gate the action on an explicit non-zero threshold so existing
+deployments see no behavior change. Typical recommended value is
+5× the response timeout — long enough that a slow-but-live peer always
+heartbeats within the window, short enough that a true crash is
+recovered quickly.
+
+CAS guard inside `TryReclaimAbandonedSlot` protects against racing a
+live heartbeat: if the peer refreshes between our observation and the
+CAS, the reclaim fails and we treat the slot as still owned.
+
+### Tests
+
+- `go/reclaim_test.go::TestAutoReclaimTimeout_RoundTrip` pins the
+  setter/getter contract (default zero, round-trips arbitrary
+  duration). The race-safety semantics are still covered by
+  `TestTryReclaim_NoDoubleClaim_Property` since auto-reclaim is a thin
+  wrapper around the same API.
+
 ## [v0.7.1] - 2026-05-17
 
 ### Reclamation API

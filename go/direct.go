@@ -157,6 +157,12 @@ type DirectGuest struct {
 	closing int32
 
     nextGuestSlot uint32 // Atomic counter for Round-Robin slot selection
+
+	// v0.7.2: auto-reclaim threshold. When sendGuestCallInternal's slow
+	// path fails to find a free guest slot it walks every guest slot
+	// and tries TryReclaimAbandonedSlot with this threshold. Zero
+	// (default) disables auto-reclaim — opt-in for safety.
+	autoReclaimTimeoutNs uint64
 }
 
 // NewDirectGuest initializes the DirectGuest by attaching to an existing shared memory region.
@@ -351,6 +357,24 @@ func (g *DirectGuest) SetTimeout(d time.Duration) {
 	g.responseTimeout = d
 }
 
+// SetAutoReclaimTimeout enables AcquireSlot-equivalent auto-reclaim during
+// guest-slot acquisition. When SendGuestCall can't find a free guest slot
+// in its normal scan, it walks each guest slot and tries
+// TryReclaimAbandonedSlot with this threshold before giving up.
+//
+// Zero (default) disables auto-reclaim — opt-in for safety. Typical
+// values: 5× the response timeout. Safe to call at any time.
+//
+// Thread-safe: atomic uint64 store under the hood.
+func (g *DirectGuest) SetAutoReclaimTimeout(d time.Duration) {
+	atomic.StoreUint64(&g.autoReclaimTimeoutNs, uint64(d.Nanoseconds()))
+}
+
+// GetAutoReclaimTimeout returns the current threshold (0 = disabled).
+func (g *DirectGuest) GetAutoReclaimTimeout() time.Duration {
+	return time.Duration(atomic.LoadUint64(&g.autoReclaimTimeoutNs))
+}
+
 // TryReclaimAbandonedSlot attempts to reclaim a slot whose Lease is older
 // than maxLeaseAge.
 //
@@ -470,7 +494,35 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, buffer []byte, msgType 
 	}
 
 	if slot == nil {
-		return nil, fmt.Errorf("all guest slots busy")
+		// v0.7.2: auto-reclaim. If the caller opted in via
+		// SetAutoReclaimTimeout, scan every guest slot and try
+		// reclaiming any whose lease is stale. Retry the acquisition
+		// once after the sweep — at most one retry, so a persistent
+		// shortage still returns the original error.
+		reclaimThresh := time.Duration(atomic.LoadUint64(&g.autoReclaimTimeoutNs))
+		if reclaimThresh > 0 {
+			reclaimed := false
+			for j := 0; j < numGuest; j++ {
+				idx := startBase + j
+				if g.TryReclaimAbandonedSlot(idx, reclaimThresh) {
+					reclaimed = true
+				}
+			}
+			if reclaimed {
+				for j := 0; j < numGuest; j++ {
+					idx := startBase + j
+					s := &g.slots[idx]
+					if atomic.CompareAndSwapUint32(&s.header.State, SlotFree, SlotGuestBusy) {
+						atomic.StoreUint64(&s.header.Lease, MonotonicNanos())
+						slot = s
+						break
+					}
+				}
+			}
+		}
+		if slot == nil {
+			return nil, fmt.Errorf("all guest slots busy")
+		}
 	}
 
 	if len(data) > len(slot.reqBuffer) {
