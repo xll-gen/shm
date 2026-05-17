@@ -569,6 +569,21 @@ public:
         if (!slot) {
             int retries = 0;
             uint32_t idx = nextSlot.fetch_add(1, std::memory_order_relaxed) % numSlots;
+#ifdef SHM_DEBUG
+            // Nested-IPC deadlock detector (debug only). The README's
+            // "Nested IPC & Recursion" section warns that an inner call
+            // started while all slots are held by outer calls will spin
+            // forever waiting for a slot that will never be released.
+            // We count full sweeps with zero progress; after the
+            // threshold we emit a one-shot diagnostic so the caller can
+            // see the deadlock instead of a silent hang. We do NOT
+            // abort — production code without SHM_DEBUG keeps the old
+            // spin-forever semantics, so behavior is identical when
+            // compiled out.
+            int fullSweeps = 0;
+            bool diagnosticEmitted = false;
+            constexpr int kDeadlockSweepThreshold = 10000; // ~10k full sweeps
+#endif
 
             while (true) {
                 Slot& s = slots[idx];
@@ -591,7 +606,20 @@ public:
                     }
                 }
                 idx++;
-                if (idx >= numSlots) idx = 0;
+                if (idx >= numSlots) {
+                    idx = 0;
+#ifdef SHM_DEBUG
+                    if (++fullSweeps == kDeadlockSweepThreshold && !diagnosticEmitted) {
+                        SHM_LOG_WARN(
+                            "DirectHost::AcquireSlot: ", kDeadlockSweepThreshold,
+                            " full sweeps with no free slot — potential "
+                            "nested-IPC deadlock. Per README 'Nested IPC & "
+                            "Recursion', numHostSlots must be >= "
+                            "N_threads * (Depth + 1).");
+                        diagnosticEmitted = true;
+                    }
+#endif
+                }
                 retries++;
                 if (retries > (int)numSlots * 100) {
                     Platform::ThreadYield();

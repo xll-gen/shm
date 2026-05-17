@@ -146,6 +146,18 @@ public:
      * @brief Unlinks the named event (removes it from the system).
      *
      * @param name The name of the event.
+     *
+     * @note **Ownership/Lifetime contract**: POSIX named semaphores (Linux
+     *       backend) persist in /dev/shm/sem.* until explicitly unlinked.
+     *       The **host** is responsible for calling UnlinkNamedEvent on
+     *       graceful shutdown — DirectHost::Shutdown() does this for every
+     *       slot's req/resp event. Guests must NOT call this (they only
+     *       sem_close their handles). If a host process is killed before
+     *       Shutdown, the semaphores leak; CI/tests should explicitly
+     *       UnlinkEvent in their setup teardown.
+     *
+     *       On Windows, `Local\` events are kernel-object reference
+     *       counted, so this is a no-op there.
      */
     static void UnlinkNamedEvent(const char* name) {
 #ifdef _WIN32

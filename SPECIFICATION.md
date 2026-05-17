@@ -210,3 +210,58 @@ The `state` field of `SlotHeader` is the synchronizing variable that publishes o
 - **Zero Dependency (Go):** The Go implementation should avoid external dependencies (cgo is permitted for system calls).
 - **Endianness:** The protocol assumes all peers are **Little Endian**.
 - **Padding:** Strict adherence to the padding bytes in `SlotHeader` and `ExchangeHeader` is required for binary compatibility.
+
+## 6. Future: Crash-Time Slot Cleanup (Planned, Not Implemented)
+
+**Status**: Design only — no implementation yet. Targeted for shm v0.7.0.
+
+**Problem**: A host or guest crashing mid-exchange leaves the slot in
+`SLOT_BUSY` / `SLOT_REQ_READY` / `SLOT_GUEST_BUSY` forever. The surviving
+side has no mechanism to distinguish a slow peer from a dead one, so it
+either waits indefinitely or releases the slot prematurely (risking
+overlap with a still-running peer that finally completes).
+
+**Proposed mechanism — heartbeat lease**:
+
+Carve an 8-byte `lease` field out of `SlotHeader::reserved[36]`. The
+layout stays 128 bytes (zero-cost ABI-wise; old readers ignored the
+reserved bytes already):
+
+| Field | Type | Offset | Notes |
+| :--- | :--- | :--- | :--- |
+| `lease` | `atomic<uint64>` | 92 | Monotonic-ns timestamp written by the slot's current owner. |
+| `reserved` | `uint8[28]` | 100 | Reduced from 36 → 28 to make room. |
+
+Semantics:
+
+1. The side currently owning the slot (whoever last CAS'd the state to a
+   non-FREE value) writes `lease = Platform::MonotonicNanos()` periodically
+   — e.g., every spin-window tick of `WaitStrategy::Wait`, or every K
+   iterations.
+
+2. The opposite side (waiting on a state transition) reads `lease` after
+   each timeout window. If `now - lease > kLeaseTimeoutNs` (suggested:
+   5 × `responseTimeoutMs` converted to ns), the slot is *presumed
+   abandoned* and may be CAS'd back to `SLOT_FREE` (recovering from the
+   crash).
+
+3. On any non-crash code path, the owner reaches its release point well
+   inside the lease window, so reclamation never fires. Only crash
+   scenarios trip it.
+
+**Why this is patch-eligible** (the v0.7.0 bump is for the new behavior,
+not the layout): `reserved` was never written by old code, so adding a
+field inside it doesn't break readers compiled against v0.6.x. Writers
+compiled against v0.7.x must heartbeat correctly; mixed-version
+deployments are still supported because old peers simply never see a
+stale lease and never reclaim — they degrade to the current (forever-
+busy) behavior, which is what they did before the field existed.
+
+**Why not implemented yet**: the heartbeat cadence and timeout interact
+with `WaitStrategy` spin tuning, the `nestedIPC` deadlock detector
+(§DirectHost::AcquireSlot, debug-only), and Go-side worker pool
+shutdown. Picking the wrong constants reclaims slots that a slow peer is
+still using → double-use → data corruption. The implementation needs a
+property-based test (random crash injection, assert no double-claim
+across many runs) before it can ship. Tracked as backlog item #1 in
+`AGENTS.md` "Known Improvement Backlog".

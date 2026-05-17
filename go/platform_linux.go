@@ -104,6 +104,20 @@ func closeEvent(h EventHandle) {
 }
 
 // unlinkEvent implementation for Linux.
+//
+// Ownership/Lifetime contract: POSIX named semaphores persist in
+// /dev/shm/sem.* until explicitly unlinked. The host owns cleanup —
+// DirectHost::Shutdown() in C++ removes its events; Go-side hosts (or
+// test setups that create events directly) MUST call UnlinkEvent for
+// every named semaphore they created on graceful shutdown. Guest-only
+// processes never unlink; they sem_close their handle and rely on the
+// host's eventual cleanup.
+//
+// CI/test setups that open the same shmName repeatedly should call
+// UnlinkEvent in teardown — otherwise stale semaphores from a prior
+// run can satisfy a sem_open(O_CREAT) and yield wrong wakeup counts.
+// See go/sem_lifetime_linux_test.go for a regression that catches the
+// leak.
 func unlinkEvent(name string) {
 	cName := C.CString("/" + name)
 	defer C.free(unsafe.Pointer(cName))

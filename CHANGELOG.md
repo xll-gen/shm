@@ -1,5 +1,39 @@
 # Changelog
 
+## [v0.6.5] - 2026-05-17
+
+### C++ Parity
+- Collapsed C++ `WaitStrategy` (`include/shm/WaitStrategy.h`) to the same
+  single-adaptive form Go got in v0.6.1: parameterless constructor,
+  `constexpr int kMinSpin/kMaxSpin/kIncStep/kDecStep` baked in. No diagnostic
+  instrumentation. Internal API only — no consumers used the old per-instance
+  constructor parameters.
+
+### Diagnostics (debug-only)
+- `DirectHost::AcquireSlot` (`include/shm/DirectHost.h`) now ships a debug-mode
+  nested-IPC deadlock detector. When compiled with `SHM_DEBUG`, the function
+  counts full slot sweeps that find zero free slots; after 10 000 fruitless
+  sweeps it emits a one-shot `SHM_LOG_WARN` pointing at the README's "Nested
+  IPC & Recursion" guidance. Production builds (no `SHM_DEBUG`) keep the
+  spin-forever behaviour bit-for-bit identical.
+
+### Documentation
+- `Platform::UnlinkNamedEvent` (C++) and `unlinkEvent` (Go) gained explicit
+  ownership/lifetime docs: the host is responsible for unlinking POSIX
+  named semaphores on graceful shutdown; guests must NOT unlink. Aligns
+  with `DirectHost::Shutdown` which already does the right thing.
+- Added `SPECIFICATION.md §6 "Future: Crash-Time Slot Cleanup"` — design
+  for a heartbeat `lease` field carved from `SlotHeader::reserved[36]`.
+  Layout stays 128 bytes; v0.7.0 will ship the implementation behind a
+  property-based crash-injection test.
+
+### Tests
+- New Linux-tagged regression `TestSemaphoreLifetime_NoLeakAcrossRuns`
+  (`go/sem_lifetime_linux_test.go`) drives 50 CreateEvent/UnlinkEvent
+  cycles and asserts `/dev/shm/sem.*` is back to baseline. Catches the
+  silent class of bug where forgetting `sem_unlink` lets a stale
+  semaphore satisfy the next `sem_open(O_CREAT)` with leftover counts.
+
 ## [v0.6.4] - 2026-05-17
 
 ### API

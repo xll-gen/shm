@@ -6,34 +6,35 @@ namespace shm {
 
 /**
  * @class WaitStrategy
- * @brief Implements an adaptive spin-wait strategy for synchronization.
+ * @brief Single adaptive spin/sleep strategy used by every Direct Exchange slot.
  *
- * This class encapsulates the logic for hybrid spinning and sleeping.
- * It dynamically adjusts the spin limit based on successful acquisitions
- * to optimize latency in varying load conditions (dedicated vs oversubscribed).
+ * Mirrors the Go-side collapse landed in shm v0.6.1. The defaults are tuned
+ * (see EXPERIMENTS.md, "Exp 3"): they keep 1-thread latency near the spin
+ * floor while still hitting peak multi-thread throughput. The constants are
+ * intentionally not configurable — one strategy fits all Direct Exchange call
+ * sites. If a new workload requires different tuning, adjust the constants
+ * here, re-run the harness, and update EXPERIMENTS.md.
+ *
+ * Adaptation: on each successful spin we grow `currentLimit`; on each failed
+ * spin we shrink it. The OS-wait fallback runs only after the punished spin
+ * window expires.
  */
 class WaitStrategy {
 public:
-    int currentLimit;
-    const int minSpin;
-    const int maxSpin;
-    const int incStep;
-    const int decStep;
+    // Spin window is sized to bridge the typical Direct Exchange inter-request
+    // gap on a non-oversubscribed system. kMaxSpin × per-iter cost (~1 ns on
+    // x86 via Platform::CpuRelax) yields a ~50–100 µs ceiling before falling
+    // back to OS-wait. kIncStep ≫ kDecStep so a single failed spin doesn't
+    // collapse the window; adaptive shrink toward kMinSpin only on sustained
+    // failures (oversubscribed environments self-throttle).
+    static constexpr int kMinSpin = 100;
+    static constexpr int kMaxSpin = 50000;
+    static constexpr int kIncStep = 5000;
+    static constexpr int kDecStep = 1000;
 
-    /**
-     * @brief Constructs a WaitStrategy with specified parameters.
-     *
-     * Default values are tuned for high-performance IPC:
-     * - Max: 5000 (Allows adaptation to medium latencies)
-     * - Min: 100 (Avoids complete waste if thrashing)
-     * - Inc: 200 (Aggressive increase)
-     * - Dec: 100 (Gradual backoff)
-     */
-    WaitStrategy(int min = 100, int max = 5000, int inc = 200, int dec = 100)
-        : currentLimit(max), minSpin(min), maxSpin(max), incStep(inc), decStep(dec) {
-            // Start with a reasonable middle ground or max
-            currentLimit = max;
-    }
+    int currentLimit;
+
+    WaitStrategy() : currentLimit(kMaxSpin) {}
 
     /**
      * @brief Waits for a condition to become true.
@@ -43,14 +44,12 @@ public:
      *
      * @param condition The condition to check.
      * @param sleepAction The action to take if spinning times out.
-     * @return true if condition met, false if sleepAction returned (and condition might be true or false).
-     *         The return value effectively mirrors whether we successfully acquired the resource.
+     * @return true if condition met, false if sleepAction returned without it becoming true.
      */
     template <typename Condition, typename SleepAction>
     bool Wait(Condition condition, SleepAction sleepAction) {
         bool ready = false;
 
-        // 1. Spin Phase
         for (int i = 0; i < currentLimit; ++i) {
             if (condition()) {
                 ready = true;
@@ -60,22 +59,18 @@ public:
         }
 
         if (ready) {
-            // Success: Reward (Increase spin limit)
-            if (currentLimit < maxSpin) {
-                currentLimit += incStep;
-                if (currentLimit > maxSpin) currentLimit = maxSpin;
+            if (currentLimit < kMaxSpin) {
+                currentLimit += kIncStep;
+                if (currentLimit > kMaxSpin) currentLimit = kMaxSpin;
             }
         } else {
-            // Failure: Punish (Decrease spin limit)
-            if (currentLimit > minSpin) {
-                currentLimit -= decStep;
-                if (currentLimit < minSpin) currentLimit = minSpin;
+            if (currentLimit > kMinSpin) {
+                currentLimit -= kDecStep;
+                if (currentLimit < kMinSpin) currentLimit = kMinSpin;
             }
 
-            // 2. Sleep Phase
             sleepAction();
 
-            // Check again after waking up
             if (condition()) {
                 ready = true;
             }
