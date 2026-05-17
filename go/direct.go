@@ -64,8 +64,9 @@ const (
 
 	// Magic is the magic number for validating shared memory ("XLL!").
 	Magic uint32 = 0x584C4C21
-	// Version is the current protocol version (v0.6.0).
-	Version uint32 = 0x00060000
+	// Version is the current protocol version (v0.7.0). Adds SlotHeader.Lease
+	// at offset 92 for crash-recovery (reclamation in v0.7.1).
+	Version uint32 = 0x00070000
 
 	// HostStateActive indicates the Host is spinning or processing.
 	HostStateActive  = 0
@@ -79,16 +80,25 @@ const (
 
 // SlotHeader represents the metadata for a single slot in shared memory.
 // It must match the C++ layout exactly (128 bytes).
+//
+// Lease (offset 92, added in v0.7.0): the side that last CAS's State to a
+// non-FREE value writes the current monotonic-ns timestamp here, marking
+// the slot as actively owned. v0.7.0 only writes the lease; the
+// reclamation logic that consumes it ships in v0.7.1 alongside a
+// property-based crash-injection test. Until then external readers may
+// poll Lease for liveness detection but no automatic action is taken.
 type SlotHeader struct {
-    _         [64]byte
-	State     uint32
-	HostState uint32
+    _          [64]byte
+	State      uint32
+	HostState  uint32
 	GuestState uint32
-	MsgSeq    uint32
-    MsgType   MsgType
-	ReqSize   int32
-	RespSize  int32
-    _         [36]byte // Reserved
+	MsgSeq     uint32
+    MsgType    MsgType
+	ReqSize    int32
+	RespSize   int32
+	_          uint32   // 4-byte alignment pad for Lease (mirrors C++ auto-pad)
+	Lease      uint64   // atomic monotonic-ns; offset 96
+    _          [24]byte // Reserved (shrunk from 36 to make room for Lease + pad)
 }
 
 // ExchangeHeader represents the metadata at the start of the shared memory region.
@@ -397,6 +407,7 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, buffer []byte, msgType 
 
 		if currentState == SlotFree {
 			if atomic.CompareAndSwapUint32(&s.header.State, SlotFree, SlotGuestBusy) {
+				atomic.StoreUint64(&s.header.Lease, MonotonicNanos())
 				slot = s
 				break
 			}
@@ -405,6 +416,7 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, buffer []byte, msgType 
 		if currentState == SlotRespReady {
 			if atomic.LoadInt32(&s.ActiveWait) == 0 {
 				if atomic.CompareAndSwapUint32(&s.header.State, SlotRespReady, SlotGuestBusy) {
+					atomic.StoreUint64(&s.header.Lease, MonotonicNanos())
 					slot = s
 					break
 				}
@@ -611,6 +623,7 @@ func (g *DirectGuest) workerLoopInternal(idx int, handler func([]byte, []byte, M
 			if !atomic.CompareAndSwapUint32(&header.State, SlotReqReady, SlotGuestBusy) {
 				continue
 			}
+			atomic.StoreUint64(&header.Lease, MonotonicNanos())
 
 			msgType := header.MsgType
 			if msgType == MsgTypeShutdown {

@@ -34,11 +34,12 @@ namespace shm {
 static const uint32_t SHM_MAGIC = 0x584C4C21;
 
 /**
- * @brief Protocol Version v0.6.0 (0x00060000).
+ * @brief Protocol Version v0.7.0 (0x00070000). Adds atomic uint64 `lease`
+ *        at SlotHeader offset 92 for crash-recovery (v0.7.1 reclamation).
  * High 16 bits: Major, Low 16 bits: Minor.
  * Breaking changes increment Major version.
  */
-static const uint32_t SHM_VERSION = 0x00060000;
+static const uint32_t SHM_VERSION = 0x00070000;
 
 /**
  * @brief Message Types for control messages.
@@ -134,11 +135,36 @@ struct alignas(64) SlotHeader {
     int32_t respSize;
 
     /**
-     * @brief Reserved for future use.
-     * 64 (pre_pad) + 4 (state) + 4 (hostState) + 4 (guestState) + 4 (msgSeq) + 4 (msgType) + 4 (reqSize) + 4 (respSize) = 92 bytes.
-     * 128 - 92 = 36 bytes reserved.
+     * @brief Monotonic-ns heartbeat written by the slot's current owner.
+     *
+     * Whoever last CAS'd `state` to a non-FREE value MUST write
+     * `Platform::MonotonicNanos()` to `lease` in the same critical section
+     * (immediately after the CAS or just before publishing it). This
+     * marks the slot as "actively owned at time T".
+     *
+     * Lives at offset 96 (4 bytes of compiler-inserted padding after
+     * `respSize` to satisfy `std::atomic<uint64_t>`'s 8-byte alignment;
+     * Go-side matches with an explicit `uint32` pad).
+     *
+     * Added in shm v0.7.0 / protocol version 0x00070000. Older readers
+     * compiled against v0.6.x ignore this field (it lives inside what
+     * used to be `reserved[36]`); they keep the original forever-busy
+     * behavior on peer crash.
+     *
+     * v0.7.0 only writes the lease — no reclamation logic yet. The
+     * `TryReclaimAbandonedSlot` API and auto-reclamation hook arrive in
+     * v0.7.1 together with a property-based crash-injection test.
+     * Until then this field is informational; consumers may read it to
+     * detect liveness manually.
      */
-    uint8_t reserved[36];
+    std::atomic<uint64_t> lease;
+
+    /**
+     * @brief Reserved for future use.
+     * 64 (pre_pad) + 4*7 (uint32 cluster up to respSize) + 4 (alignment pad)
+     * + 8 (lease) = 104 bytes. 128 - 104 = 24 bytes reserved.
+     */
+    uint8_t reserved[24];
 };
 
 // ABI safety: SlotHeader must remain exactly 128 bytes and at least 64-byte

@@ -560,6 +560,7 @@ public:
 
             if (canClaim) {
                 if (s.header->state.compare_exchange_strong(current, SLOT_BUSY, std::memory_order_acquire)) {
+                    s.header->lease.store(Platform::MonotonicNanos(), std::memory_order_release);
                     slot = &s;
                     resultIdx = (int32_t)cachedSlotIdx;
                 }
@@ -599,6 +600,7 @@ public:
 
                 if (canClaim) {
                     if (s.header->state.compare_exchange_strong(current, SLOT_BUSY, std::memory_order_acquire)) {
+                        s.header->lease.store(Platform::MonotonicNanos(), std::memory_order_release);
                         slot = &s;
                         cachedSlotIdx = idx;
                         resultIdx = (int32_t)idx;
@@ -666,6 +668,7 @@ public:
 
              if (canClaim) {
                  if (slot->header->state.compare_exchange_strong(current, SLOT_BUSY, std::memory_order_acquire)) {
+                     slot->header->lease.store(Platform::MonotonicNanos(), std::memory_order_release);
                      break;
                  }
              }
@@ -1047,6 +1050,7 @@ public:
             if (current != SLOT_REQ_READY) continue;
 
             if (slot->header->state.compare_exchange_strong(current, SLOT_BUSY, std::memory_order_acq_rel)) {
+                slot->header->lease.store(Platform::MonotonicNanos(), std::memory_order_release);
                 int32_t reqSize = slot->header->reqSize;
                 const uint8_t* reqData = nullptr;
                 uint32_t absReqSize = (reqSize < 0) ? (0u - (uint32_t)reqSize) : (uint32_t)reqSize;

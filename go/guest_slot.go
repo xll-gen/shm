@@ -153,6 +153,7 @@ func (g *DirectGuest) AcquireGuestSlot() (*GuestSlot, error) {
 		// Case 1: Slot is Free
 		if currentState == SlotFree {
 			if atomic.CompareAndSwapUint32(&s.header.State, SlotFree, SlotGuestBusy) { // Use SlotGuestBusy (5)
+				atomic.StoreUint64(&s.header.Lease, MonotonicNanos())
 				return &GuestSlot{
 					guest:   g,
 					slotIdx: i,
@@ -166,6 +167,7 @@ func (g *DirectGuest) AcquireGuestSlot() (*GuestSlot, error) {
 		if currentState == SlotRespReady {
 			if atomic.LoadInt32(&s.ActiveWait) == 0 {
 				if atomic.CompareAndSwapUint32(&s.header.State, SlotRespReady, SlotGuestBusy) {
+					atomic.StoreUint64(&s.header.Lease, MonotonicNanos())
 					return &GuestSlot{
 						guest:   g,
 						slotIdx: i,

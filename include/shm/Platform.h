@@ -320,6 +320,46 @@ public:
     }
 
     /**
+     * @brief Returns wall-clock nanoseconds since Unix epoch.
+     *
+     * Used by the v0.7.0 `SlotHeader::lease` field — owners stamp their
+     * activity time. We use wall-clock (not `CLOCK_MONOTONIC` / QPC)
+     * specifically so the value is comparable across processes AND
+     * across languages: the Go side stores `time.Now().UnixNano()` and
+     * the C++ side stores this. Both sit in the same Unix-epoch
+     * timeline.
+     *
+     * NOT strictly monotonic — an NTP step can move the clock backward.
+     * For lease purposes this is acceptable: a backward step causes a
+     * spurious reclamation candidate (caught by the v0.7.1 CAS guard,
+     * which re-checks state before reclaiming); a forward step delays
+     * reclamation. Neither corrupts data, both are rare.
+     *
+     * Despite the name "MonotonicNanos" we are NOT using a monotonic
+     * clock; kept this way so v0.7.1's `TryReclaimAbandonedSlot` API
+     * has a stable identifier. Will be revisited when v0.7.1 adds the
+     * crash-injection test that pins the epoch contract.
+     */
+    static uint64_t MonotonicNanos() {
+#ifdef _WIN32
+        FILETIME ft;
+        GetSystemTimePreciseAsFileTime(&ft);
+        // FILETIME is 100-ns ticks since 1601-01-01; Unix epoch is
+        // 1970-01-01, so subtract the 11644473600-second offset.
+        ULARGE_INTEGER ull;
+        ull.LowPart = ft.dwLowDateTime;
+        ull.HighPart = ft.dwHighDateTime;
+        const uint64_t kEpochDeltaTicks = 116444736000000000ULL;
+        return (ull.QuadPart - kEpochDeltaTicks) * 100ULL;
+#else
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        return static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL +
+               static_cast<uint64_t>(ts.tv_nsec);
+#endif
+    }
+
+    /**
      * @brief Returns the current process ID.
      * @return int PID.
      */

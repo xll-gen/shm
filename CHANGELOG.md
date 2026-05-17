@@ -1,5 +1,55 @@
 # Changelog
 
+## [v0.7.0] - 2026-05-17
+
+### Protocol — Heartbeat Lease (write-only)
+
+Bumps protocol version to `0x00070000`. Carves an `atomic<uint64> lease`
+out of `SlotHeader::reserved[36]` at offset 96 (with 4 bytes of natural
+alignment padding before it). Total `SlotHeader` size stays 128 bytes;
+the field used to be opaque reserved bytes that v0.6.x peers ignored, so
+this is forward-compatible with older readers.
+
+Every site that CAS's slot `state` to a non-FREE value now writes
+`Platform::MonotonicNanos()` (C++) / `shm.MonotonicNanos()` (Go) into
+`lease` immediately after the CAS:
+
+* `DirectHost::AcquireSlot` (cached and slow paths)
+* `DirectHost::AcquireSpecificSlot`
+* `DirectHost::ProcessGuestCalls` (worker pickup)
+* `direct.go::sendGuestCallInternal` (both Free→GuestBusy and
+  RespReady→GuestBusy reclaim paths)
+* `direct.go::workerLoop` (worker pickup: ReqReady→GuestBusy)
+* `guest_slot.go::Acquire` (both Free→GuestBusy and RespReady→GuestBusy)
+
+No code reads `lease` in v0.7.0 yet — the value is observable through
+the field for diagnostics. v0.7.1 introduces the reclamation policy
+behind a property-based crash-injection test.
+
+### Clock contract
+
+`lease` is **wall-clock nanoseconds since the Unix epoch** (NOT a
+monotonic counter). Both sides converged on wall-clock so the value is
+comparable across processes AND across languages without coordinating
+clock epochs:
+
+| Side | Source |
+| :--- | :--- |
+| C++ | `GetSystemTimePreciseAsFileTime` (Windows) / `clock_gettime(CLOCK_REALTIME)` (Linux) |
+| Go | `time.Now().UnixNano()` |
+
+The function names retain "MonotonicNanos" for API stability despite the
+wall-clock implementation; revisit when v0.7.1 lands.
+
+### Tests
+
+* `go/lease_test.go`:
+  * `TestSlotHeader_LeaseOffset` — locks down `Lease` at offset 96.
+  * `TestMonotonicNanos_NonZero` — sanity-checks the helper across a
+    1 ms sleep.
+  * `TestLeaseField_WriteableViaAtomic` — exercises atomic store/load
+    against the field.
+
 ## [v0.6.5] - 2026-05-17
 
 ### C++ Parity

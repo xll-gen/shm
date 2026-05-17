@@ -65,9 +65,13 @@ The `SlotHeader` controls the state of the transaction. It **must** be aligned t
 | `msgType` | `uint32` | 80 | Message Type (e.g., Normal, Shutdown). |
 | `reqSize` | `int32` | 84 | Size of Request payload (see Section 3.3). |
 | `respSize` | `int32` | 88 | Size of Response payload (see Section 3.3). |
-| `reserved` | `uint8[36]` | 92 | Reserved to reach 128 bytes. |
+| _(align pad)_ | `uint32` | 92 | 4 bytes of padding to 8-byte-align `lease`. |
+| `lease` | `atomic<uint64>` | 96 | **v0.7.0+**: wall-clock-ns heartbeat written by the current owner immediately after CAS'ing `state` to a non-FREE value. See §3.6. |
+| `reserved` | `uint8[24]` | 104 | Reserved to reach 128 bytes. |
 
 **Total Size:** 128 Bytes.
+
+**Compatibility note**: the `lease` slot used to be inside `reserved[36]` (v0.6.x and earlier). Older readers see those bytes as opaque padding and behave exactly as before — they never wrote into `reserved`, so introducing a typed field there is forward-compatible. The protocol version bumped to `0x00070000` so a writer can detect peers that won't update `lease` and skip lease-based reclamation.
 
 ### 2.3. Slot Partitioning
 
@@ -211,57 +215,33 @@ The `state` field of `SlotHeader` is the synchronizing variable that publishes o
 - **Endianness:** The protocol assumes all peers are **Little Endian**.
 - **Padding:** Strict adherence to the padding bytes in `SlotHeader` and `ExchangeHeader` is required for binary compatibility.
 
-## 6. Future: Crash-Time Slot Cleanup (Planned, Not Implemented)
+## 3.6. Lease Heartbeat (v0.7.0)
 
-**Status**: Design only — no implementation yet. Targeted for shm v0.7.0.
+**Status**: Layout + heartbeat-on-CAS shipped in v0.7.0. Reclamation logic is targeted for v0.7.1.
 
-**Problem**: A host or guest crashing mid-exchange leaves the slot in
-`SLOT_BUSY` / `SLOT_REQ_READY` / `SLOT_GUEST_BUSY` forever. The surviving
-side has no mechanism to distinguish a slow peer from a dead one, so it
-either waits indefinitely or releases the slot prematurely (risking
-overlap with a still-running peer that finally completes).
+**Problem**: A host or guest crashing mid-exchange leaves the slot in `SLOT_BUSY` / `SLOT_REQ_READY` / `SLOT_GUEST_BUSY` forever. The surviving side has no mechanism to distinguish a slow peer from a dead one.
 
-**Proposed mechanism — heartbeat lease**:
+**v0.7.0 mechanism — write-only heartbeat**:
 
-Carve an 8-byte `lease` field out of `SlotHeader::reserved[36]`. The
-layout stays 128 bytes (zero-cost ABI-wise; old readers ignored the
-reserved bytes already):
+Every site that CAS's `state` from `SLOT_FREE` (or `SLOT_RESP_READY`/`SLOT_REQ_READY` reclaim paths) to a non-FREE value MUST, immediately after the successful CAS, store `Platform::MonotonicNanos()` into `lease` with `memory_order_release` (or Go's `atomic.StoreUint64`). This marks the slot as "actively owned at time T".
 
-| Field | Type | Offset | Notes |
-| :--- | :--- | :--- | :--- |
-| `lease` | `atomic<uint64>` | 92 | Monotonic-ns timestamp written by the slot's current owner. |
-| `reserved` | `uint8[28]` | 100 | Reduced from 36 → 28 to make room. |
+In v0.7.0 nothing yet *reads* `lease` to make decisions — the field is observable through `SlotHeader::lease` for diagnostics, but no code reclaims based on it. v0.7.1 will introduce the reclamation policy.
 
-Semantics:
+**Clock contract**: `lease` is **wall-clock nanoseconds since the Unix epoch**, not a monotonic counter. Both sides use it:
 
-1. The side currently owning the slot (whoever last CAS'd the state to a
-   non-FREE value) writes `lease = Platform::MonotonicNanos()` periodically
-   — e.g., every spin-window tick of `WaitStrategy::Wait`, or every K
-   iterations.
+| Side | Source |
+| :--- | :--- |
+| C++ Host | `Platform::MonotonicNanos()` — `GetSystemTimePreciseAsFileTime` (Windows) or `clock_gettime(CLOCK_REALTIME)` (Linux), normalised to ns-since-Unix-epoch. |
+| Go Guest | `shm.MonotonicNanos()` — `time.Now().UnixNano()`. |
 
-2. The opposite side (waiting on a state transition) reads `lease` after
-   each timeout window. If `now - lease > kLeaseTimeoutNs` (suggested:
-   5 × `responseTimeoutMs` converted to ns), the slot is *presumed
-   abandoned* and may be CAS'd back to `SLOT_FREE` (recovering from the
-   crash).
+The name "MonotonicNanos" predates the wall-clock choice; it stays for API stability. Wall-clock was selected so the values are comparable across processes AND across languages without coordinating clock epochs. NTP steps can move the clock backward; a backward step causes at most a spurious reclamation candidate (guarded by the v0.7.1 CAS check against `state`), never data corruption.
 
-3. On any non-crash code path, the owner reaches its release point well
-   inside the lease window, so reclamation never fires. Only crash
-   scenarios trip it.
+**v0.7.1 (planned) — reclamation**:
 
-**Why this is patch-eligible** (the v0.7.0 bump is for the new behavior,
-not the layout): `reserved` was never written by old code, so adding a
-field inside it doesn't break readers compiled against v0.6.x. Writers
-compiled against v0.7.x must heartbeat correctly; mixed-version
-deployments are still supported because old peers simply never see a
-stale lease and never reclaim — they degrade to the current (forever-
-busy) behavior, which is what they did before the field existed.
+1. Waiter side reads `lease`. If `now - lease > kLeaseTimeoutNs` (suggested: 5 × `responseTimeoutMs` converted to ns), the slot is *presumed abandoned*.
+2. Waiter attempts `state.compare_exchange_strong(observed_state, SLOT_FREE)`. If the CAS succeeds the slot is reclaimed; if it fails, the live owner made progress in the meantime — abort the reclamation, retry the normal flow.
+3. Reclamation never fires on non-crash code paths because the heartbeat is refreshed inside the timeout window.
 
-**Why not implemented yet**: the heartbeat cadence and timeout interact
-with `WaitStrategy` spin tuning, the `nestedIPC` deadlock detector
-(§DirectHost::AcquireSlot, debug-only), and Go-side worker pool
-shutdown. Picking the wrong constants reclaims slots that a slow peer is
-still using → double-use → data corruption. The implementation needs a
-property-based test (random crash injection, assert no double-claim
-across many runs) before it can ship. Tracked as backlog item #1 in
-`AGENTS.md` "Known Improvement Backlog".
+Picking the wrong heartbeat cadence or timeout could reclaim a slot a slow-but-live peer is still using → double-use → data corruption. v0.7.1 will ship the reclamation API together with a property-based crash-injection test that asserts no double-claim across N random crash points. The test is the gating constraint; the API is straightforward once the test infrastructure exists.
+
+**Why this was patch-layout-compatible**: `reserved[36]` was never written by v0.6.x code, so adding `atomic<uint64> lease` at offset 96 (with 4 bytes of natural alignment padding before it) is invisible to old readers. Old writers don't touch the slice. Mixed-version deployments degrade gracefully — v0.6.x peers participating in the protocol simply never publish a lease; v0.7.x reclaimers will see `lease == 0` for those slots and (per v0.7.1 design) skip reclamation for them, falling back to the pre-v0.7 forever-busy behavior.
