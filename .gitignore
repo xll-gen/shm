@@ -6,7 +6,11 @@
 *.dylib
 bin/
 build/
+build_bench/
 server
+
+# Benchmark output (commit selectively under benchmarks/results/<named>/)
+benchmarks/results/
 
 # Test binary, built with `go test -c`
 *.test

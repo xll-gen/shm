@@ -293,9 +293,7 @@ func NewDirectGuest(name string) (*DirectGuest, error) {
 
         g.slots[i].nextMsgSeq = uint32(i + 1)
 
-        // Optimize for Single Thread (latency) vs Multi Thread (throughput)
-        enableYield := numSlots > 1
-        g.slots[i].waitStrategy = NewWaitStrategy(enableYield)
+        g.slots[i].waitStrategy = NewWaitStrategy()
 
 		ptr += uintptr(perSlotSize)
 	}
@@ -478,7 +476,7 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, buffer []byte, msgType 
     }
 
 	atomic.StoreInt32(&slot.ActiveWait, 1)
-    ready := slot.waitStrategy.Wait(checkReady, sleepAction)
+    ready := slot.waitStrategy.WaitState(&slot.header.State, SlotRespReady, sleepAction)
 	atomic.StoreInt32(&slot.ActiveWait, 0)
 
 	if !ready {
@@ -590,14 +588,10 @@ func (g *DirectGuest) workerLoopInternal(idx int, handler func([]byte, []byte, M
 			return false
 		}
 
-		checkReady := func() bool {
-			return atomic.LoadUint32(&header.State) == SlotReqReady
-		}
-
 		sleepAction := func() {
 			atomic.StoreUint32(&header.GuestState, GuestStateWaiting)
 
-			if checkReady() {
+			if atomic.LoadUint32(&header.State) == SlotReqReady {
 				atomic.StoreUint32(&header.GuestState, GuestStateActive)
 				return
 			}
@@ -611,7 +605,7 @@ func (g *DirectGuest) workerLoopInternal(idx int, handler func([]byte, []byte, M
 			atomic.StoreUint32(&header.GuestState, GuestStateActive)
 		}
 
-		ready := slot.waitStrategy.Wait(checkReady, sleepAction)
+		ready := slot.waitStrategy.WaitState(&header.State, SlotReqReady, sleepAction)
 
 		if ready {
 			if !atomic.CompareAndSwapUint32(&header.State, SlotReqReady, SlotGuestBusy) {

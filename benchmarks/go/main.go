@@ -147,6 +147,22 @@ func main() {
 		fmt.Println("Client stopped (Host Shutdown).")
 	}
 
+	gSpin := atomic.LoadUint64(&shm.WaitStatsSpinSuccess)
+	gSleep := atomic.LoadUint64(&shm.WaitStatsSleepFallback)
+	gTotal := gSpin + gSleep
+	var sleepPct float64
+	if gTotal > 0 {
+		sleepPct = 100.0 * float64(gSleep) / float64(gTotal)
+	}
+	gIters := atomic.LoadUint64(&shm.WaitStatsIterCount)
+	var avgIters float64
+	if gSpin > 0 {
+		avgIters = float64(gIters) / float64(gSpin)
+	}
+	fmt.Printf("[GuestWS] SpinSuccess:   %s\n", formatUint(gSpin))
+	fmt.Printf("[GuestWS] SleepFallback: %s (%.2f%%)\n", formatUint(gSleep), sleepPct)
+	fmt.Printf("[GuestWS] AvgItersPerSpin: %.1f\n", avgIters)
+
 	if *memProfile != "" {
 		f, err := os.Create(*memProfile)
 		if err != nil {

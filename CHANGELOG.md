@@ -1,5 +1,34 @@
 # Changelog
 
+## [v0.6.1] - 2026-05-17
+
+### WaitStrategy (Go)
+- Collapsed Go `WaitStrategy` to a single adaptive strategy. Removed the
+  `NewWaitStrategy(enableYield bool)` flag — tuned defaults are now
+  package-level constants. Internal API only.
+- New asm fast-path: `spinUntilEq32` (`go/spin_amd64.s`) implements the
+  inner spin loop entirely in assembly, eliminating per-iteration Go→asm
+  CALL / TLS reload cost. `(*WaitStrategy).WaitState(addr, want, sleep)`
+  wraps it and is used by all production Direct-Exchange callsites
+  (direct.go, guest_slot.go). The closure-based `Wait` path is retained
+  for non-state-equality conditions.
+- Yield cadence moved from 128 to 4096 spin iterations and made always-on
+  (previously gated on `numSlots > 1`). Avoids the ~5 µs Gosched tax at
+  high spin counts and prevents short-timeout callers from being broken
+  by aggressive yielding.
+
+### Diagnostics (temporary)
+- Added package-global `WaitStatsSpinSuccess / SleepFallback / IterCount`
+  counters and matching C++ `WaitStrategyStats` struct so the benchmark
+  harness can report spin-success vs sleep-fallback ratios. Expect these
+  to be removed once perf tuning settles — do not depend on the names.
+
+### Tooling
+- Added `benchmarks/harness.ps1`: matrix sweep driver that builds binaries,
+  runs the C++/Go ping-pong across a `(threads × payload)` grid, and emits
+  `results.csv` + `summary.md` (throughput/latency pivots, peak rows,
+  anomaly table) plus per-case raw logs.
+
 ## [v0.6.0] - 2025-12-14
 
 ### Streaming API (Double Buffering)

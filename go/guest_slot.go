@@ -72,13 +72,9 @@ func (s *GuestSlot) SendWithTimeout(size int32, msgType MsgType, timeout time.Du
 	SignalEvent(s.slot.reqEvent)
 
 	// Wait for Response
-	checkReady := func() bool {
-		return atomic.LoadUint32(&header.State) == SlotRespReady
-	}
-
 	sleepAction := func() {
 		atomic.StoreUint32(&header.GuestState, GuestStateWaiting)
-		if checkReady() {
+		if atomic.LoadUint32(&header.State) == SlotRespReady {
 			atomic.StoreUint32(&header.GuestState, GuestStateActive)
 			return
 		}
@@ -86,7 +82,7 @@ func (s *GuestSlot) SendWithTimeout(size int32, msgType MsgType, timeout time.Du
 		// Loop to handle spurious wakeups
 		start := time.Now()
 		for {
-			if checkReady() {
+			if atomic.LoadUint32(&header.State) == SlotRespReady {
 				break
 			}
 
@@ -111,7 +107,7 @@ func (s *GuestSlot) SendWithTimeout(size int32, msgType MsgType, timeout time.Du
 
 	// Set ActiveWait before entering Wait
 	atomic.StoreInt32(&s.slot.ActiveWait, 1)
-	ready := s.slot.waitStrategy.Wait(checkReady, sleepAction)
+	ready := s.slot.waitStrategy.WaitState(&header.State, SlotRespReady, sleepAction)
 	atomic.StoreInt32(&s.slot.ActiveWait, 0)
 
 	if !ready {
