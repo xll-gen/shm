@@ -1,5 +1,35 @@
 # Changelog
 
+## [v0.7.3] - 2026-05-17
+
+### Cross-process crash test
+
+`go/reclaim_crash_test.go::TestCrashProcess_ReclaimAfterChildExit` is
+the v0.7 series' missing test layer: real OS-process crash injection.
+
+- Parent creates a fresh shm (1 host slot + 1 guest slot) and per-slot
+  events the same way `TestSystemErrorReal` does.
+- Parent re-execs the test binary with `SHM_CRASH_TEST_WORKER=1` and the
+  shm name in `SHM_CRASH_TEST_NAME`. The child opens the existing shm
+  (same kernel handle/object the parent's pointing at), CAS's the guest
+  slot's `State` from `SlotFree` → `SlotGuestBusy`, writes
+  `Lease = MonotonicNanos()`, then `os.Exit(0)` — never releases the
+  slot, modeling a guest that crashed mid-handler.
+- Parent waits up to 10 s for the child to exit, asserts the slot is
+  in the post-claim state with a non-zero lease, then sleeps past a
+  50 ms reclamation threshold and calls `TryReclaimAbandonedSlot`.
+  Asserts the slot transitions back to `SlotFree`.
+
+This validates that the v0.7.0–v0.7.2 lease/reclamation pipeline works
+across real kernel-tracked shared memory and semaphore handles, not
+just in-process CAS races. Runs in ~0.5 s. Cross-platform — uses the
+standard `createShm`/`createEvent` primitives via cgo (Linux) or
+Win32 (Windows).
+
+With this test in place, the v0.7-series crash-recovery feature is
+feature-complete: lease (v0.7.0) + opt-in API (v0.7.1) + auto-reclaim
+integration (v0.7.2) + cross-process verification (v0.7.3).
+
 ## [v0.7.2] - 2026-05-17
 
 ### Auto-Reclaim Integration
