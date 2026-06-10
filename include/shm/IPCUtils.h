@@ -35,7 +35,8 @@ static const uint32_t SHM_MAGIC = 0x584C4C21;
 
 /**
  * @brief Protocol Version v0.7.0 (0x00070000). Adds atomic uint64 `lease`
- *        at SlotHeader offset 92 for crash-recovery (v0.7.1 reclamation).
+ *        at SlotHeader offset 96 (offset 92 is alignment padding) for
+ *        crash-recovery (v0.7.1 reclamation).
  * High 16 bits: Major, Low 16 bits: Minor.
  * Breaking changes increment Major version.
  */

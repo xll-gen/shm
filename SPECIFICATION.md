@@ -1,4 +1,4 @@
-# Shared Memory IPC Specification (v0.6.0)
+# Shared Memory IPC Specification (v0.7.0)
 
 This document defines the specification for the `xll-gen/shm` Shared Memory IPC system. It serves as the authoritative reference for implementing the protocol in any language (C++, Go, Python, Rust, etc.).
 
@@ -29,7 +29,7 @@ The first 64 bytes of the shared memory are reserved for the `ExchangeHeader`. T
 | Field | Type | Offset | Description |
 | :--- | :--- | :--- | :--- |
 | `magic` | `uint32` | 0 | Magic Number (0x584C4C21). |
-| `version` | `uint32` | 4 | Protocol Version (0x00060000). |
+| `version` | `uint32` | 4 | Protocol Version (0x00070000). |
 | `numSlots` | `uint32` | 8 | Number of Host-to-Guest slots. |
 | `numGuestSlots` | `uint32` | 12 | Number of Guest-to-Host (Guest Call) slots. |
 | `slotSize` | `uint32` | 16 | Total size of a single slot in bytes. |
@@ -162,6 +162,8 @@ The `reqSize` and `respSize` fields indicate the location of the data within the
 4.  **Process:** Host (polling `ProcessGuestCalls`) detects `SLOT_REQ_READY`, processes, and writes response.
 5.  **Reply:** Host sets `SLOT_RESP_READY` and signals Guest.
 6.  **Complete:** Guest reads response and resets state to `SLOT_FREE`.
+
+*Consume-claim note (step 6):* a Guest implementation SHOULD atomically CAS `SLOT_RESP_READY` → `SLOT_GUEST_BUSY` before reading the response, and release via CAS `SLOT_GUEST_BUSY` → `SLOT_FREE` when done. This keeps the slot visibly owned while the response is being consumed, so intra-process zombie-reclaim heuristics cannot steal it mid-read, and a blind `SLOT_FREE` store can never clobber a concurrent reclaimer's transaction. The Host is unaffected: it only acts on `SLOT_REQ_READY` in the Guest Slot range, and the claiming CAS refreshes `lease` per §3.6. If the wait for `SLOT_RESP_READY` times out, the Guest MUST NOT store `SLOT_FREE` (the Host may still own the slot in `SLOT_REQ_READY`/`SLOT_BUSY`); the slot is recovered later by a reclaim path once the late response arrives or the lease goes stale.
 
 ## 4. Synchronization & Signaling
 
