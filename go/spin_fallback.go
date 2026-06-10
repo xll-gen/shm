@@ -16,3 +16,7 @@ func spinUntilEq32(addr *uint32, want uint32, max uintptr) (uintptr, bool) {
 	}
 	return max, false
 }
+
+// cpuPause is a no-op on non-amd64 builds (the amd64 version emits PAUSE).
+// Build-portability fallback only; the runtime target is windows/amd64.
+func cpuPause() {}

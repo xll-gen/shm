@@ -23,11 +23,6 @@ const (
 	EVENT_ALL_ACCESS    = 0x1F0003
 )
 
-// implemented in asm_windows_amd64.s
-//
-//go:noescape
-func rawSyscall(trap, a1, a2, a3 uintptr) (r1, r2, err uintptr)
-
 // createEvent implementation for Windows.
 func createEvent(name string) (EventHandle, error) {
 	n, err := syscall.UTF16PtrFromString("Local\\" + name)
@@ -57,9 +52,15 @@ func openEvent(name string) (EventHandle, error) {
 }
 
 // signalEvent implementation for Windows.
+//
+// This goes through the runtime's standard stdcall path (g0 switch). A
+// previous custom rawSyscall asm shim skipped that for speed, but it called
+// kernel32 on the goroutine stack without the 16-byte RSP alignment the
+// Microsoft x64 ABI requires (UB) and without stack headroom guarantees.
+// SetEvent only fires when the peer is parked in an OS wait — already the
+// slow path, where the kernel transition dwarfs the dispatch overhead.
 func signalEvent(h EventHandle) {
-	// SetEvent is non-blocking, so we use rawSyscall to avoid scheduler overhead.
-	rawSyscall(procSetEvent.Addr(), uintptr(h), 0, 0)
+	procSetEvent.Call(uintptr(h))
 }
 
 // waitForEvent implementation for Windows.

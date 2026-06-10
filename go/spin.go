@@ -5,16 +5,6 @@ import (
 	"sync/atomic"
 )
 
-// cpuPause emits the x86 PAUSE instruction (implementation in
-// cpu_pause_amd64.s). Used inside the spin loop to back off briefly so the
-// peer core's cache write can land — critical under KVM/Hyper-V where naked
-// spin loops cause cache-line ping-pong and PLE-induced VMEXIT pressure.
-//
-// Retained for the closure-based Wait path. Hot callers should use
-// (*WaitStrategy).WaitState, whose inner loop is implemented entirely in
-// assembly (spin_amd64.s) and skips the per-iteration Go→asm CALL.
-func cpuPause()
-
 // waitStrategyAsmChunk bounds the iteration count handed to spinUntilEq32 in
 // one burst. Between bursts the Go wrapper calls runtime.Gosched(), preserving
 // the legacy 4096-iter yield cadence without putting Gosched into the asm
@@ -41,8 +31,11 @@ const (
 	waitStrategyYieldMask int   = 0xFFF // runtime.Gosched() every 4096 spin iterations
 )
 
-// TEMPORARY DIAGNOSTIC — package-global counters measuring how often Wait()
-// falls through the spin window into the OS-wait path. Revert before merging.
+// Benchmark instrumentation: package-global counters measuring how often
+// Wait/WaitState resolve within the spin window vs. fall through to the
+// OS-wait path. Consumed by benchmarks/go/main.go to report spin efficiency
+// when tuning the adaptive constants above. Two relaxed atomic adds on the
+// post-wait path; not on the spin inner loop itself.
 var (
 	WaitStatsSpinSuccess   uint64
 	WaitStatsSleepFallback uint64
