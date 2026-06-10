@@ -1,5 +1,22 @@
 # Changelog
 
+## [v0.7.4] - 2026-06-10
+
+### Fixed
+
+- Added the missing `.gitmodules` URL entry for the `benchmarks/external/aeron`
+  submodule. The gitlink (commit 707fa29) was recorded without a corresponding
+  `.gitmodules` entry, so `git clone --recursive` and `git submodule update`
+  aborted with "No url found for submodule path". Non-recursive clones are
+  unaffected; aeron is only fetched on an explicit recursive clone / submodule
+  init (when building the aeron benchmark).
+
+### Docs
+
+- Documented that `SlotHeader` atomic-field alignment (State @64, Lease @96) is
+  guaranteed by the mapping layout (`base = 64 + N*(128 + slotSize)`, slotSize%8
+  enforced in `Init`), not by Go struct alignment.
+
 ## [v0.7.3] - 2026-05-17
 
 ### Cross-process crash test
