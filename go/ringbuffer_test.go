@@ -17,13 +17,10 @@ func TestRingBufferReceiver(t *testing.T) {
 	header.WriteOffset = 0
 	header.ReadOffset = 0
 
-	// Create Receiver
-	rb := &RingBufferReceiver{
-		slotIdx:  0,
-		header:   header,
-		data:     mem[256:],
-		capacity: 1024,
-		guest:    nil, // Not needed for this unit test
+	// Create Receiver via the bootstrap path (also exercises its guards)
+	rb, ok := BootstrapRingBuffer(mem)
+	if !ok {
+		t.Fatal("BootstrapRingBuffer rejected a valid buffer")
 	}
 
 	// 2. Simulate Host Writing
@@ -95,5 +92,21 @@ func TestRingBufferReceiver(t *testing.T) {
 
 	if !bytes.Equal(readBuf, moreData) {
 		t.Fatalf("Data mismatch in wrapped read")
+	}
+}
+
+func TestBootstrapRingBuffer_RejectsInvalidBuffers(t *testing.T) {
+	// Header-only (no data): a zero-capacity ring would divide by zero.
+	if _, ok := BootstrapRingBuffer(make([]byte, 256)); ok {
+		t.Fatal("expected rejection: 256-byte buffer leaves zero data capacity")
+	}
+	// Too short for the header at all.
+	if _, ok := BootstrapRingBuffer(make([]byte, 64)); ok {
+		t.Fatal("expected rejection: buffer shorter than header")
+	}
+	// Misaligned base: the header offsets are accessed with 64-bit atomics.
+	backing := make([]byte, 600)
+	if _, ok := BootstrapRingBuffer(backing[1:]); ok {
+		t.Fatal("expected rejection: misaligned base address")
 	}
 }
