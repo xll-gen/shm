@@ -82,6 +82,16 @@ const (
 // SlotHeader represents the metadata for a single slot in shared memory.
 // It must match the C++ layout exactly (128 bytes).
 //
+// Atomic-field alignment is guaranteed by the *mapping layout*, NOT by Go
+// struct alignment: the leading `_ [64]byte` pushes State to offset 64 and
+// Lease to offset 96 within the header, and slot N's header sits at
+// base = 64 (ExchangeHeader) + N*(128 + slotSize) in the mapped region. Since
+// 64 and 128 are multiples of 8 and Init rejects a slotSize that is not 8-byte
+// aligned (see the slotSize%8 guard), every slot base — and therefore every
+// State (base+64) and Lease (base+96) — is 8-byte aligned for the atomic ops.
+// Do not rely on Go's natural struct alignment here; mmap'd memory is only as
+// aligned as the offsets above make it.
+//
 // Lease (offset 96, added in v0.7.0): the side that last CAS's State to a
 // non-FREE value writes the current monotonic-ns timestamp here, marking
 // the slot as actively owned. v0.7.0 only writes the lease; the
