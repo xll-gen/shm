@@ -23,3 +23,8 @@ func Debug(msg string, args ...any) {
 func Info(msg string, args ...any) {
 	defaultLogger.Info(msg, args...)
 }
+
+// Error logs a message at Error level.
+func Error(msg string, args ...any) {
+	defaultLogger.Error(msg, args...)
+}

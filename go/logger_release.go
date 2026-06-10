@@ -14,3 +14,10 @@ func Debug(msg string, args ...any) {}
 
 // Info is a no-op in release mode.
 func Info(msg string, args ...any) {}
+
+// Error logs even in release mode — error-class events (worker panics,
+// protocol violations) must never be silenced. Goes through slog.Default()
+// so the embedding application controls the sink via slog.SetDefault.
+func Error(msg string, args ...any) {
+	slog.Default().Error(msg, args...)
+}

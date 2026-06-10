@@ -19,38 +19,38 @@ type MsgType uint32
 // Constants defining slot states and message Types.
 const (
 	// SlotFree indicates the slot is available for the Host to claim.
-	SlotFree      = 0
+	SlotFree = 0
 	// SlotReqReady indicates the Host has written a request and it is ready for the Guest.
-	SlotReqReady  = 1
+	SlotReqReady = 1
 	// SlotRespReady indicates the Guest has written a response and it is ready for the Host.
 	SlotRespReady = 2
 	// SlotDone is a transient state indicating transaction completion.
 	// SLOT_DONE = 3 (reserved; not currently used by the protocol but
 	// retained for future flow extensions).
-	SlotDone      = 3
+	SlotDone = 3
 	// SlotBusy indicates the Host has claimed the slot and is writing data.
-	SlotBusy      = 4
+	SlotBusy = 4
 	// SlotGuestBusy indicates the Guest has claimed the slot and is writing data.
 	SlotGuestBusy = 5
 
 	// MsgTypeNormal is a standard data payload message.
-	MsgTypeNormal        MsgType = 0
+	MsgTypeNormal MsgType = 0
 	// MsgTypeHeartbeatReq is a keep-alive request from the Host.
-	MsgTypeHeartbeatReq  MsgType = 1
+	MsgTypeHeartbeatReq MsgType = 1
 	// MsgTypeHeartbeatResp is the response to a keep-alive request.
 	MsgTypeHeartbeatResp MsgType = 2
 	// MsgTypeShutdown signals the Guest to terminate.
-	MsgTypeShutdown      MsgType = 3
+	MsgTypeShutdown MsgType = 3
 	// MsgTypeFlatbuffer indicates a Zero-Copy FlatBuffer payload.
-	MsgTypeFlatbuffer    MsgType = 10
+	MsgTypeFlatbuffer MsgType = 10
 	// MsgTypeGuestCall indicates a Guest Call payload.
-	MsgTypeGuestCall     MsgType = 11
+	MsgTypeGuestCall MsgType = 11
 	// MsgTypeStreamStart indicates a Stream Start payload.
-	MsgTypeStreamStart   MsgType = 13
+	MsgTypeStreamStart MsgType = 13
 	// MsgTypeStreamChunk indicates a Stream Chunk payload.
-	MsgTypeStreamChunk   MsgType = 14
+	MsgTypeStreamChunk MsgType = 14
 	// MsgTypeSystemError indicates a system-level error (e.g. overflow).
-	MsgTypeSystemError   MsgType = 127
+	MsgTypeSystemError MsgType = 127
 	// MsgTypeAppStart is the start of Application Specific message types.
 	// Types below 128 are reserved for internal protocol use.
 	// Applications should define their own message types starting from this value.
@@ -60,7 +60,7 @@ const (
 	//       MyMsgLogin  = shm.MsgTypeAppStart + 0
 	//       MyMsgUpdate = shm.MsgTypeAppStart + 1
 	//   )
-	MsgTypeAppStart      MsgType = 128
+	MsgTypeAppStart MsgType = 128
 
 	// Magic is the magic number for validating shared memory ("XLL!").
 	Magic uint32 = 0x584C4C21
@@ -70,7 +70,7 @@ const (
 	Version uint32 = 0x00070000
 
 	// HostStateActive indicates the Host is spinning or processing.
-	HostStateActive  = 0
+	HostStateActive = 0
 	// HostStateWaiting indicates the Host is sleeping on the Response Event.
 	HostStateWaiting = 1
 	// GuestStateActive indicates the Guest is spinning or processing.
@@ -89,17 +89,17 @@ const (
 // property-based crash-injection test. Until then external readers may
 // poll Lease for liveness detection but no automatic action is taken.
 type SlotHeader struct {
-    _          [64]byte
+	_          [64]byte
 	State      uint32
 	HostState  uint32
 	GuestState uint32
 	MsgSeq     uint32
-    MsgType    MsgType
+	MsgType    MsgType
 	ReqSize    int32
 	RespSize   int32
 	_          uint32   // 4-byte alignment pad for Lease (mirrors C++ auto-pad)
 	Lease      uint64   // atomic monotonic-ns; offset 96
-    _          [24]byte // Reserved (shrunk from 36 to make room for Lease + pad)
+	_          [24]byte // Reserved (shrunk from 36 to make room for Lease + pad)
 }
 
 // ExchangeHeader represents the metadata at the start of the shared memory region.
@@ -129,35 +129,35 @@ var (
 
 // slotContext holds local runtime state for a slot.
 type slotContext struct {
-	header     *SlotHeader
-	reqBuffer  []byte
-	respBuffer []byte
-	reqEvent   EventHandle
-	respEvent  EventHandle
-    waitStrategy *WaitStrategy
-    nextMsgSeq uint32
-    ActiveWait int32 // Atomic flag: 1 if actively waiting, 0 otherwise
+	header       *SlotHeader
+	reqBuffer    []byte
+	respBuffer   []byte
+	reqEvent     EventHandle
+	respEvent    EventHandle
+	waitStrategy *WaitStrategy
+	nextMsgSeq   uint32
+	ActiveWait   int32 // Atomic flag: 1 if actively waiting, 0 otherwise
 }
 
 // DirectGuest implements the Guest side of the Direct Mode IPC.
 // It manages multiple workers, each attached to a specific slot.
 type DirectGuest struct {
-	name          string
-	shmBase       uintptr
-	shmSize       uint64
-	handle        ShmHandle
-	numSlots      uint32
-	numGuestSlots uint32
-	slotSize      uint32
-	reqOffset     uint32
-	respOffset    uint32
+	name            string
+	shmBase         uintptr
+	shmSize         uint64
+	handle          ShmHandle
+	numSlots        uint32
+	numGuestSlots   uint32
+	slotSize        uint32
+	reqOffset       uint32
+	respOffset      uint32
 	responseTimeout time.Duration
 
-	slots []slotContext
-	wg    sync.WaitGroup
+	slots   []slotContext
+	wg      sync.WaitGroup
 	closing int32
 
-    nextGuestSlot uint32 // Atomic counter for Round-Robin slot selection
+	nextGuestSlot uint32 // Atomic counter for Round-Robin slot selection
 
 	// v0.7.2: auto-reclaim threshold. When sendGuestCallInternal's slow
 	// path fails to find a free guest slot it walks every guest slot
@@ -201,9 +201,26 @@ func NewDirectGuest(name string) (*DirectGuest, error) {
 		CloseShm(h, addr, HeaderMapSize)
 		return nil, fmt.Errorf("invalid numSlots: %d", numSlots)
 	}
+	if numGuestSlots > 100000 {
+		CloseShm(h, addr, HeaderMapSize)
+		return nil, fmt.Errorf("invalid numGuestSlots: %d", numGuestSlots)
+	}
 	if slotSize == 0 || slotSize > 1024*1024*1024 {
 		CloseShm(h, addr, HeaderMapSize)
 		return nil, fmt.Errorf("invalid slotSize: %d", slotSize)
+	}
+	// Slot headers live at addr + 64 + i*(128 + slotSize): with the two
+	// fixed sizes being multiples of 8, slotSize%8 != 0 would misalign every
+	// SlotHeader after the first, making the uint32/uint64 atomics on State
+	// and Lease operate on unaligned addresses. reqOffset feeds buffer bases
+	// that may host atomics too (ring-buffer bootstrap). Reject both early.
+	if slotSize%8 != 0 {
+		CloseShm(h, addr, HeaderMapSize)
+		return nil, fmt.Errorf("invalid slotSize: %d (must be 8-byte aligned)", slotSize)
+	}
+	if reqOffset%8 != 0 {
+		CloseShm(h, addr, HeaderMapSize)
+		return nil, fmt.Errorf("invalid reqOffset: %d (must be 8-byte aligned)", reqOffset)
 	}
 
 	// Validate relative offset ordering. The C++ host writes these fields to
@@ -246,35 +263,35 @@ func NewDirectGuest(name string) (*DirectGuest, error) {
 	}
 
 	g := &DirectGuest{
-		name:          name,
-		shmBase:       addr,
-		shmSize:       totalSize,
-		handle:        h,
-		numSlots:      numSlots,
-		numGuestSlots: numGuestSlots,
-		slotSize:      slotSize,
-		reqOffset:     reqOffset,
-		respOffset:    respOffset,
+		name:            name,
+		shmBase:         addr,
+		shmSize:         totalSize,
+		handle:          h,
+		numSlots:        numSlots,
+		numGuestSlots:   numGuestSlots,
+		slotSize:        slotSize,
+		reqOffset:       reqOffset,
+		respOffset:      respOffset,
 		responseTimeout: 10 * time.Second,
-		slots:         make([]slotContext, totalSlots),
+		slots:           make([]slotContext, totalSlots),
 	}
 
 	ptr := addr + uintptr(headerSize)
 	for i := 0; i < int(totalSlots); i++ {
 		g.slots[i].header = (*SlotHeader)(unsafe.Pointer(ptr))
 
-        dataBase := ptr + uintptr(slotHeaderSize)
+		dataBase := ptr + uintptr(slotHeaderSize)
 
-        // Zero-copy slicing
-        // unsafe.Slice requires Go 1.17+
-        reqPtr := unsafe.Pointer(dataBase + uintptr(reqOffset))
-        respPtr := unsafe.Pointer(dataBase + uintptr(respOffset))
+		// Zero-copy slicing
+		// unsafe.Slice requires Go 1.17+
+		reqPtr := unsafe.Pointer(dataBase + uintptr(reqOffset))
+		respPtr := unsafe.Pointer(dataBase + uintptr(respOffset))
 
-        maxReq := respOffset - reqOffset
-        maxResp := slotSize - respOffset
+		maxReq := respOffset - reqOffset
+		maxResp := slotSize - respOffset
 
 		g.slots[i].reqBuffer = unsafe.Slice((*byte)(reqPtr), maxReq)
-        g.slots[i].respBuffer = unsafe.Slice((*byte)(respPtr), maxResp)
+		g.slots[i].respBuffer = unsafe.Slice((*byte)(respPtr), maxResp)
 
 		var reqName string
 		if uint32(i) < numSlots {
@@ -308,9 +325,9 @@ func NewDirectGuest(name string) (*DirectGuest, error) {
 		g.slots[i].reqEvent = evReq
 		g.slots[i].respEvent = evResp
 
-        g.slots[i].nextMsgSeq = uint32(i + 1)
+		g.slots[i].nextMsgSeq = uint32(i + 1)
 
-        g.slots[i].waitStrategy = NewWaitStrategy()
+		g.slots[i].waitStrategy = NewWaitStrategy()
 
 		ptr += uintptr(perSlotSize)
 	}
@@ -348,7 +365,7 @@ func (g *DirectGuest) Close() {
 // Wait blocks the calling thread until all worker goroutines have exited.
 // Workers usually exit when the Host sends a Shutdown signal.
 func (g *DirectGuest) Wait() {
-    g.wg.Wait()
+	g.wg.Wait()
 }
 
 // SetTimeout sets the default timeout for Guest Call responses.
@@ -542,9 +559,9 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, buffer []byte, msgType 
 
 	slot.header.MsgType = msgType
 
-    currentSeq := slot.nextMsgSeq
-    slot.header.MsgSeq = currentSeq
-    slot.nextMsgSeq += uint32(len(g.slots))
+	currentSeq := slot.nextMsgSeq
+	slot.header.MsgSeq = currentSeq
+	slot.nextMsgSeq += uint32(len(g.slots))
 
 	// Mark this goroutine as an active waiter BEFORE publishing the request:
 	// from the moment State can become SlotRespReady, the slot must never
@@ -555,43 +572,43 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, buffer []byte, msgType 
 	atomic.StoreUint32(&slot.header.State, SlotReqReady)
 	SignalEvent(slot.reqEvent)
 
-    checkReady := func() bool {
-        return atomic.LoadUint32(&slot.header.State) == SlotRespReady
-    }
+	checkReady := func() bool {
+		return atomic.LoadUint32(&slot.header.State) == SlotRespReady
+	}
 
-    sleepAction := func() {
-        atomic.StoreUint32(&slot.header.GuestState, GuestStateWaiting)
-        if checkReady() {
-            atomic.StoreUint32(&slot.header.GuestState, GuestStateActive)
-            return
-        }
+	sleepAction := func() {
+		atomic.StoreUint32(&slot.header.GuestState, GuestStateWaiting)
+		if checkReady() {
+			atomic.StoreUint32(&slot.header.GuestState, GuestStateActive)
+			return
+		}
 
-        start := time.Now()
-        for {
-            if checkReady() {
-                break
-            }
+		start := time.Now()
+		for {
+			if checkReady() {
+				break
+			}
 
-            elapsed := time.Since(start)
-            if elapsed >= timeout {
-                break
-            }
+			elapsed := time.Since(start)
+			if elapsed >= timeout {
+				break
+			}
 
-            remaining := timeout - elapsed
-            waitMs := uint32(remaining.Milliseconds())
-            if waitMs == 0 && remaining > 0 {
-                waitMs = 1
-            }
-            if waitMs > 100 {
-                waitMs = 100
-            }
+			remaining := timeout - elapsed
+			waitMs := uint32(remaining.Milliseconds())
+			if waitMs == 0 && remaining > 0 {
+				waitMs = 1
+			}
+			if waitMs > 100 {
+				waitMs = 100
+			}
 
-            WaitForEvent(slot.respEvent, waitMs)
-        }
-        atomic.StoreUint32(&slot.header.GuestState, GuestStateActive)
-    }
+			WaitForEvent(slot.respEvent, waitMs)
+		}
+		atomic.StoreUint32(&slot.header.GuestState, GuestStateActive)
+	}
 
-    ready := slot.waitStrategy.WaitState(&slot.header.State, SlotRespReady, sleepAction)
+	ready := slot.waitStrategy.WaitState(&slot.header.State, SlotRespReady, sleepAction)
 	claimed := false
 	if ready {
 		// Consume-claim: take the slot back to SlotGuestBusy BEFORE
@@ -619,15 +636,15 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, buffer []byte, msgType 
 		return nil, fmt.Errorf("slot reclaimed while consuming response")
 	}
 
-    if slot.header.MsgSeq != currentSeq {
-         atomic.CompareAndSwapUint32(&slot.header.State, SlotGuestBusy, SlotFree)
-         return nil, fmt.Errorf("msgSeq mismatch: expected %d, got %d", currentSeq, slot.header.MsgSeq)
-    }
+	if slot.header.MsgSeq != currentSeq {
+		atomic.CompareAndSwapUint32(&slot.header.State, SlotGuestBusy, SlotFree)
+		return nil, fmt.Errorf("msgSeq mismatch: expected %d, got %d", currentSeq, slot.header.MsgSeq)
+	}
 
-    if slot.header.MsgType == MsgTypeSystemError {
-        atomic.CompareAndSwapUint32(&slot.header.State, SlotGuestBusy, SlotFree)
-        return nil, fmt.Errorf("system error: host rejected request (likely buffer overflow)")
-    }
+	if slot.header.MsgType == MsgTypeSystemError {
+		atomic.CompareAndSwapUint32(&slot.header.State, SlotGuestBusy, SlotFree)
+		return nil, fmt.Errorf("system error: host rejected request (likely buffer overflow)")
+	}
 
 	respSize := slot.header.RespSize
 	var respData []byte
@@ -680,12 +697,14 @@ func (g *DirectGuest) workerLoop(idx int, handler func([]byte, []byte, MsgType) 
 		func() {
 			defer func() {
 				if r := recover(); r != nil {
-					// If closing, we expect potential panics due to unmap. Just return.
+					// Note: a fault on actually-unmapped memory is a fatal
+					// runtime error that recover() cannot catch; this guard
+					// covers ordinary handler panics and shutdown races.
 					if atomic.LoadInt32(&g.closing) == 1 {
 						return
 					}
 
-					fmt.Printf("Worker %d panic recovered (restarting): %v\n", idx, r)
+					Error("Worker panic recovered (restarting)", "worker", idx, "panic", r)
 
 					// Unblock Host if we were processing
 					// If the panic happened while we owned the slot, we must release it.
@@ -696,7 +715,10 @@ func (g *DirectGuest) workerLoop(idx int, handler func([]byte, []byte, MsgType) 
 					state := atomic.LoadUint32(&header.State)
 					if state == SlotReqReady || state == SlotGuestBusy {
 						// We failed during processing. Host is likely waiting.
-						// Signal generic error (RespSize 0)
+						// Mark the response as a SYSTEM_ERROR: RespSize=0 with
+						// the request's MsgType intact would read as a
+						// successful empty response on the host side.
+						header.MsgType = MsgTypeSystemError
 						header.RespSize = 0
 						atomic.StoreUint32(&header.State, SlotRespReady)
 						SignalEvent(slot.respEvent)
@@ -768,25 +790,25 @@ func (g *DirectGuest) workerLoopInternal(idx int, handler func([]byte, []byte, M
 
 				if reqSize >= 0 {
 					if reqSize > int32(len(slot.reqBuffer)) {
-                        header.RespSize = 0
-                        header.MsgType = MsgTypeSystemError
-                        atomic.StoreUint32(&header.State, SlotRespReady)
-                        if atomic.LoadUint32(&header.HostState) == HostStateWaiting {
-				            SignalEvent(slot.respEvent)
-			            }
-                        continue
+						header.RespSize = 0
+						header.MsgType = MsgTypeSystemError
+						atomic.StoreUint32(&header.State, SlotRespReady)
+						if atomic.LoadUint32(&header.HostState) == HostStateWaiting {
+							SignalEvent(slot.respEvent)
+						}
+						continue
 					}
 					reqData = slot.reqBuffer[:reqSize]
 				} else {
 					rLen := -reqSize
 					if rLen < 0 || rLen > int32(len(slot.reqBuffer)) {
-                        header.RespSize = 0
-                        header.MsgType = MsgTypeSystemError
-                        atomic.StoreUint32(&header.State, SlotRespReady)
-                        if atomic.LoadUint32(&header.HostState) == HostStateWaiting {
-				            SignalEvent(slot.respEvent)
-			            }
-                        continue
+						header.RespSize = 0
+						header.MsgType = MsgTypeSystemError
+						atomic.StoreUint32(&header.State, SlotRespReady)
+						if atomic.LoadUint32(&header.HostState) == HostStateWaiting {
+							SignalEvent(slot.respEvent)
+						}
+						continue
 					}
 					offset := int32(len(slot.reqBuffer)) - rLen
 					reqData = slot.reqBuffer[offset:]
