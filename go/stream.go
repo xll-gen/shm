@@ -21,7 +21,7 @@ type ChunkHeader struct {
 	ChunkIndex  uint32
 	PayloadSize uint32
 	Reserved    uint32
-    Padding     uint32 // Padding to match C++ alignment (24 bytes)
+	Padding     uint32 // Padding to match C++ alignment (24 bytes)
 }
 
 // Compile-time size assertions for streaming protocol headers.
@@ -33,6 +33,16 @@ var (
 	_ [unsafe.Sizeof(StreamHeader{}) - 24]byte
 	_ [24 - unsafe.Sizeof(ChunkHeader{})]byte
 	_ [unsafe.Sizeof(ChunkHeader{}) - 24]byte
+)
+
+// Reassembly bounds for peer-supplied stream headers. A corrupt or
+// malicious StreamHeader must not drive huge allocations (TotalChunks is
+// used to size a slice of slices; TotalSize sizes the final buffer).
+const (
+	// MaxStreamChunks bounds StreamHeader.TotalChunks.
+	MaxStreamChunks = 1 << 20
+	// MaxStreamSize bounds StreamHeader.TotalSize (1 GiB).
+	MaxStreamSize = 1 << 30
 )
 
 // StreamHandler is a function type for processing assembled streams.
@@ -62,8 +72,21 @@ func NewStreamReassembler(onStream StreamHandler, fallback func(req []byte, resp
 				return 0, MsgTypeSystemError
 			}
 			var header StreamHeader
-            buf := bytes.NewReader(req)
-            binary.Read(buf, binary.LittleEndian, &header)
+			if err := binary.Read(bytes.NewReader(req), binary.LittleEndian, &header); err != nil {
+				return 0, MsgTypeSystemError
+			}
+			if header.TotalChunks > MaxStreamChunks || header.TotalSize > MaxStreamSize {
+				return 0, MsgTypeSystemError
+			}
+			if header.TotalChunks == 0 {
+				// Empty stream: no chunks will follow, so complete it now
+				// instead of leaving a context in the map forever.
+				if header.TotalSize != 0 {
+					return 0, MsgTypeSystemError
+				}
+				onStream(header.StreamID, nil)
+				return 0, MsgTypeNormal // ACK
+			}
 
 			mu.Lock()
 			streams[header.StreamID] = &streamContext{
@@ -81,20 +104,20 @@ func NewStreamReassembler(onStream StreamHandler, fallback func(req []byte, resp
 				return 0, MsgTypeSystemError
 			}
 
-            streamID := binary.LittleEndian.Uint64(req[0:8])
-            chunkIndex := binary.LittleEndian.Uint32(req[8:12])
-            payloadSize := binary.LittleEndian.Uint32(req[12:16])
+			streamID := binary.LittleEndian.Uint64(req[0:8])
+			chunkIndex := binary.LittleEndian.Uint32(req[8:12])
+			payloadSize := binary.LittleEndian.Uint32(req[12:16])
 
-            headerLen := int(unsafe.Sizeof(ChunkHeader{}))
-            if len(req) < headerLen + int(payloadSize) {
-                return 0, MsgTypeSystemError
-            }
+			headerLen := int(unsafe.Sizeof(ChunkHeader{}))
+			if len(req) < headerLen+int(payloadSize) {
+				return 0, MsgTypeSystemError
+			}
 
-            data := req[headerLen : headerLen+int(payloadSize)]
+			data := req[headerLen : headerLen+int(payloadSize)]
 
-            // Copy data because the slot will be reused
-            chunkData := make([]byte, len(data))
-            copy(chunkData, data)
+			// Copy data because the slot will be reused
+			chunkData := make([]byte, len(data))
+			copy(chunkData, data)
 
 			mu.Lock()
 			ctx, exists := streams[streamID]
@@ -103,33 +126,43 @@ func NewStreamReassembler(onStream StreamHandler, fallback func(req []byte, resp
 				return 0, MsgTypeSystemError
 			}
 
-            if chunkIndex >= uint32(len(ctx.chunks)) {
-                 mu.Unlock()
-                 return 0, MsgTypeSystemError
-            }
+			if chunkIndex >= uint32(len(ctx.chunks)) {
+				mu.Unlock()
+				return 0, MsgTypeSystemError
+			}
 
-            if ctx.chunks[chunkIndex] == nil {
-                ctx.chunks[chunkIndex] = chunkData
-                ctx.received++
-            }
+			if ctx.chunks[chunkIndex] == nil {
+				ctx.chunks[chunkIndex] = chunkData
+				ctx.received++
+			}
 
-            ready := (ctx.received == ctx.totalChunks)
-            var fullData []byte
-            if ready {
-                // Reassemble
-                fullData = make([]byte, ctx.totalSize)
-                offset := 0
-                for _, c := range ctx.chunks {
-                    copy(fullData[offset:], c)
-                    offset += len(c)
-                }
-                delete(streams, streamID)
-            }
+			ready := (ctx.received == ctx.totalChunks)
+			var fullData []byte
+			if ready {
+				// Reassemble. The chunk byte-sum must match the advertised
+				// TotalSize exactly; otherwise the stream is corrupt and is
+				// dropped rather than delivered truncated/garbled.
+				delete(streams, streamID)
+				fullData = make([]byte, ctx.totalSize)
+				offset := 0
+				for _, c := range ctx.chunks {
+					if offset+len(c) > len(fullData) {
+						mu.Unlock()
+						return 0, MsgTypeSystemError
+					}
+					copy(fullData[offset:], c)
+					offset += len(c)
+				}
+				if offset != len(fullData) {
+					mu.Unlock()
+					return 0, MsgTypeSystemError
+				}
+			}
 			mu.Unlock()
 
-            if ready {
-                onStream(streamID, fullData)
-            }
+			if ready {
+				onStream(streamID, fullData)
+			}
 
 			return 0, MsgTypeNormal // ACK
 		}
