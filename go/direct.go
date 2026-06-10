@@ -65,7 +65,8 @@ const (
 	// Magic is the magic number for validating shared memory ("XLL!").
 	Magic uint32 = 0x584C4C21
 	// Version is the current protocol version (v0.7.0). Adds SlotHeader.Lease
-	// at offset 92 for crash-recovery (reclamation in v0.7.1).
+	// at offset 96 (92 is alignment padding) for crash-recovery
+	// (reclamation in v0.7.1).
 	Version uint32 = 0x00070000
 
 	// HostStateActive indicates the Host is spinning or processing.
@@ -81,7 +82,7 @@ const (
 // SlotHeader represents the metadata for a single slot in shared memory.
 // It must match the C++ layout exactly (128 bytes).
 //
-// Lease (offset 92, added in v0.7.0): the side that last CAS's State to a
+// Lease (offset 96, added in v0.7.0): the side that last CAS's State to a
 // non-FREE value writes the current monotonic-ns timestamp here, marking
 // the slot as actively owned. v0.7.0 only writes the lease; the
 // reclamation logic that consumes it ships in v0.7.1 alongside a
@@ -526,7 +527,7 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, buffer []byte, msgType 
 	}
 
 	if len(data) > len(slot.reqBuffer) {
-		atomic.StoreUint32(&slot.header.State, SlotFree)
+		atomic.CompareAndSwapUint32(&slot.header.State, SlotGuestBusy, SlotFree)
 		return nil, fmt.Errorf("data too large")
 	}
 
@@ -544,6 +545,12 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, buffer []byte, msgType 
     currentSeq := slot.nextMsgSeq
     slot.header.MsgSeq = currentSeq
     slot.nextMsgSeq += uint32(len(g.slots))
+
+	// Mark this goroutine as an active waiter BEFORE publishing the request:
+	// from the moment State can become SlotRespReady, the slot must never
+	// exhibit the zombie signature (SlotRespReady && ActiveWait==0) while
+	// still owned, or the Case-2 reclaim above could steal it.
+	atomic.StoreInt32(&slot.ActiveWait, 1)
 
 	atomic.StoreUint32(&slot.header.State, SlotReqReady)
 	SignalEvent(slot.reqEvent)
@@ -584,21 +591,41 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, buffer []byte, msgType 
         atomic.StoreUint32(&slot.header.GuestState, GuestStateActive)
     }
 
-	atomic.StoreInt32(&slot.ActiveWait, 1)
     ready := slot.waitStrategy.WaitState(&slot.header.State, SlotRespReady, sleepAction)
+	claimed := false
+	if ready {
+		// Consume-claim: take the slot back to SlotGuestBusy BEFORE
+		// clearing ActiveWait, so it never looks like a zombie
+		// (SlotRespReady && ActiveWait==0) while we read the response.
+		// Refresh the lease per SPECIFICATION.md §3.6.
+		claimed = atomic.CompareAndSwapUint32(&slot.header.State, SlotRespReady, SlotGuestBusy)
+		if claimed {
+			atomic.StoreUint64(&slot.header.Lease, MonotonicNanos())
+		}
+	}
 	atomic.StoreInt32(&slot.ActiveWait, 0)
 
 	if !ready {
+		// Timeout: the host may still own the slot (SlotReqReady/SlotBusy).
+		// Do NOT store SlotFree — recovery is handled by the Case-2 zombie
+		// reclaim (once the host posts its late response) or lease reclaim.
 		Debug("SendGuestCall timed out waiting for host")
 		return nil, fmt.Errorf("timeout waiting for host")
 	}
+	if !claimed {
+		// A reclaimer (lease-based crash recovery) took the slot between
+		// observing SlotRespReady and the consume-claim CAS. The response
+		// buffer can no longer be trusted.
+		return nil, fmt.Errorf("slot reclaimed while consuming response")
+	}
 
     if slot.header.MsgSeq != currentSeq {
+         atomic.CompareAndSwapUint32(&slot.header.State, SlotGuestBusy, SlotFree)
          return nil, fmt.Errorf("msgSeq mismatch: expected %d, got %d", currentSeq, slot.header.MsgSeq)
     }
 
     if slot.header.MsgType == MsgTypeSystemError {
-        atomic.StoreUint32(&slot.header.State, SlotFree)
+        atomic.CompareAndSwapUint32(&slot.header.State, SlotGuestBusy, SlotFree)
         return nil, fmt.Errorf("system error: host rejected request (likely buffer overflow)")
     }
 
@@ -607,7 +634,7 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, buffer []byte, msgType 
 
 	if respSize >= 0 {
 		if int(respSize) > len(slot.respBuffer) {
-			atomic.StoreUint32(&slot.header.State, SlotFree)
+			atomic.CompareAndSwapUint32(&slot.header.State, SlotGuestBusy, SlotFree)
 			return nil, fmt.Errorf("response size %d exceeds buffer size %d", respSize, len(slot.respBuffer))
 		}
 		if buffer != nil && cap(buffer) >= int(respSize) {
@@ -619,11 +646,11 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, buffer []byte, msgType 
 	} else {
 		rLen := -respSize
 		if rLen < 0 {
-			atomic.StoreUint32(&slot.header.State, SlotFree)
+			atomic.CompareAndSwapUint32(&slot.header.State, SlotGuestBusy, SlotFree)
 			return nil, fmt.Errorf("invalid response size: %d", respSize)
 		}
 		if int(rLen) > len(slot.respBuffer) {
-			atomic.StoreUint32(&slot.header.State, SlotFree)
+			atomic.CompareAndSwapUint32(&slot.header.State, SlotGuestBusy, SlotFree)
 			return nil, fmt.Errorf("response size %d exceeds buffer size %d", rLen, len(slot.respBuffer))
 		}
 		offset := int32(len(slot.respBuffer)) - rLen
@@ -635,7 +662,7 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, buffer []byte, msgType 
 		copy(respData, slot.respBuffer[offset:])
 	}
 
-	atomic.StoreUint32(&slot.header.State, SlotFree)
+	atomic.CompareAndSwapUint32(&slot.header.State, SlotGuestBusy, SlotFree)
 
 	return respData, nil
 }

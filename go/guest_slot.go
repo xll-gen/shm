@@ -13,6 +13,14 @@ type GuestSlot struct {
 	guest   *DirectGuest
 	slotIdx int
 	slot    *slotContext
+	// lost records that slot ownership was forfeited: the wait timed out
+	// (the host may still own the slot in SlotReqReady/SlotBusy, or its
+	// late SlotRespReady belongs to the zombie-reclaim path), or the
+	// consume-claim CAS lost to a reclaimer. Release() must then leave
+	// State untouched — storing SlotFree would clobber the host's or a
+	// new owner's transaction. Recovery is handled by the Case-2 zombie
+	// reclaim in AcquireGuestSlot or by lease-based reclamation.
+	lost bool
 }
 
 // RequestBuffer returns the shared memory buffer for the request.
@@ -67,6 +75,12 @@ func (s *GuestSlot) SendWithTimeout(size int32, msgType MsgType, timeout time.Du
     header.MsgSeq = currentSeq
     s.slot.nextMsgSeq += uint32(len(s.guest.slots))
 
+	// Mark this goroutine as an active waiter BEFORE publishing the request:
+	// from the moment State can become SlotRespReady, the slot must never
+	// exhibit the zombie signature (SlotRespReady && ActiveWait==0) while
+	// still owned, or AcquireGuestSlot's Case-2 reclaim could steal it.
+	atomic.StoreInt32(&s.slot.ActiveWait, 1)
+
 	// Signal Ready
 	atomic.StoreUint32(&header.State, SlotReqReady)
 	SignalEvent(s.slot.reqEvent)
@@ -105,14 +119,32 @@ func (s *GuestSlot) SendWithTimeout(size int32, msgType MsgType, timeout time.Du
 		atomic.StoreUint32(&header.GuestState, GuestStateActive)
 	}
 
-	// Set ActiveWait before entering Wait
-	atomic.StoreInt32(&s.slot.ActiveWait, 1)
 	ready := s.slot.waitStrategy.WaitState(&header.State, SlotRespReady, sleepAction)
+	claimed := false
+	if ready {
+		// Consume-claim: take the slot back to SlotGuestBusy BEFORE
+		// clearing ActiveWait, so it never looks like a zombie while the
+		// caller still reads ResponseBuffer(). Refresh the lease per
+		// SPECIFICATION.md §3.6 (every claiming CAS heartbeats).
+		claimed = atomic.CompareAndSwapUint32(&header.State, SlotRespReady, SlotGuestBusy)
+		if claimed {
+			atomic.StoreUint64(&header.Lease, MonotonicNanos())
+		}
+	}
 	atomic.StoreInt32(&s.slot.ActiveWait, 0)
 
 	if !ready {
-		// Timeout
+		// Timeout: the host may still own the slot (SlotReqReady/SlotBusy).
+		// Forfeit ownership so Release() leaves State untouched.
+		s.lost = true
 		return 0, 0, fmt.Errorf("timeout waiting for host")
+	}
+	if !claimed {
+		// A reclaimer (lease-based crash recovery) took the slot between
+		// observing SlotRespReady and the consume-claim CAS. The response
+		// buffer can no longer be trusted; forfeit ownership.
+		s.lost = true
+		return 0, 0, fmt.Errorf("slot reclaimed while consuming response")
 	}
 
     // Verify MsgSeq
@@ -125,9 +157,19 @@ func (s *GuestSlot) SendWithTimeout(size int32, msgType MsgType, timeout time.Du
 
 // Release marks the slot as free for other workers to use.
 // MUST be called after processing the response.
+//
+// If the preceding Send timed out (or lost its consume-claim), Release
+// leaves State untouched: the host may still own the slot, and a blind
+// SlotFree store would clobber the in-flight transaction of whoever owns
+// it next. Such slots are recovered by zombie/lease reclamation instead.
 func (s *GuestSlot) Release() {
 	if s.slot != nil {
-		atomic.StoreUint32(&s.slot.header.State, SlotFree)
+		if !s.lost {
+			// CAS from the owned state (SlotGuestBusy) instead of a blind
+			// store: if a lease-based reclaimer stole the slot, the new
+			// owner's state must not be clobbered with SlotFree.
+			atomic.CompareAndSwapUint32(&s.slot.header.State, SlotGuestBusy, SlotFree)
+		}
 		s.slot = nil
 	}
 }
