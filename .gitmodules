@@ -1,0 +1,3 @@
+[submodule "benchmarks/external/aeron"]
+	path = benchmarks/external/aeron
+	url = https://github.com/real-logic/aeron.git
