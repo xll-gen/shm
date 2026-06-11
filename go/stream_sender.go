@@ -72,15 +72,15 @@ func (s *StreamSender) Send(data []byte, streamID uint64) error {
 		}
 
 		// Write Header manually
-        if len(reqBuf) < 24 { // StreamHeader is 24 bytes
-            slot.Release()
-            return fmt.Errorf("buffer too small")
-        }
+		if len(reqBuf) < 24 { // StreamHeader is 24 bytes
+			slot.Release()
+			return fmt.Errorf("buffer too small")
+		}
 
-        binary.LittleEndian.PutUint64(reqBuf[0:], streamID)
-        binary.LittleEndian.PutUint64(reqBuf[8:], uint64(len(data)))
-        binary.LittleEndian.PutUint32(reqBuf[16:], uint32(totalChunks))
-        binary.LittleEndian.PutUint32(reqBuf[20:], 0) // Reserved
+		binary.LittleEndian.PutUint64(reqBuf[0:], streamID)
+		binary.LittleEndian.PutUint64(reqBuf[8:], uint64(len(data)))
+		binary.LittleEndian.PutUint32(reqBuf[16:], uint32(totalChunks))
+		binary.LittleEndian.PutUint32(reqBuf[20:], 0) // Reserved
 
 		// Send
 		_, _, err = slot.Send(int32(headerSize), MsgTypeStreamStart)
@@ -129,6 +129,12 @@ func (s *StreamSender) Send(data []byte, streamID uint64) error {
 			case e := <-errChan:
 				<-sem // Release token
 				wg.Done()
+				// Drain already-launched chunk goroutines before returning,
+				// mirroring the line-110 error path. Otherwise they keep
+				// writing to their slots / calling Release after Send has
+				// returned, which becomes a use-after-free if the caller then
+				// closes the client and unmaps the region.
+				wg.Wait()
 				return e
 			default:
 			}
@@ -164,20 +170,20 @@ func (s *StreamSender) Send(data []byte, streamID uint64) error {
 			}
 
 			// Write Header manually
-            // ChunkHeader is 24 bytes (with padding)
-            if len(reqBuf) < 24 {
-                select {
+			// ChunkHeader is 24 bytes (with padding)
+			if len(reqBuf) < 24 {
+				select {
 				case errChan <- fmt.Errorf("buffer too small for ChunkHeader"):
 				default:
 				}
-                return
-            }
+				return
+			}
 
-            binary.LittleEndian.PutUint64(reqBuf[0:], streamID)
-            binary.LittleEndian.PutUint32(reqBuf[8:], idx)
-            binary.LittleEndian.PutUint32(reqBuf[12:], uint32(len(chunkSlice)))
-            binary.LittleEndian.PutUint32(reqBuf[16:], 0) // Reserved
-            binary.LittleEndian.PutUint32(reqBuf[20:], 0) // Padding
+			binary.LittleEndian.PutUint64(reqBuf[0:], streamID)
+			binary.LittleEndian.PutUint32(reqBuf[8:], idx)
+			binary.LittleEndian.PutUint32(reqBuf[12:], uint32(len(chunkSlice)))
+			binary.LittleEndian.PutUint32(reqBuf[16:], 0) // Reserved
+			binary.LittleEndian.PutUint32(reqBuf[20:], 0) // Padding
 
 			// Write Data
 			copy(reqBuf[chunkHeaderSize:], chunkSlice)

@@ -70,7 +70,7 @@ func main() {
 	}
 
 	fmt.Println("Go: Sending stream...")
-	sender := shm.NewStreamSenderFromClient(client)
+	sender := shm.NewStreamSender(client, 0)
 	if err := sender.Send(payload, 999); err != nil {
 		log.Fatalf("Go: Send failed: %v", err)
 	}

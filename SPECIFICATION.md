@@ -67,11 +67,12 @@ The `SlotHeader` controls the state of the transaction. It **must** be aligned t
 | `respSize` | `int32` | 88 | Size of Response payload (see Section 3.3). |
 | _(align pad)_ | `uint32` | 92 | 4 bytes of padding to 8-byte-align `lease`. |
 | `lease` | `atomic<uint64>` | 96 | **v0.7.0+**: wall-clock-ns heartbeat written by the current owner immediately after CAS'ing `state` to a non-FREE value. See §3.6. |
-| `reserved` | `uint8[24]` | 104 | Reserved to reach 128 bytes. |
+| `gen` | `atomic<uint64>` | 104 | **v0.7.5+**: claim generation counter; advanced by every slot-claiming path *before* its state-claiming CAS. Makes crash-recovery reclamation airtight against the ABA hazard. See §3.6.1. |
+| `reserved` | `uint8[16]` | 112 | Reserved to reach 128 bytes. |
 
 **Total Size:** 128 Bytes.
 
-**Compatibility note**: the `lease` slot used to be inside `reserved[36]` (v0.6.x and earlier). Older readers see those bytes as opaque padding and behave exactly as before — they never wrote into `reserved`, so introducing a typed field there is forward-compatible. The protocol version bumped to `0x00070000` so a writer can detect peers that won't update `lease` and skip lease-based reclamation.
+**Compatibility note**: the `lease` slot used to be inside `reserved[36]` (v0.6.x and earlier), and `gen` was carved from the remaining `reserved[24]` in v0.7.5. Older readers see those bytes as opaque padding and behave exactly as before — they never wrote into `reserved`, so introducing typed fields there is forward-compatible and the layout stays 128 bytes. The protocol version remains `0x00070000`: the `gen` addition is ABI-compatible and degrades gracefully (a peer that does not advance `gen` falls back to the pre-v0.7.5 reclaim behavior for its slots).
 
 ### 2.3. Slot Partitioning
 
@@ -247,3 +248,30 @@ The name "MonotonicNanos" predates the wall-clock choice; it stays for API stabi
 Picking the wrong heartbeat cadence or timeout could reclaim a slot a slow-but-live peer is still using → double-use → data corruption. v0.7.1 will ship the reclamation API together with a property-based crash-injection test that asserts no double-claim across N random crash points. The test is the gating constraint; the API is straightforward once the test infrastructure exists.
 
 **Why this was patch-layout-compatible**: `reserved[36]` was never written by v0.6.x code, so adding `atomic<uint64> lease` at offset 96 (with 4 bytes of natural alignment padding before it) is invisible to old readers. Old writers don't touch the slice. Mixed-version deployments degrade gracefully — v0.6.x peers participating in the protocol simply never publish a lease; v0.7.x reclaimers will see `lease == 0` for those slots and (per v0.7.1 design) skip reclamation for them, falling back to the pre-v0.7 forever-busy behavior.
+
+## 3.6.1. Claim Generation & the Reclamation ABA Guard (v0.7.5)
+
+**Status**: implemented; targeted for the v0.7.5 release (not yet tagged — v0.7.4 shipped without `gen`). ABI-compatible (`gen` carved from `reserved`, total size unchanged at 128 bytes; protocol version stays `0x00070000`).
+
+**Problem (ABA)**: `TryReclaimAbandonedSlot` (§3.6) decides a slot is abandoned from an observed `state` and a stale `lease`, then CAS's `state` from the observed value back to `SLOT_FREE`. Between the observation and the CAS a peer can legitimately:
+
+1. finish the slot (`state` → `SLOT_FREE`),
+2. have it reused, and
+3. re-claim it so `state` lands back on the **same** observed value, now backed by a **fresh** lease.
+
+A bare `state` CAS then succeeds and wrongly reclaims a live slot. Re-reading `lease` immediately before the CAS narrows the window but is **provably insufficient**: per §3.6 the fresh lease is published *after* the claiming CAS, so there is a window in which `state` is already re-claimed but `lease` still reads the stale value (the *lease-publication lag*).
+
+**Mechanism — claim generation**:
+
+`gen` is a monotonic `atomic<uint64>` at offset 104. The synchronization contract is:
+
+- **Every slot-claiming path** (Host `AcquireSlot` / `AcquireSpecificSlot` / `ProcessGuestCalls`; Guest `SendGuestCall` acquire, `AcquireGuestSlot`, response consume-claim, worker request-claim) **MUST advance `gen` (`fetch_add(1)` / `atomic.AddUint64`) immediately BEFORE its state-claiming CAS**, with at least acq_rel/release semantics. The bump *precedes* the `state` transition, so any in-flight claim — even one whose lease store has not yet landed — is observable in `gen`.
+- **The reclaimer** snapshots `gen` first, validates staleness, then wins the exclusive right to reclaim via `compare_exchange(gen, gen+1)`. This single CAS linearizes reclaim against claim:
+  - If a claim's `gen` bump landed first, the reclaimer's `gen` CAS fails → refuse (covers the lease-lag window).
+  - If the reclaimer's `gen` CAS lands first, it then publishes `SLOT_FREE` via `compare_exchange(state, observed, SLOT_FREE)` — *not* a blind store — so a concurrent `SLOT_RESP_READY` zombie re-claim that bumped `gen` afterwards is arbitrated by this final `state` CAS. Exactly one of {reclaimer frees, claimant claims} wins.
+
+A burned `gen` tick (reclaimer won `gen` but lost the final `state` CAS) is harmless: `gen` only ever advances.
+
+**Limitation (documented, not a defect)**: a *fully* airtight guard against an adversarial peer that re-claims and immediately republishes within the reclaimer's window would require folding the generation into the `state` synchronizing word itself (a `state`-field ABI/semantics change). The `gen` handshake closes the realistic crash-recovery race — where the abandoned owner does not relinquish and a distinct new owner can only claim a `SLOT_FREE` slot — and is verified by the property/stress tests in `go/reclaim_aba_test.go`. Tightening beyond this is a protocol-redesign item, not a v0.7.x patch.
+
+**Mixed-version compatibility**: a peer that does not advance `gen` (pre-v0.7.5) leaves it at a fixed value; the reclaimer's `gen` CAS then behaves like the pre-v0.7.5 bare reclaim for that slot — correct degradation, no corruption.

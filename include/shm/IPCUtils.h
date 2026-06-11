@@ -161,11 +161,35 @@ struct alignas(64) SlotHeader {
     std::atomic<uint64_t> lease;
 
     /**
+     * @brief Claim generation counter (v0.7.5). Offset 104.
+     *
+     * Monotonic counter advanced by EVERY slot-claiming path immediately
+     * BEFORE its state-claiming CAS (see the `claimGen` helper and
+     * `SPECIFICATION.md §3.6.1`). It exists to make crash-recovery
+     * reclamation airtight against the ABA hazard: `state` alone returns to
+     * the same value when a slot is finished, reused, and re-claimed, and
+     * `lease` is published only AFTER the claiming CAS, so neither a bare
+     * `state` CAS nor a `lease` re-read can distinguish an abandoned slot
+     * from a freshly re-claimed live one.
+     *
+     * `TryReclaimAbandonedSlot` snapshots `gen`, verifies staleness, then
+     * reclaims by `compare_exchange(gen, gen+1)`. Because every claim bumps
+     * `gen` before transitioning `state`, the reclaim CAS fails whenever a
+     * claim has begun — including the lease-publication-lag window.
+     *
+     * Carved from the former `reserved[24]`; the layout stays 128 bytes and
+     * is forward-compatible with v0.7.0–v0.7.3 readers (which never wrote
+     * these bytes). A peer that does not bump `gen` degrades to the
+     * pre-v0.7.5 reclaim behavior for its slots.
+     */
+    std::atomic<uint64_t> gen;
+
+    /**
      * @brief Reserved for future use.
      * 64 (pre_pad) + 4*7 (uint32 cluster up to respSize) + 4 (alignment pad)
-     * + 8 (lease) = 104 bytes. 128 - 104 = 24 bytes reserved.
+     * + 8 (lease) + 8 (gen) = 112 bytes. 128 - 112 = 16 bytes reserved.
      */
-    uint8_t reserved[24];
+    uint8_t reserved[16];
 };
 
 // ABI safety: SlotHeader must remain exactly 128 bytes and at least 64-byte
