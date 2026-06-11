@@ -566,6 +566,10 @@ public:
             }
 
             if (canClaim) {
+                // Bump the claim generation BEFORE the claiming CAS so a
+                // concurrent reclaimer's generation handshake sees the
+                // in-flight claim (SPECIFICATION.md §3.6.1).
+                s.header->gen.fetch_add(1, std::memory_order_acq_rel);
                 if (s.header->state.compare_exchange_strong(current, SLOT_BUSY, std::memory_order_acquire)) {
                     s.header->lease.store(Platform::MonotonicNanos(), std::memory_order_release);
                     slot = &s;
@@ -606,6 +610,8 @@ public:
                 }
 
                 if (canClaim) {
+                    // §3.6.1: bump generation before the claiming CAS.
+                    s.header->gen.fetch_add(1, std::memory_order_acq_rel);
                     if (s.header->state.compare_exchange_strong(current, SLOT_BUSY, std::memory_order_acquire)) {
                         s.header->lease.store(Platform::MonotonicNanos(), std::memory_order_release);
                         slot = &s;
@@ -695,6 +701,8 @@ public:
              }
 
              if (canClaim) {
+                 // §3.6.1: bump generation before the claiming CAS.
+                 slot->header->gen.fetch_add(1, std::memory_order_acq_rel);
                  if (slot->header->state.compare_exchange_strong(current, SLOT_BUSY, std::memory_order_acquire)) {
                      slot->header->lease.store(Platform::MonotonicNanos(), std::memory_order_release);
                      break;
@@ -756,32 +764,47 @@ public:
      * `now - lease > maxLeaseAgeNs` it tries to CAS the state back to
      * SLOT_FREE.
      *
-     * Safety: the CAS ensures we never reclaim a slot a live peer just
-     * advanced. Between the lease read and the CAS the peer may have
-     * heartbeated again — that's fine, the CAS will simply succeed and
-     * the slot becomes FREE, and the next caller of AcquireSlot will
-     * re-acquire it. The dangerous case is reclaiming while the peer is
-     * mid-write; the lease window protects against that probabilistically
-     * (the peer either heartbeated recently — lease fresh, no reclaim —
-     * or it didn't — lease stale, reclaim is correct).
+     * Safety / ABA hazard (v0.7.5): a bare `state` CAS is NOT sufficient.
+     * Between the lease read and the CAS a peer can legitimately finish the
+     * slot (state -> FREE), have it reused, and re-claim it so `state` lands
+     * back on the SAME observed value with a FRESH lease. A bare
+     * CAS(state, observed, FREE) would then wrongly reclaim a live slot.
+     * Worse, the fresh lease is published only AFTER the re-claiming CAS, so
+     * even re-reading `lease` before the CAS cannot close the window (the
+     * "lease-publication-lag").
      *
-     * v0.7.1: opt-in API only. Auto-reclaim inside WaitStrategy and an
-     * end-to-end crash-process test ship in a later release.
+     * We close it with the claim-generation handshake (§3.6.1): every claim
+     * path bumps `gen` BEFORE its state-claiming CAS. The reclaimer snapshots
+     * `gen`, verifies staleness, then wins the reclaim by
+     * `compare_exchange(gen, gen+1)`. Because a claim's `gen` bump precedes
+     * any `state` change, the reclaim CAS fails whenever a claim has begun —
+     * including the lease-lag window. The final `state` CAS (from the
+     * observed value) then arbitrates a same-generation reclaim against a
+     * SLOT_RESP_READY zombie re-claim.
      *
      * @param slotIdx The slot to inspect.
      * @param maxLeaseAgeNs Maximum tolerated age in nanoseconds. Slots
      *                     whose lease is older than this are candidates
      *                     for reclamation.
-     * @return true if the slot was reclaimed (state was non-FREE,
-     *         lease stale, CAS succeeded). false if (a) the slot was
-     *         already FREE, (b) lease was fresher than the threshold,
-     *         (c) the CAS lost a race against legitimate progress.
+     * @return true if the slot was reclaimed. false if (a) the slot was
+     *         already FREE, (b) lease was zero (peer never heartbeated),
+     *         (c) lease was fresher than the threshold, (d) the lease
+     *         changed before the handshake (peer heartbeated/re-claimed),
+     *         (e) the generation CAS lost (a claim began), or (f) the final
+     *         state CAS lost a race against a concurrent claim.
      */
     bool TryReclaimAbandonedSlot(int32_t slotIdx, uint64_t maxLeaseAgeNs) {
         if (slotIdx < 0 || slotIdx >= (int32_t)(numSlots + numGuestSlots)) {
             return false;
         }
         Slot* slot = &slots[slotIdx];
+
+        // Snapshot the claim generation FIRST. Every claim bumps gen before
+        // transitioning state (§3.6.1), so any claim that begins after this
+        // load — even one whose lease store has not yet landed — is caught
+        // by the generation CAS below.
+        uint64_t gen = slot->header->gen.load(std::memory_order_acquire);
+
         uint32_t state = slot->header->state.load(std::memory_order_acquire);
         if (state == SLOT_FREE) {
             return false;
@@ -797,8 +820,23 @@ public:
         if (now <= lease || (now - lease) <= maxLeaseAgeNs) {
             return false;
         }
-        // Lease is stale by our threshold. Try the CAS — if a heartbeat
-        // races in between, the CAS fails and we return false.
+        // Cheap common-case rejection: a refreshed lease means a live owner
+        // heartbeated/re-claimed and already published its lease.
+        if (slot->header->lease.load(std::memory_order_acquire) != lease) {
+            return false;
+        }
+        // Generation handshake: win the exclusive right to reclaim. Fails if
+        // any claim bumped gen since our snapshot (including the lease-lag
+        // window, where state is re-claimed but the fresh lease is pending).
+        if (!slot->header->gen.compare_exchange_strong(
+                gen, gen + 1, std::memory_order_acq_rel)) {
+            return false;
+        }
+        // We won the generation. Publish SLOT_FREE via CAS from the observed
+        // state (not a blind store): a claim that bumped gen AFTER our
+        // winning CAS — e.g. reclaiming a SLOT_RESP_READY zombie — will have
+        // advanced state via its own claiming CAS, and this CAS arbitrates
+        // the final race. A burned gen tick is harmless (gen only advances).
         return slot->header->state.compare_exchange_strong(
             state, SLOT_FREE, std::memory_order_acq_rel);
     }
@@ -1161,6 +1199,8 @@ public:
             uint32_t current = slot->header->state.load(std::memory_order_acquire);
             if (current != SLOT_REQ_READY) continue;
 
+            // §3.6.1: bump generation before the claiming CAS.
+            slot->header->gen.fetch_add(1, std::memory_order_acq_rel);
             if (slot->header->state.compare_exchange_strong(current, SLOT_BUSY, std::memory_order_acq_rel)) {
                 slot->header->lease.store(Platform::MonotonicNanos(), std::memory_order_release);
                 int32_t reqSize = slot->header->reqSize;

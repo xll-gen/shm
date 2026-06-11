@@ -109,7 +109,8 @@ type SlotHeader struct {
 	RespSize   int32
 	_          uint32   // 4-byte alignment pad for Lease (mirrors C++ auto-pad)
 	Lease      uint64   // atomic monotonic-ns; offset 96
-	_          [24]byte // Reserved (shrunk from 36 to make room for Lease + pad)
+	Gen        uint64   // v0.7.5: atomic claim generation; offset 104. See §3.6.1.
+	_          [16]byte // Reserved (shrunk from 24 to make room for Gen)
 }
 
 // ExchangeHeader represents the metadata at the start of the shared memory region.
@@ -152,20 +153,26 @@ type slotContext struct {
 // DirectGuest implements the Guest side of the Direct Mode IPC.
 // It manages multiple workers, each attached to a specific slot.
 type DirectGuest struct {
-	name            string
-	shmBase         uintptr
-	shmSize         uint64
-	handle          ShmHandle
-	numSlots        uint32
-	numGuestSlots   uint32
-	slotSize        uint32
-	reqOffset       uint32
-	respOffset      uint32
-	responseTimeout time.Duration
+	name          string
+	shmBase       uintptr
+	shmSize       uint64
+	handle        ShmHandle
+	numSlots      uint32
+	numGuestSlots uint32
+	slotSize      uint32
+	reqOffset     uint32
+	respOffset    uint32
 
-	slots   []slotContext
-	wg      sync.WaitGroup
-	closing int32
+	// responseTimeoutNs is the default Guest Call timeout in nanoseconds.
+	// Accessed atomically because SetTimeout may be called from a different
+	// goroutine than SendGuestCall/SendGuestCallBuffer (which read it on the
+	// hot path) — a plain time.Duration field would be a data race.
+	responseTimeoutNs int64
+
+	slots     []slotContext
+	wg        sync.WaitGroup
+	closing   int32
+	closeOnce sync.Once
 
 	nextGuestSlot uint32 // Atomic counter for Round-Robin slot selection
 
@@ -273,17 +280,17 @@ func NewDirectGuest(name string) (*DirectGuest, error) {
 	}
 
 	g := &DirectGuest{
-		name:            name,
-		shmBase:         addr,
-		shmSize:         totalSize,
-		handle:          h,
-		numSlots:        numSlots,
-		numGuestSlots:   numGuestSlots,
-		slotSize:        slotSize,
-		reqOffset:       reqOffset,
-		respOffset:      respOffset,
-		responseTimeout: 10 * time.Second,
-		slots:           make([]slotContext, totalSlots),
+		name:              name,
+		shmBase:           addr,
+		shmSize:           totalSize,
+		handle:            h,
+		numSlots:          numSlots,
+		numGuestSlots:     numGuestSlots,
+		slotSize:          slotSize,
+		reqOffset:         reqOffset,
+		respOffset:        respOffset,
+		responseTimeoutNs: int64(10 * time.Second),
+		slots:             make([]slotContext, totalSlots),
 	}
 
 	ptr := addr + uintptr(headerSize)
@@ -350,7 +357,8 @@ func NewDirectGuest(name string) (*DirectGuest, error) {
 // It spawns one goroutine per slot to handle incoming requests from the Host.
 //
 // handler: The function to process requests. It receives the request buffer, response buffer, and message type.
-//          It must return the response size (negative for end-aligned) and response message type.
+//
+//	It must return the response size (negative for end-aligned) and response message type.
 func (g *DirectGuest) Start(handler func(req []byte, resp []byte, msgType MsgType) (int32, MsgType)) {
 	for i := 0; i < int(g.numSlots); i++ {
 		g.wg.Add(1)
@@ -360,16 +368,29 @@ func (g *DirectGuest) Start(handler func(req []byte, resp []byte, msgType MsgTyp
 
 // Close releases shared memory resources.
 // It signals workers to exit and cleans up resources.
+//
+// Close is idempotent: the underlying unmap/handle-close runs at most once
+// (guarded by closeOnce), so calling it twice — or racing two Close calls —
+// will not double-unmap or double-close the OS handles.
+//
+// Caller contract: Close must not run concurrently with an in-flight
+// SendGuestCall on the same DirectGuest. Worker goroutines (started via Start)
+// are drained here via wg.Wait, but caller-initiated SendGuestCall* runs on
+// the caller's own goroutines and is not tracked — unmapping the region while
+// such a call still reads/writes a slot buffer is a use-after-free. Ensure all
+// SendGuestCall callers have returned before Close.
 func (g *DirectGuest) Close() {
-	Info("Closing DirectGuest", "name", g.name)
-	atomic.StoreInt32(&g.closing, 1)
-	g.wg.Wait()
+	g.closeOnce.Do(func() {
+		Info("Closing DirectGuest", "name", g.name)
+		atomic.StoreInt32(&g.closing, 1)
+		g.wg.Wait()
 
-	for i := range g.slots {
-		CloseEvent(g.slots[i].reqEvent)
-		CloseEvent(g.slots[i].respEvent)
-	}
-	CloseShm(g.handle, g.shmBase, g.shmSize)
+		for i := range g.slots {
+			CloseEvent(g.slots[i].reqEvent)
+			CloseEvent(g.slots[i].respEvent)
+		}
+		CloseShm(g.handle, g.shmBase, g.shmSize)
+	})
 }
 
 // Wait blocks the calling thread until all worker goroutines have exited.
@@ -382,7 +403,13 @@ func (g *DirectGuest) Wait() {
 //
 // d: The timeout duration. Default is 10 seconds.
 func (g *DirectGuest) SetTimeout(d time.Duration) {
-	g.responseTimeout = d
+	atomic.StoreInt64(&g.responseTimeoutNs, int64(d))
+}
+
+// responseTimeout returns the current default Guest Call timeout. It loads the
+// underlying nanosecond field atomically (paired with SetTimeout's store).
+func (g *DirectGuest) responseTimeout() time.Duration {
+	return time.Duration(atomic.LoadInt64(&g.responseTimeoutNs))
 }
 
 // SetAutoReclaimTimeout enables AcquireSlot-equivalent auto-reclaim during
@@ -403,6 +430,14 @@ func (g *DirectGuest) GetAutoReclaimTimeout() time.Duration {
 	return time.Duration(atomic.LoadUint64(&g.autoReclaimTimeoutNs))
 }
 
+// reclaimPreCASHook is a test-only seam fired inside
+// TryReclaimAbandonedSlot after the staleness decision but before the
+// lease re-validation and CAS. Production builds leave it nil, so the
+// branch that calls it is a single never-taken nil check. Tests set it to
+// deterministically simulate a peer re-claiming the slot in the ABA
+// window. See reclaim_aba_test.go.
+var reclaimPreCASHook func(slotIdx int)
+
 // TryReclaimAbandonedSlot attempts to reclaim a slot whose Lease is older
 // than maxLeaseAge.
 //
@@ -411,14 +446,44 @@ func (g *DirectGuest) GetAutoReclaimTimeout() time.Duration {
 // method reads State and Lease, and if the lease is stale by the
 // threshold, attempts to CAS State back to SlotFree.
 //
-// Safety: the CAS ensures we never reclaim a slot a live peer just
-// advanced. If a live peer heartbeats between the lease read and the
-// CAS, the CAS succeeds (state still matches what we observed) and the
-// slot becomes Free; the peer's next state write will fail or be a CAS
-// from a stale state. The dangerous case — reclaiming while the peer is
-// mid-write — is probabilistically protected by the lease window: the
-// peer either heartbeated recently (lease fresh, no reclaim) or it
-// didn't (lease stale, reclaim is correct).
+// Safety: the CAS on `State` alone is NOT sufficient, because `State` is
+// subject to an ABA hazard. Between the lease read and the CAS a peer can
+// legitimately (a) finish the slot (State -> SlotFree), (b) have the slot
+// reused, and (c) re-claim it so State lands back on the SAME value we
+// observed — but now backed by a FRESH lease. A bare CAS(State, observed,
+// SlotFree) would succeed and wrongly reclaim a now-busy, live slot. The
+// staleness decision was made on the OLD lease value; the new owner's
+// lease was never checked.
+//
+// To close that window we re-validate the lease tied to the CAS. The
+// lease is only ever advanced by a successful claiming CAS on `State`
+// (§3.6: the new owner stores MonotonicNanos() immediately after CAS'ing
+// State to a non-FREE value). Therefore, if the lease still equals the
+// value our staleness decision was based on at the moment of the CAS, no
+// re-claim happened in between — the slot is the same abandoned slot we
+// observed. If the lease changed, a live owner re-claimed (or heartbeated)
+// the slot and we MUST refuse, regardless of whether the CAS would have
+// succeeded.
+//
+// Sequence:
+//  1. Observe State (non-FREE) and Lease (stale by threshold).
+//  2. Re-load Lease immediately before the CAS; bail if it changed
+//     (an intervening claim/heartbeat — the lease the staleness decision
+//     was based on is no longer current).
+//  3. CAS(State, observed, SlotFree). Because the re-load and the CAS are
+//     ordered (both go through sync/atomic, sequentially consistent), and
+//     because §3.6 mandates that the lease store happens-after the
+//     claiming CAS, any re-claim that completes after our re-load either
+//     (i) already advanced the lease — caught by step 2 on a future call,
+//     or (ii) advances State away from `observed` — caught by the CAS.
+//     The remaining ABA — re-claim to the same State with the same lease
+//     value — is impossible because the lease is monotonic wall-clock ns;
+//     a fresh claim writes a strictly newer (or, under an NTP backstep,
+//     different) timestamp, never byte-identical to the stale one we read.
+//
+// The classic heartbeat-only race (live peer refreshes lease between our
+// reads) is now caught by the re-load: a refreshed lease differs from the
+// observed lease, so we refuse and let the normal flow retry.
 //
 // v0.7.1 ships this as an opt-in API only. Auto-reclamation inside
 // WaitStrategy and an end-to-end crash-process test will follow.
@@ -426,12 +491,23 @@ func (g *DirectGuest) GetAutoReclaimTimeout() time.Duration {
 // Returns true if the slot was reclaimed. Returns false if: the slot is
 // already Free, the lease is fresher than the threshold, the lease is
 // zero (peer never heartbeated — likely a v0.6.x peer, refuse to
-// reclaim), or the CAS lost to a concurrent legitimate state change.
+// reclaim), the lease changed between observation and the CAS (a peer
+// re-claimed or heartbeated — ABA guard), or the CAS lost to a concurrent
+// legitimate state change.
 func (g *DirectGuest) TryReclaimAbandonedSlot(slotIdx int, maxLeaseAge time.Duration) bool {
 	if slotIdx < 0 || slotIdx >= len(g.slots) {
 		return false
 	}
 	s := &g.slots[slotIdx]
+
+	// Read the claim generation FIRST. claimSlotGen (and every C++ claim
+	// site) bumps Gen with release semantics BEFORE the state-claiming CAS
+	// (§3.6.1), so any claim that begins after this load — even one whose
+	// lease store has not yet landed — is observable as a Gen change. This
+	// is what closes the lease-publication-lag window that a bare lease
+	// re-load cannot: the lease is written AFTER the claiming CAS, but Gen
+	// is bumped BEFORE it.
+	gen := atomic.LoadUint64(&s.header.Gen)
 
 	state := atomic.LoadUint32(&s.header.State)
 	if state == SlotFree {
@@ -445,7 +521,67 @@ func (g *DirectGuest) TryReclaimAbandonedSlot(slotIdx int, maxLeaseAge time.Dura
 	if now <= lease || (now-lease) <= uint64(maxLeaseAge.Nanoseconds()) {
 		return false
 	}
+
+	// Test-only injection point: lets a regression test deterministically
+	// drive the ABA window (peer re-claims the slot between the staleness
+	// decision and the CAS). nil in production — zero overhead.
+	if reclaimPreCASHook != nil {
+		reclaimPreCASHook(slotIdx)
+	}
+
+	// ABA guard (lease): a refreshed lease means a live owner heartbeated
+	// or re-claimed and already published its lease. Refuse early — this
+	// is a cheap, common-case rejection.
+	if atomic.LoadUint64(&s.header.Lease) != lease {
+		return false
+	}
+
+	// Reclamation handshake on Gen (the airtight ABA guard). The reclaimer
+	// wins the exclusive right to reclaim by advancing the generation with
+	// CAS(Gen: gen -> gen+1). Because EVERY claim path bumps Gen via
+	// claimSlotGen BEFORE its state-claiming CAS (§3.6.1), this single CAS
+	// linearizes reclaim against claim:
+	//
+	//   - If a claim's Gen bump landed first, our Gen CAS sees a changed
+	//     value and fails -> we refuse (a peer is/was claiming). This holds
+	//     even in the lease-publication-lag window, where the claim has
+	//     re-claimed State but not yet stored its fresh lease: the lease
+	//     re-load above would pass, but the Gen bump precedes the lease
+	//     store, so the Gen CAS still fails.
+	//   - If our Gen CAS lands first, any concurrent claim's later
+	//     state-claiming CAS finds State still at the abandoned value (we
+	//     have not yet stored SlotFree) or, after we store SlotFree, must
+	//     CAS from SlotFree — either way it observes a coherent state and
+	//     never double-owns. We then publish SlotFree.
+	//
+	// A bare re-load of Gen followed by a separate State CAS would NOT be
+	// airtight: a claim could bump Gen between the re-load and the State
+	// CAS. Conditioning the reclaim ON the Gen CAS removes that gap.
+	if !atomic.CompareAndSwapUint64(&s.header.Gen, gen, gen+1) {
+		return false
+	}
+	// We won the reclaim generation. Publish SlotFree via CAS from the
+	// observed `state`, NOT a blind store: a claim that bumped Gen AFTER
+	// our winning CAS (to gen+1) — e.g. reclaiming a SlotRespReady zombie
+	// out from under us — will have advanced State via its own claiming
+	// CAS. The State CAS arbitrates that final race: exactly one of
+	// {reclaimer frees, claimant claims} wins. If ours fails, a live
+	// claimant took the slot; we refuse (the burned Gen tick is harmless —
+	// Gen only ever advances).
 	return atomic.CompareAndSwapUint32(&s.header.State, state, SlotFree)
+}
+
+// claimSlotGen bumps the slot's claim generation immediately before a
+// state-claiming CAS. Every site that CAS's State from SlotFree (or a
+// reclaim-eligible state) to a non-FREE value MUST call this first so the
+// reclaimer's generation handshake (§3.6.1) linearizes against the claim:
+// the reclaimer wins the slot only by CAS-advancing Gen, which fails if any
+// claim bumped Gen first. The bump must precede the state CAS so that an
+// in-flight re-claim — even one whose lease store has not yet landed — is
+// already visible in Gen. Go atomics are sequentially consistent, ordering
+// the bump before the subsequent state CAS.
+func claimSlotGen(h *SlotHeader) {
+	atomic.AddUint64(&h.Gen, 1)
 }
 
 // SendGuestCall sends a request to the Host using a Guest Slot.
@@ -456,7 +592,7 @@ func (g *DirectGuest) TryReclaimAbandonedSlot(slotIdx int, maxLeaseAge time.Dura
 //
 // Returns the response payload or an error if the call fails or times out.
 func (g *DirectGuest) SendGuestCall(data []byte, msgType MsgType) ([]byte, error) {
-	return g.sendGuestCallInternal(data, nil, msgType, g.responseTimeout)
+	return g.sendGuestCallInternal(data, nil, msgType, g.responseTimeout())
 }
 
 // SendGuestCallBuffer sends a request to the Host using a provided buffer for the response.
@@ -468,7 +604,7 @@ func (g *DirectGuest) SendGuestCall(data []byte, msgType MsgType) ([]byte, error
 //
 // Returns the response payload (slice of buffer) or an error.
 func (g *DirectGuest) SendGuestCallBuffer(data []byte, buffer []byte, msgType MsgType) ([]byte, error) {
-	return g.sendGuestCallInternal(data, buffer, msgType, g.responseTimeout)
+	return g.sendGuestCallInternal(data, buffer, msgType, g.responseTimeout())
 }
 
 // SendGuestCallWithTimeout sends a request to the Host using a Guest Slot with a custom timeout.
@@ -503,6 +639,7 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, buffer []byte, msgType 
 		currentState := atomic.LoadUint32(&s.header.State)
 
 		if currentState == SlotFree {
+			claimSlotGen(s.header)
 			if atomic.CompareAndSwapUint32(&s.header.State, SlotFree, SlotGuestBusy) {
 				atomic.StoreUint64(&s.header.Lease, MonotonicNanos())
 				slot = s
@@ -512,6 +649,7 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, buffer []byte, msgType 
 
 		if currentState == SlotRespReady {
 			if atomic.LoadInt32(&s.ActiveWait) == 0 {
+				claimSlotGen(s.header)
 				if atomic.CompareAndSwapUint32(&s.header.State, SlotRespReady, SlotGuestBusy) {
 					atomic.StoreUint64(&s.header.Lease, MonotonicNanos())
 					slot = s
@@ -540,6 +678,10 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, buffer []byte, msgType 
 				for j := 0; j < numGuest; j++ {
 					idx := startBase + j
 					s := &g.slots[idx]
+					if atomic.LoadUint32(&s.header.State) != SlotFree {
+						continue
+					}
+					claimSlotGen(s.header)
 					if atomic.CompareAndSwapUint32(&s.header.State, SlotFree, SlotGuestBusy) {
 						atomic.StoreUint64(&s.header.Lease, MonotonicNanos())
 						slot = s
@@ -624,7 +766,9 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, buffer []byte, msgType 
 		// Consume-claim: take the slot back to SlotGuestBusy BEFORE
 		// clearing ActiveWait, so it never looks like a zombie
 		// (SlotRespReady && ActiveWait==0) while we read the response.
-		// Refresh the lease per SPECIFICATION.md §3.6.
+		// Refresh the lease per SPECIFICATION.md §3.6 and bump Gen per
+		// §3.6.1 before re-claiming.
+		claimSlotGen(slot.header)
 		claimed = atomic.CompareAndSwapUint32(&slot.header.State, SlotRespReady, SlotGuestBusy)
 		if claimed {
 			atomic.StoreUint64(&slot.header.Lease, MonotonicNanos())
@@ -776,6 +920,7 @@ func (g *DirectGuest) workerLoopInternal(idx int, handler func([]byte, []byte, M
 		ready := slot.waitStrategy.WaitState(&header.State, SlotReqReady, sleepAction)
 
 		if ready {
+			claimSlotGen(header)
 			if !atomic.CompareAndSwapUint32(&header.State, SlotReqReady, SlotGuestBusy) {
 				continue
 			}

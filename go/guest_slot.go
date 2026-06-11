@@ -51,7 +51,7 @@ func (s *GuestSlot) ResponseBuffer() []byte {
 //   - MsgType: The type of the response.
 //   - error: Error if transaction fails or times out.
 func (s *GuestSlot) Send(size int32, msgType MsgType) (int32, MsgType, error) {
-	return s.SendWithTimeout(size, msgType, s.guest.responseTimeout)
+	return s.SendWithTimeout(size, msgType, s.guest.responseTimeout())
 }
 
 // SendWithTimeout is the same as Send but with a custom timeout.
@@ -70,10 +70,10 @@ func (s *GuestSlot) SendWithTimeout(size int32, msgType MsgType, timeout time.Du
 	header.ReqSize = size
 	header.MsgType = msgType
 
-    // Set MsgSeq
-    currentSeq := s.slot.nextMsgSeq
-    header.MsgSeq = currentSeq
-    s.slot.nextMsgSeq += uint32(len(s.guest.slots))
+	// Set MsgSeq
+	currentSeq := s.slot.nextMsgSeq
+	header.MsgSeq = currentSeq
+	s.slot.nextMsgSeq += uint32(len(s.guest.slots))
 
 	// Mark this goroutine as an active waiter BEFORE publishing the request:
 	// from the moment State can become SlotRespReady, the slot must never
@@ -125,7 +125,9 @@ func (s *GuestSlot) SendWithTimeout(size int32, msgType MsgType, timeout time.Du
 		// Consume-claim: take the slot back to SlotGuestBusy BEFORE
 		// clearing ActiveWait, so it never looks like a zombie while the
 		// caller still reads ResponseBuffer(). Refresh the lease per
-		// SPECIFICATION.md §3.6 (every claiming CAS heartbeats).
+		// SPECIFICATION.md §3.6 (every claiming CAS heartbeats) and bump
+		// Gen per §3.6.1 before re-claiming.
+		claimSlotGen(header)
 		claimed = atomic.CompareAndSwapUint32(&header.State, SlotRespReady, SlotGuestBusy)
 		if claimed {
 			atomic.StoreUint64(&header.Lease, MonotonicNanos())
@@ -147,10 +149,10 @@ func (s *GuestSlot) SendWithTimeout(size int32, msgType MsgType, timeout time.Du
 		return 0, 0, fmt.Errorf("slot reclaimed while consuming response")
 	}
 
-    // Verify MsgSeq
-    if header.MsgSeq != currentSeq {
-        return 0, 0, fmt.Errorf("msgSeq mismatch: expected %d, got %d", currentSeq, header.MsgSeq)
-    }
+	// Verify MsgSeq
+	if header.MsgSeq != currentSeq {
+		return 0, 0, fmt.Errorf("msgSeq mismatch: expected %d, got %d", currentSeq, header.MsgSeq)
+	}
 
 	return header.RespSize, header.MsgType, nil
 }
@@ -194,6 +196,7 @@ func (g *DirectGuest) AcquireGuestSlot() (*GuestSlot, error) {
 
 		// Case 1: Slot is Free
 		if currentState == SlotFree {
+			claimSlotGen(s.header)
 			if atomic.CompareAndSwapUint32(&s.header.State, SlotFree, SlotGuestBusy) { // Use SlotGuestBusy (5)
 				atomic.StoreUint64(&s.header.Lease, MonotonicNanos())
 				return &GuestSlot{
@@ -208,6 +211,7 @@ func (g *DirectGuest) AcquireGuestSlot() (*GuestSlot, error) {
 		// Reclaim ONLY if no local process is actively waiting.
 		if currentState == SlotRespReady {
 			if atomic.LoadInt32(&s.ActiveWait) == 0 {
+				claimSlotGen(s.header)
 				if atomic.CompareAndSwapUint32(&s.header.State, SlotRespReady, SlotGuestBusy) {
 					atomic.StoreUint64(&s.header.Lease, MonotonicNanos())
 					return &GuestSlot{

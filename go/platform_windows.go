@@ -1,6 +1,7 @@
 package shm
 
 import (
+	"fmt"
 	"syscall"
 	"unsafe"
 )
@@ -16,7 +17,24 @@ var (
 	procOpenFileMappingW    = kernel32.NewProc("OpenFileMappingW")
 	procMapViewOfFile       = kernel32.NewProc("MapViewOfFile")
 	procUnmapViewOfFile     = kernel32.NewProc("UnmapViewOfFile")
+	procVirtualQuery        = kernel32.NewProc("VirtualQuery")
 )
+
+// memoryBasicInformation mirrors the Win32 MEMORY_BASIC_INFORMATION struct on
+// amd64. Only RegionSize is read here; the explicit padding keeps RegionSize at
+// its native offset (24) so VirtualQuery fills it correctly.
+type memoryBasicInformation struct {
+	BaseAddress       uintptr // 0
+	AllocationBase    uintptr // 8
+	AllocationProtect uint32  // 16
+	PartitionID       uint16  // 20
+	_                 uint16  // 22 (pad to 8-align RegionSize)
+	RegionSize        uintptr // 24
+	State             uint32  // 32
+	Protect           uint32  // 36
+	Type              uint32  // 40
+	_                 uint32  // 44 (tail pad to 48)
+}
 
 const (
 	FILE_MAP_ALL_ACCESS = 0xF001F
@@ -143,6 +161,26 @@ func openShm(name string, size uint64) (ShmHandle, uintptr, error) {
 	if addr == 0 {
 		procCloseHandle.Call(hMap)
 		return 0, 0, err
+	}
+
+	// Validate the mapped view is at least `size` bytes before any caller
+	// dereferences the ExchangeHeader/slots. The Linux path guards this via
+	// fstat (a too-small mapping there would SIGBUS); on Windows MapViewOfFile
+	// with dwNumberOfBytesToMap=0 maps the whole section, so a section created
+	// smaller than expected (stale/mismatched config, or a Host still
+	// initializing) would otherwise be read out of bounds. VirtualQuery reports
+	// the committed region size at the view base; reject if it is short.
+	var mbi memoryBasicInformation
+	ret, _, qerr := procVirtualQuery.Call(addr, uintptr(unsafe.Pointer(&mbi)), unsafe.Sizeof(mbi))
+	if ret == 0 {
+		procUnmapViewOfFile.Call(addr)
+		procCloseHandle.Call(hMap)
+		return 0, 0, fmt.Errorf("VirtualQuery on mapped view failed: %v", qerr)
+	}
+	if uint64(mbi.RegionSize) < size {
+		procUnmapViewOfFile.Call(addr)
+		procCloseHandle.Call(hMap)
+		return 0, 0, fmt.Errorf("mapped view too small: have %d bytes, need %d (host initializing or mismatched config?)", mbi.RegionSize, size)
 	}
 
 	return ShmHandle(hMap), addr, nil
