@@ -111,6 +111,20 @@ Logic changes often require symmetric updates.
 2.  **Guest Logic**: `go/direct.go` / `go/client.go` (e.g., `workerLoop`, `SendGuestCall`).
 **Constraint**: A new message type or flow (e.g., Streaming) must be supported on both sides.
 
+## **Confirmed-Correct Decisions (Do NOT Change)**
+
+Synced from the workspace `IMPROVEMENT_BACKLOG.md` §6 (2026-06-12). These were
+flagged by past reviews and confirmed correct — do not "fix" or re-propose:
+
+* `go/direct.go` — the size/seq **re-validation after the `state` acquire-load**
+  is a cache-visibility safety net, not redundancy. Do not remove it.
+* The `state` store/load pair keeps **release/acquire** semantics — never
+  "optimize" to `relaxed`. x86 TSO makes relaxed *appear* to work (see the
+  deployment-target note above); the contract is codified in
+  SPECIFICATION.md §4.4.
+* The **header-only** C++ library structure is a design decision (see Project
+  Structure) — no `.cpp` files for library logic.
+
 ## **Known Improvement Backlog**
 
 From a code review on 2026-05-16. Address as part of normal work.
