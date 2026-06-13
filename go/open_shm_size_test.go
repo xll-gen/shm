@@ -4,9 +4,9 @@ import "testing"
 
 // TestOpenShm_RejectsUndersizedSection verifies the attach-time size guard:
 // openShm must refuse a section smaller than the caller-expected size before
-// any ExchangeHeader/slot dereference. Linux enforces this via fstat; Windows
-// via VirtualQuery on the mapped view. The test is platform-agnostic — it
-// creates a small section and asks openShm for a larger size.
+// any ExchangeHeader/slot dereference. On Windows this is enforced via
+// VirtualQuery on the mapped view. The test creates a small section and asks
+// openShm for a larger size.
 func TestOpenShm_RejectsUndersizedSection(t *testing.T) {
 	const name = "OpenShmUndersizeTest"
 	const small = 4096

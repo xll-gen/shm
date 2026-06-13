@@ -1,80 +1,51 @@
 #pragma once
 
-#ifdef _WIN32
-    #ifndef NOMINMAX
-        #define NOMINMAX
-    #endif
-    #include <windows.h>
-    #include <string>
-    typedef HANDLE EventHandle;
-    typedef HANDLE ShmHandle;
-#else
-    #include <fcntl.h>
-    #include <sys/stat.h>
-    #include <semaphore.h>
-    #include <sys/mman.h>
-    #include <sys/file.h>
-    #include <unistd.h>
-    #include <time.h>
-    #include <errno.h>
-    #include <string>
-    #include <cstring>
-    #include <iostream>
-    #include <immintrin.h>
-    #include "Logger.h"
-
-    typedef sem_t* EventHandle;
-    typedef int ShmHandle; // File Descriptor
+#ifndef NOMINMAX
+    #define NOMINMAX
 #endif
+#include <windows.h>
+#include <string>
+
+typedef HANDLE EventHandle;
+typedef HANDLE ShmHandle;
 
 namespace shm {
 
 /**
  * @class Platform
- * @brief Abstraction layer for OS-specific synchronization and memory mapping.
+ * @brief Abstraction layer for Windows OS synchronization and memory mapping.
  *
- * Provides a unified API for Windows and Linux to handle:
- * - Named Events (Semaphores on Linux, Events on Windows)
- * - Shared Memory (shm_open/mmap on Linux, CreateFileMapping on Windows)
+ * Provides the API used by the rest of the library for:
+ * - Named Events (Win32 Event objects)
+ * - Shared Memory (CreateFileMapping / MapViewOfFile)
  * - CPU relaxation and thread yielding
+ *
+ * This library is Windows-only (MSVC 2019+ / MinGW). All primitives map
+ * directly onto the Win32 API.
  */
 class Platform {
 public:
     /**
      * @brief Creates or opens a named synchronization event.
      *
-     * @param name The name of the event. On Linux, a leading '/' is prepended if missing.
-     * @return EventHandle The handle to the event, or valid handle/pointer on success.
+     * @param name The name of the event.
+     * @return EventHandle The handle to the event, or NULL on failure.
      */
     static EventHandle CreateNamedEvent(const char* name) {
-#ifdef _WIN32
         std::string s_name(name);
         std::wstring w_name(s_name.begin(), s_name.end());
         std::wstring final_ev_name = L"Local\\" + w_name;
         return CreateEventW(NULL, FALSE, FALSE, final_ev_name.c_str());
-#else
-        std::string evName = "/" + std::string(name);
-        EventHandle sem = sem_open(evName.c_str(), O_CREAT, 0644, 0);
-        if (sem == SEM_FAILED) {
-            SHM_LOG_ERROR("sem_open failed: ", strerror(errno));
-            return nullptr;
-        }
-        return sem;
-#endif
     }
 
     /**
-     * @brief Signals the event (sets to signaled state or posts semaphore).
+     * @brief Signals the event (sets to signaled state).
      *
      * @param h The event handle.
      */
     static void SignalEvent(EventHandle h) {
         if (!h) return;
-#ifdef _WIN32
         SetEvent(h);
-#else
-        sem_post(h);
-#endif
     }
 
     /**
@@ -86,24 +57,8 @@ public:
      */
     static bool WaitEvent(EventHandle h, uint32_t timeoutMs = 0xFFFFFFFF) {
         if (!h) return false;
-#ifdef _WIN32
         DWORD res = WaitForSingleObject(h, timeoutMs);
         return (res == WAIT_OBJECT_0);
-#else
-        if (timeoutMs == 0xFFFFFFFF) {
-            return (sem_wait(h) == 0);
-        } else {
-            struct timespec ts;
-            clock_gettime(CLOCK_REALTIME, &ts);
-            ts.tv_sec += timeoutMs / 1000;
-            ts.tv_nsec += (timeoutMs % 1000) * 1000000;
-            if (ts.tv_nsec >= 1000000000) {
-                ts.tv_sec++;
-                ts.tv_nsec -= 1000000000;
-            }
-            return (sem_timedwait(h, &ts) == 0);
-        }
-#endif
     }
 
     /**
@@ -113,11 +68,7 @@ public:
      */
     static void CloseEvent(EventHandle h) {
         if (!h) return;
-#ifdef _WIN32
         CloseHandle(h);
-#else
-        sem_close(h);
-#endif
     }
 
     /**
@@ -127,19 +78,10 @@ public:
      * @return EventHandle The handle.
      */
     static EventHandle OpenEvent(const char* name) {
-#ifdef _WIN32
         std::string s_name(name);
         std::wstring w_name(s_name.begin(), s_name.end());
         std::wstring final_ev_name = L"Local\\" + w_name;
         return OpenEventW(EVENT_ALL_ACCESS, FALSE, final_ev_name.c_str());
-#else
-        std::string evName = "/" + std::string(name);
-        EventHandle sem = sem_open(evName.c_str(), 0);
-        if (sem == SEM_FAILED) {
-            return nullptr;
-        }
-        return sem;
-#endif
     }
 
     /**
@@ -147,26 +89,15 @@ public:
      *
      * @param name The name of the event.
      *
-     * @note **Ownership/Lifetime contract**: POSIX named semaphores (Linux
-     *       backend) persist in /dev/shm/sem.* until explicitly unlinked.
-     *       The **host** is responsible for calling UnlinkNamedEvent on
-     *       graceful shutdown — DirectHost::Shutdown() does this for every
-     *       slot's req/resp event. Guests must NOT call this (they only
-     *       sem_close their handles). If a host process is killed before
-     *       Shutdown, the semaphores leak; CI/tests should explicitly
-     *       UnlinkEvent in their setup teardown.
-     *
-     *       On Windows, `Local\` events are kernel-object reference
-     *       counted, so this is a no-op there.
+     * @note On Windows, `Local\` Event objects are kernel-object reference
+     *       counted and destroyed when the last handle is closed, so this is
+     *       a no-op. It is retained for API symmetry; callers (DirectHost
+     *       teardown, tests) may invoke it harmlessly.
      */
     static void UnlinkNamedEvent(const char* name) {
-#ifdef _WIN32
         // Windows objects are ref-counted and destroyed when last handle is closed.
         // No explicit unlink needed for Local\ events.
-#else
-        std::string evName = "/" + std::string(name);
-        sem_unlink(evName.c_str());
-#endif
+        (void)name;
     }
 
     /**
@@ -174,12 +105,11 @@ public:
      *
      * @param name The name of the shared memory region.
      * @param size The size of the region in bytes.
-     * @param[out] outHandle The native handle for the shared memory (File Mapping or FD).
+     * @param[out] outHandle The native file-mapping handle.
      * @param[out] outExists Set to true if the region already existed.
      * @return void* Pointer to the mapped memory, or nullptr on failure.
      */
     static void* CreateNamedShm(const char* name, uint64_t size, ShmHandle& outHandle, bool& outExists) {
-#ifdef _WIN32
         std::string s_name(name);
         std::wstring w_name(s_name.begin(), s_name.end());
         std::wstring final_shm_name = L"Local\\" + w_name;
@@ -191,27 +121,6 @@ public:
         outExists = (GetLastError() == ERROR_ALREADY_EXISTS);
         void* addr = MapViewOfFile(outHandle, FILE_MAP_ALL_ACCESS, 0, 0, 0);
         return addr;
-#else
-        std::string shmName = "/" + std::string(name);
-        outHandle = shm_open(shmName.c_str(), O_CREAT | O_RDWR, 0666);
-        if (outHandle < 0) return nullptr;
-
-        struct stat st;
-        fstat(outHandle, &st);
-        outExists = (st.st_size > 0); // Simplistic check
-
-        if (ftruncate(outHandle, size) == -1) {
-            close(outHandle);
-            return nullptr;
-        }
-
-        void* addr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, outHandle, 0);
-        if (addr == MAP_FAILED) {
-            close(outHandle);
-            return nullptr;
-        }
-        return addr;
-#endif
     }
 
     /**
@@ -222,13 +131,9 @@ public:
      * @param size The size of the mapping.
      */
     static void CloseShm(ShmHandle h, void* addr, uint64_t size) {
-#ifdef _WIN32
+        (void)size;
         if (addr) UnmapViewOfFile(addr);
         if (h) CloseHandle(h);
-#else
-        if (addr) munmap(addr, size);
-        if (h >= 0) close(h);
-#endif
     }
 
     /**
@@ -241,9 +146,9 @@ public:
      * @return ShmHandle The handle.
      */
     static ShmHandle OpenShm(const char* name, uint64_t size, uint64_t& outRealSize, void*& outAddr) {
+        (void)size;
         outAddr = nullptr;
         outRealSize = 0;
-#ifdef _WIN32
         std::string s_name(name);
         std::wstring w_name(s_name.begin(), s_name.end());
         std::wstring final_shm_name = L"Local\\" + w_name;
@@ -257,54 +162,26 @@ public:
              outRealSize = info.RegionSize;
         }
         return h;
-#else
-        std::string shmName = "/" + std::string(name);
-        int fd = shm_open(shmName.c_str(), O_RDWR, 0666);
-        if (fd < 0) return -1;
-
-        struct stat st;
-        if (fstat(fd, &st) == -1) {
-            close(fd);
-            return -1;
-        }
-        outRealSize = st.st_size;
-
-        if (size == 0) size = st.st_size;
-
-        void* addr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-        if (addr == MAP_FAILED) {
-            close(fd);
-            outAddr = nullptr;
-            return -1;
-        }
-        outAddr = addr;
-        return fd;
-#endif
     }
 
     /**
      * @brief Unlinks the shared memory region (removes it from the system).
      *
      * @param name The name of the shared memory region.
+     *
+     * @note Windows pagefile-backed shared memory is destroyed when the last
+     *       handle is closed, so this is a no-op. Retained for API symmetry.
      */
     static void UnlinkShm(const char* name) {
-#ifdef _WIN32
         // Windows pagefile-backed SHM is destroyed when last handle is closed.
-#else
-        std::string shmName = "/" + std::string(name);
-        shm_unlink(shmName.c_str());
-#endif
+        (void)name;
     }
 
     /**
      * @brief Yields the current thread's time slice.
      */
     static void ThreadYield() {
-#ifdef _WIN32
         SwitchToThread();
-#else
-        sched_yield();
-#endif
     }
 
     /**
@@ -312,22 +189,17 @@ public:
      * Used in spin loops to reduce power consumption and pipeline flushing.
      */
     static void CpuRelax() {
-#ifdef _WIN32
         YieldProcessor();
-#else
-        _mm_pause();
-#endif
     }
 
     /**
      * @brief Returns wall-clock nanoseconds since Unix epoch.
      *
      * Used by the v0.7.0 `SlotHeader::lease` field — owners stamp their
-     * activity time. We use wall-clock (not `CLOCK_MONOTONIC` / QPC)
-     * specifically so the value is comparable across processes AND
-     * across languages: the Go side stores `time.Now().UnixNano()` and
-     * the C++ side stores this. Both sit in the same Unix-epoch
-     * timeline.
+     * activity time. We use wall-clock (not QPC) specifically so the value
+     * is comparable across processes AND across languages: the Go side
+     * stores `time.Now().UnixNano()` and the C++ side stores this. Both sit
+     * in the same Unix-epoch timeline.
      *
      * NOT strictly monotonic — an NTP step can move the clock backward.
      * For lease purposes this is acceptable: a backward step causes a
@@ -337,11 +209,9 @@ public:
      *
      * Despite the name "MonotonicNanos" we are NOT using a monotonic
      * clock; kept this way so v0.7.1's `TryReclaimAbandonedSlot` API
-     * has a stable identifier. Will be revisited when v0.7.1 adds the
-     * crash-injection test that pins the epoch contract.
+     * has a stable identifier.
      */
     static uint64_t MonotonicNanos() {
-#ifdef _WIN32
         FILETIME ft;
         GetSystemTimePreciseAsFileTime(&ft);
         // FILETIME is 100-ns ticks since 1601-01-01; Unix epoch is
@@ -351,12 +221,6 @@ public:
         ull.HighPart = ft.dwHighDateTime;
         const uint64_t kEpochDeltaTicks = 116444736000000000ULL;
         return (ull.QuadPart - kEpochDeltaTicks) * 100ULL;
-#else
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        return static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL +
-               static_cast<uint64_t>(ts.tv_nsec);
-#endif
     }
 
     /**
@@ -364,23 +228,19 @@ public:
      * @return int PID.
      */
     static int GetPid() {
-#ifdef _WIN32
         return (int)GetCurrentProcessId();
-#else
-        return (int)getpid();
-#endif
     }
 
     /**
      * @brief Tries to acquire an exclusive lock on the SHM region.
      *
-     * @param hShm The shared memory handle (Linux FD).
-     * @param name The shared memory name (Windows Mutex Name).
-     * @param[out] outLockHandle The lock handle (Windows Mutex). Unused on Linux.
+     * @param hShm The shared memory handle. Unused on Windows.
+     * @param name The shared memory name (used to derive the Windows Mutex name).
+     * @param[out] outLockHandle The lock handle (Windows Mutex).
      * @return true if acquired, false if already locked.
      */
     static bool LockShm(ShmHandle hShm, const char* name, ShmHandle& outLockHandle) {
-#ifdef _WIN32
+        (void)hShm;
         std::string s_name(name);
         std::wstring w_name(s_name.begin(), s_name.end());
         std::wstring mutex_name = L"Local\\" + w_name + L"_lock";
@@ -405,29 +265,19 @@ public:
         // We created it and own it.
         outLockHandle = hMutex;
         return true;
-#else
-        // Linux: Lock the file descriptor
-        if (flock(hShm, LOCK_EX | LOCK_NB) == 0) {
-            return true;
-        }
-        return false;
-#endif
     }
 
     /**
      * @brief Releases the SHM lock.
-     * @param hShm The shared memory handle.
-     * @param hLock The lock handle (Windows).
+     * @param hShm The shared memory handle. Unused on Windows.
+     * @param hLock The lock handle (Windows Mutex).
      */
     static void UnlockShm(ShmHandle hShm, ShmHandle hLock) {
-#ifdef _WIN32
+        (void)hShm;
         if (hLock) {
             ReleaseMutex(hLock);
             CloseHandle(hLock);
         }
-#else
-        flock(hShm, LOCK_UN);
-#endif
     }
 };
 

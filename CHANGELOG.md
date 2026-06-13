@@ -1,5 +1,48 @@
 # Changelog
 
+## [v0.7.7] - 2026-06-13
+
+### Changed
+
+- **The library is now Windows-only.** All Linux/POSIX cross-compilation
+  support has been removed (a deliberate reversal of the previous
+  developer-convenience cross-platform target; the only production consumer,
+  `xll-gen`, is Windows-only). `include/shm/Platform.h` drops its `#else`
+  POSIX branch — the Win32 path (`CreateFileMapping`/`MapViewOfFile`,
+  `CreateEventW`, named mutex) is now unconditional and the header stays
+  header-only. The Go package no longer uses cgo at all (pure `syscall`).
+  `CMakeLists.txt`, `AGENTS.md`, and `SPECIFICATION.md` updated to Windows-only.
+  No wire-protocol/ABI change — `SHM_VERSION` remains `0x00070000`.
+
+### Removed
+
+- `go/platform_linux.go` and `go/sem_lifetime_linux_test.go` (POSIX cgo impl).
+- `tests/test_init_safety.cpp` (simulated POSIX FD exhaustion — meaningless on
+  the Windows HANDLE model) and a stray committed test ELF binary.
+- `experiments/` — the Linux-only pingpong/aeron/coro benchmark scratch and the
+  `xll` experiment (all POSIX cgo, never part of the shipped library or CI).
+
+### Fixed
+
+- `tests/test_shutdown_hang.cpp` watchdog ported from POSIX `SIGALRM`/`alarm`
+  to a portable detached `std::thread` + `std::_Exit(1)`.
+
+## [v0.7.6] - 2026-06-13
+
+### Fixed
+
+- `go`: bound in-flight stream reassembly memory with a `MaxConcurrentStreams`
+  cap (1024) and LRU eviction keyed on activity sequence, so a zombie/malicious
+  peer that sends `StreamStart` without delivering chunks can no longer grow
+  reassembly state without bound.
+
+## [v0.7.5] - 2026-06-11
+
+### Fixed
+
+- `go`: atomic `SetTimeout`, idempotent `Close`, and stream-sender drain on
+  close; slot-reclaim generation handling.
+
 ## [v0.7.4] - 2026-06-10
 
 ### Fixed

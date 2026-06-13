@@ -1,22 +1,28 @@
 #include <iostream>
 #include <thread>
 #include <atomic>
+#include <chrono>
+#include <cstdlib>
 #include <shm/DirectHost.h>
-#include <unistd.h>
-#include <signal.h>
-
-void alarm_handler(int signum) {
-    std::cerr << "Test timed out (HANG DETECTED)!" << std::endl;
-    _exit(1);
-}
 
 int main() {
     shm::Platform::UnlinkShm("ShutdownHangTest");
     shm::Platform::UnlinkNamedEvent("ShutdownHangTest_slot_0");
     shm::Platform::UnlinkNamedEvent("ShutdownHangTest_slot_0_resp");
 
-    signal(SIGALRM, alarm_handler);
-    alarm(2); // 2 seconds timeout
+    // Portable watchdog: a detached thread force-exits the process if the test
+    // body does not finish within the timeout (replaces POSIX SIGALRM/alarm).
+    std::atomic<bool> done{false};
+    std::thread watchdog([&done]() {
+        for (int i = 0; i < 200 && !done.load(std::memory_order_acquire); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        if (!done.load(std::memory_order_acquire)) {
+            std::cerr << "Test timed out (HANG DETECTED)!" << std::endl;
+            std::_Exit(1);
+        }
+    });
+    watchdog.detach();
 
     shm::DirectHost host;
     if (!host.Init("ShutdownHangTest", 1, 1024)) {
@@ -41,5 +47,6 @@ int main() {
     host.SendShutdown();
 
     std::cout << "Shutdown completed." << std::endl;
+    done.store(true, std::memory_order_release);
     return 0;
 }

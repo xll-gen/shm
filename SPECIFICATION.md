@@ -178,22 +178,24 @@ All synchronization primitives are named based on the Shared Memory name (`SHM_N
 - **Response Event (Guest -> Host):** `{SHM_NAME}_slot_{INDEX}_resp`
 - **Guest Call Event (Guest -> Host):** `{SHM_NAME}_guest_call` (Global event for all guest slots)
 
-*Note: On Linux, named semaphores often require a leading `/`, so the actual name might be `/SimpleIPC_slot_0`.*
+*Note: On Windows these names are created under the `Local\` namespace, so the actual object name is `Local\SimpleIPC_slot_0`.*
 
 ### 4.2. Hybrid Wait Strategy
 
 Implementations should use a hybrid wait strategy for optimal latency:
 1.  **Spin:** Busy-wait for a short period (checking atomic `state`).
 2.  **Yield:** Call `std::this_thread::yield()` or `runtime.Gosched()`.
-3.  **Sleep:** Wait on the OS primitive (Semaphore/Event) if the peer signals it is sleeping (`hostState`/`guestState` flags).
+3.  **Sleep:** Wait on the OS primitive (named Event) if the peer signals it is sleeping (`hostState`/`guestState` flags).
 
 ### 4.3. Platform Implementation
 
-| Feature | Linux | Windows |
-| :--- | :--- | :--- |
-| **Shared Memory** | `shm_open` / `mmap` | `CreateFileMapping` / `MapViewOfFile` |
-| **Signaling** | Named Semaphores (`sem_open`) | Named Events (`CreateEvent`) |
-| **Atomic Wait** | `sem_wait` / `sem_post` | `WaitForSingleObject` / `SetEvent` |
+This library is **Windows-only** (MSVC 2019+ / MinGW). All primitives map onto the Win32 API:
+
+| Feature | Windows |
+| :--- | :--- |
+| **Shared Memory** | `CreateFileMapping` / `MapViewOfFile` |
+| **Signaling** | Named Events (`CreateEvent`) |
+| **Atomic Wait** | `WaitForSingleObject` / `SetEvent` |
 
 ### 4.4. Memory Ordering Contract
 
@@ -234,7 +236,7 @@ In v0.7.0 nothing yet *reads* `lease` to make decisions — the field is observa
 
 | Side | Source |
 | :--- | :--- |
-| C++ Host | `Platform::MonotonicNanos()` — `GetSystemTimePreciseAsFileTime` (Windows) or `clock_gettime(CLOCK_REALTIME)` (Linux), normalised to ns-since-Unix-epoch. |
+| C++ Host | `Platform::MonotonicNanos()` — `GetSystemTimePreciseAsFileTime`, normalised to ns-since-Unix-epoch. |
 | Go Guest | `shm.MonotonicNanos()` — `time.Now().UnixNano()`. |
 
 The name "MonotonicNanos" predates the wall-clock choice; it stays for API stability. Wall-clock was selected so the values are comparable across processes AND across languages without coordinating clock epochs. NTP steps can move the clock backward; a backward step causes at most a spurious reclamation candidate (guarded by the v0.7.1 CAS check against `state`), never data corruption.

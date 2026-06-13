@@ -14,7 +14,7 @@ import (
 // any event handles — it just exposes the bookkeeping (slots[] + the State
 // and Lease fields) that TryReclaimAbandonedSlot needs. Sufficient for
 // driving the reclaim API through every scenario without paying the
-// shm_open / sem_open lifecycle cost.
+// shared-memory / event-object lifecycle cost.
 //
 // We exercise TryReclaimAbandonedSlot directly rather than through a real
 // Host/Guest pair because the latter would also need a parallel C++ peer.

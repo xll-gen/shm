@@ -164,9 +164,8 @@ func openShm(name string, size uint64) (ShmHandle, uintptr, error) {
 	}
 
 	// Validate the mapped view is at least `size` bytes before any caller
-	// dereferences the ExchangeHeader/slots. The Linux path guards this via
-	// fstat (a too-small mapping there would SIGBUS); on Windows MapViewOfFile
-	// with dwNumberOfBytesToMap=0 maps the whole section, so a section created
+	// dereferences the ExchangeHeader/slots. MapViewOfFile with
+	// dwNumberOfBytesToMap=0 maps the whole section, so a section created
 	// smaller than expected (stale/mismatched config, or a Host still
 	// initializing) would otherwise be read out of bounds. VirtualQuery reports
 	// the committed region size at the view base; reject if it is short.

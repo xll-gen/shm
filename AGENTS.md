@@ -14,8 +14,8 @@ This repo's contract is **transport only**: never embed protocol-specific assump
 
 ## **Platform Targets**
 
-* **Primary deployment target**: Windows x86 / x86-64 (Intel/AMD), as the production consumer is `xll-gen`, which is Windows-only (see `xll-gen/AGENTS.md` §0.1). On x86/x64, TSO hardware ordering covers most of the acquire-release contract; correctness MUST still be implemented via proper atomic ops (no `relaxed` on synchronizing operations).
-* **Library compile targets**: Linux (GCC/Clang) and Windows (MSVC 2019+) per the Coding Standards section below. Linux support exists for developer convenience, CI, and potential reuse — NOT as an `xll-gen` production deployment target.
+* **Sole deployment target**: Windows x86 / x86-64 (Intel/AMD), as the production consumer is `xll-gen`, which is Windows-only (see `xll-gen/AGENTS.md` §0.1). On x86/x64, TSO hardware ordering covers most of the acquire-release contract; correctness MUST still be implemented via proper atomic ops (no `relaxed` on synchronizing operations).
+* **Library compile targets**: Windows only — MSVC 2019+ and MinGW (GCC). This repo is **Windows-only**; there is no Linux/POSIX support. Use `Platform.h` for all OS primitives (Win32 Events, file mappings).
 * **No ARM support**: neither Windows-on-ARM nor Apple Silicon is a target. Cache-line sizes other than 64 bytes are out of scope for tuning.
 * **Single-architecture matching at runtime**: C++ Host and Go Guest in a given deployment MUST run on the same architecture and bitness. Cross-arch IPC is not supported.
 
@@ -46,9 +46,9 @@ This repo's contract is **transport only**: never embed protocol-specific assump
     *   **Header-only architecture.**
     *   Use `doxygen` style comments (`/** ... */`).
     *   Strict memory alignment (cache-line friendly).
-    *   **Cross-Platform:** Must compile on Linux (GCC/Clang) and Windows (MSVC 2019+). Use `Platform.h` for OS primitives.
+    *   **Windows-only:** Must compile on Windows with MSVC 2019+ and MinGW (GCC). There is no Linux/POSIX support. Use `Platform.h` for OS primitives.
 *   **Go:**
-    *   Use `cgo` only when necessary for OS primitives (e.g. `sem_open`).
+    *   **No cgo.** OS primitives are accessed via `syscall` against `kernel32.dll` (see `go/platform_windows.go`). The Go side is pure Go + `syscall`.
     *   Use `go fmt`.
     *   Follow standard Go idioms.
 
@@ -102,7 +102,7 @@ The Shared Memory layout is the contract between C++ (Host) and Go (Guest).
 ### **Platform Primitives**
 Synchronization primitives must behave identically across languages and OSs.
 1.  **C++ Interface**: `include/shm/Platform.h`.
-2.  **Go Implementation**: `go/platform.go`, `go/platform_linux.go`, `go/platform_windows.go`.
+2.  **Go Implementation**: `go/platform.go` (shared dispatcher/doc comments), `go/platform_windows.go` (Win32 `syscall` implementation).
 **Constraint**: If you add a feature (e.g., timeout) to C++, you must implement it in Go.
 
 ### **Feature Parity (Host <-> Guest)**
@@ -137,7 +137,7 @@ From a code review on 2026-05-16. Address as part of normal work.
   * **v0.7.3 (DONE):** End-to-end crash-process test. `go/reclaim_crash_test.go::TestCrashProcess_ReclaimAfterChildExit` re-execs the test binary with `SHM_CRASH_TEST_WORKER=1` — the child opens the parent's shm, CAS-claims the guest slot, writes Lease, then `os.Exit(0)` without releasing. Parent waits for child to exit, sleeps past the threshold, calls `TryReclaimAbandonedSlot`, asserts the slot returns to `SlotFree`. Validates the kernel-tracked cross-process lifecycle, not just in-process CAS races. Runs in ~0.5 s.
 
   The v0.7-series crash-recovery feature is **feature-complete**: lease (v0.7.0) + opt-in reclamation API (v0.7.1) + auto-reclaim integration (v0.7.2) + cross-process verification (v0.7.3).
-* **DONE (v0.6.5):** Linux semaphore lifetime — `unlinkEvent` (Go) and `Platform::UnlinkNamedEvent` (C++) now carry explicit ownership/lifetime docs (host owns cleanup; DirectHost::Shutdown does it for every slot; guests must NOT unlink). New Linux-tagged regression `TestSemaphoreLifetime_NoLeakAcrossRuns` (`go/sem_lifetime_linux_test.go`) runs 50 init/teardown cycles and asserts `/dev/shm/sem.*` is back to baseline.
+* **OBSOLETE (was v0.6.5, removed when the repo went Windows-only):** Linux semaphore lifetime work. The POSIX named-semaphore backend (`go/platform_linux.go`), its regression test (`go/sem_lifetime_linux_test.go`), and the `/dev/shm/sem.*` leak concern no longer exist. `UnlinkEvent`/`UnlinkShm` (Go) and `Platform::UnlinkNamedEvent`/`Platform::UnlinkShm` (C++) are retained as effective no-ops on Windows for API symmetry and teardown calls — Windows kernel objects are reference-counted, so there is nothing to unlink.
 * **DONE (v0.6.0):** Doc comments on `MsgType` constants — every entry in `go/direct.go:36–63` now has a `// MsgFoo ...` line and the C++ side mirrors it in `MsgType.h` Doxygen.
 * **DONE (v0.6.5):** Nested IPC deadlock detector — `DirectHost::AcquireSlot` (C++, `SHM_DEBUG` only) counts full slot sweeps; after 10 000 fruitless sweeps it emits a one-shot `SHM_LOG_WARN` pointing at the README's "Nested IPC & Recursion" guidance (`numHostSlots >= N_threads × (Depth + 1)`). Production builds without `SHM_DEBUG` keep the old spin-forever semantics, so behavior is identical when compiled out.
 

@@ -40,13 +40,8 @@ endif()
 find_package(Threads REQUIRED)
 target_link_libraries(shm INTERFACE Threads::Threads)
 
-if(UNIX)
-    # On Linux, shm_open requires -lrt
-    target_link_libraries(shm INTERFACE rt)
-elseif(WIN32)
-    # On Windows, link ws2_32 (Winsock) just in case, ensuring compatibility
-    target_link_libraries(shm INTERFACE ws2_32)
-endif()
+# Windows-only: link ws2_32 (Winsock) for compatibility.
+target_link_libraries(shm INTERFACE ws2_32)
 
 # --- Installation ---
 include(GNUInstallDirs)

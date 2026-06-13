@@ -1,13 +1,11 @@
 package shm
 
-// EventHandle represents an OS-specific handle for a synchronization event.
-// On Linux, it wraps a pointer to `sem_t`.
-// On Windows, it wraps a `HANDLE`.
+// EventHandle represents a handle for a synchronization event.
+// It wraps a Windows `HANDLE` to a named Event object.
 type EventHandle uintptr
 
-// ShmHandle represents an OS-specific handle for a shared memory region.
-// On Linux, it wraps a file descriptor (int).
-// On Windows, it wraps a `HANDLE`.
+// ShmHandle represents a handle for a shared memory region.
+// It wraps a Windows `HANDLE` to a file-mapping object.
 type ShmHandle uintptr
 
 // CreateEvent creates a new named synchronization event.
@@ -51,7 +49,10 @@ func CloseEvent(h EventHandle) {
 }
 
 // UnlinkEvent removes the named event from the system.
-// This is primarily relevant for POSIX semaphores which persist until unlinked.
+// On Windows, named `Local\` Event objects are kernel reference-counted and
+// destroyed automatically when the last handle is closed, so this is a no-op.
+// It is retained for API symmetry and because callers invoke it during
+// teardown.
 //
 // name: The name of the event.
 func UnlinkEvent(name string) {
@@ -89,6 +90,9 @@ func CloseShm(h ShmHandle, addr uintptr, size uint64) {
 }
 
 // UnlinkShm removes the named shared memory region from the system.
+// On Windows, pagefile-backed file mappings are destroyed automatically when
+// the last handle is closed, so this is a no-op. It is retained for API
+// symmetry and because callers invoke it during teardown.
 //
 // name: The name of the shared memory region.
 func UnlinkShm(name string) {
