@@ -43,6 +43,13 @@ const (
 	MaxStreamChunks = 1 << 20
 	// MaxStreamSize bounds StreamHeader.TotalSize (1 GiB).
 	MaxStreamSize = 1 << 30
+	// MaxConcurrentStreams bounds the number of partially-reassembled streams
+	// held in memory at once. A peer that opens streams (StreamStart) but never
+	// delivers all chunks — because it crashed, was killed, or is malicious —
+	// would otherwise accumulate streamContexts (each holding up to TotalSize
+	// bytes) forever. When a new StreamStart would exceed this bound, the
+	// least-recently-active in-flight stream is evicted.
+	MaxConcurrentStreams = 1024
 )
 
 // StreamHandler is a function type for processing assembled streams.
@@ -54,6 +61,10 @@ type streamContext struct {
 	totalChunks uint32
 	chunks      [][]byte
 	received    uint32
+	// lastSeq is the closure-local activity counter value at the most recent
+	// StreamStart/StreamChunk for this stream. It defines least-recently-active
+	// order for eviction; it is read/written only under the reassembler mutex.
+	lastSeq uint64
 }
 
 // NewStreamReassembler creates a Handler that reassembles streams and calls the provided StreamHandler.
@@ -65,6 +76,9 @@ func NewStreamReassembler(onStream StreamHandler, fallback func(req []byte, resp
 	// Map to store partial streams
 	streams := make(map[uint64]*streamContext)
 	var mu sync.Mutex
+	// seq is a monotonic activity counter; the highest value marks the most
+	// recently touched stream. Guarded by mu.
+	var seq uint64
 
 	return func(req []byte, resp []byte, msgType MsgType) (int32, MsgType) {
 		if msgType == MsgTypeStreamStart {
@@ -89,11 +103,29 @@ func NewStreamReassembler(onStream StreamHandler, fallback func(req []byte, resp
 			}
 
 			mu.Lock()
+			seq++
+			// Bound the number of in-flight reassemblies. Adding a genuinely
+			// new stream beyond the cap evicts the least-recently-active one,
+			// so a peer that starts streams but never finishes them cannot grow
+			// the map without limit. A repeated StreamStart for an existing ID
+			// just overwrites and does not count as growth.
+			if _, dup := streams[header.StreamID]; !dup && len(streams) >= MaxConcurrentStreams {
+				oldestID := header.StreamID
+				oldestSeq := ^uint64(0)
+				for id, c := range streams {
+					if c.lastSeq < oldestSeq {
+						oldestSeq = c.lastSeq
+						oldestID = id
+					}
+				}
+				delete(streams, oldestID)
+			}
 			streams[header.StreamID] = &streamContext{
 				totalSize:   header.TotalSize,
 				totalChunks: header.TotalChunks,
 				chunks:      make([][]byte, header.TotalChunks),
 				received:    0,
+				lastSeq:     seq,
 			}
 			mu.Unlock()
 			return 0, MsgTypeNormal // ACK
@@ -130,6 +162,11 @@ func NewStreamReassembler(onStream StreamHandler, fallback func(req []byte, resp
 				mu.Unlock()
 				return 0, MsgTypeSystemError
 			}
+
+			// Mark activity so a stream actively receiving chunks is not the
+			// eviction target when other streams open under memory pressure.
+			seq++
+			ctx.lastSeq = seq
 
 			if ctx.chunks[chunkIndex] == nil {
 				ctx.chunks[chunkIndex] = chunkData
