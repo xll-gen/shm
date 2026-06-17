@@ -1,4 +1,8 @@
-# Shared Memory IPC Specification (v0.7.0)
+# Shared Memory IPC Specification (wire protocol `SHM_VERSION 0x00070000`)
+
+> Document tracks the `shm` release line (see `VERSION`). The **wire** protocol version
+> (`SHM_VERSION 0x00070000`) is intentionally pinned across the ABI-compatible v0.7.x series;
+> patch releases add fields carved from reserved space without bumping it.
 
 This document defines the specification for the `xll-gen/shm` Shared Memory IPC system. It serves as the authoritative reference for implementing the protocol in any language (C++, Go, Python, Rust, etc.).
 
@@ -222,7 +226,7 @@ The `state` field of `SlotHeader` is the synchronizing variable that publishes o
 
 ## 3.6. Lease Heartbeat (v0.7.0)
 
-**Status**: Layout + heartbeat-on-CAS shipped in v0.7.0. Reclamation logic is targeted for v0.7.1.
+**Status**: Shipped. Layout + heartbeat-on-CAS landed in v0.7.0; the reclamation policy (`TryReclaimAbandonedSlot`) shipped in v0.7.2.
 
 **Problem**: A host or guest crashing mid-exchange leaves the slot in `SLOT_BUSY` / `SLOT_REQ_READY` / `SLOT_GUEST_BUSY` forever. The surviving side has no mechanism to distinguish a slow peer from a dead one.
 
@@ -230,7 +234,7 @@ The `state` field of `SlotHeader` is the synchronizing variable that publishes o
 
 Every site that CAS's `state` from `SLOT_FREE` (or `SLOT_RESP_READY`/`SLOT_REQ_READY` reclaim paths) to a non-FREE value MUST, immediately after the successful CAS, store `Platform::MonotonicNanos()` into `lease` with `memory_order_release` (or Go's `atomic.StoreUint64`). This marks the slot as "actively owned at time T".
 
-In v0.7.0 nothing yet *reads* `lease` to make decisions — the field is observable through `SlotHeader::lease` for diagnostics, but no code reclaims based on it. v0.7.1 will introduce the reclamation policy.
+In v0.7.0 nothing yet *read* `lease` to make decisions — the field was observable through `SlotHeader::lease` for diagnostics, but no code reclaimed based on it. v0.7.2 introduced the reclamation policy described below.
 
 **Clock contract**: `lease` is **wall-clock nanoseconds since the Unix epoch**, not a monotonic counter. Both sides use it:
 
@@ -239,21 +243,21 @@ In v0.7.0 nothing yet *reads* `lease` to make decisions — the field is observa
 | C++ Host | `Platform::MonotonicNanos()` — `GetSystemTimePreciseAsFileTime`, normalised to ns-since-Unix-epoch. |
 | Go Guest | `shm.MonotonicNanos()` — `time.Now().UnixNano()`. |
 
-The name "MonotonicNanos" predates the wall-clock choice; it stays for API stability. Wall-clock was selected so the values are comparable across processes AND across languages without coordinating clock epochs. NTP steps can move the clock backward; a backward step causes at most a spurious reclamation candidate (guarded by the v0.7.1 CAS check against `state`), never data corruption.
+The name "MonotonicNanos" predates the wall-clock choice; it stays for API stability. Wall-clock was selected so the values are comparable across processes AND across languages without coordinating clock epochs. NTP steps can move the clock backward; a backward step causes at most a spurious reclamation candidate (guarded by the CAS check against `state`), never data corruption.
 
-**v0.7.1 (planned) — reclamation**:
+**v0.7.2 — reclamation**:
 
 1. Waiter side reads `lease`. If `now - lease > kLeaseTimeoutNs` (suggested: 5 × `responseTimeoutMs` converted to ns), the slot is *presumed abandoned*.
 2. Waiter attempts `state.compare_exchange_strong(observed_state, SLOT_FREE)`. If the CAS succeeds the slot is reclaimed; if it fails, the live owner made progress in the meantime — abort the reclamation, retry the normal flow.
 3. Reclamation never fires on non-crash code paths because the heartbeat is refreshed inside the timeout window.
 
-Picking the wrong heartbeat cadence or timeout could reclaim a slot a slow-but-live peer is still using → double-use → data corruption. v0.7.1 will ship the reclamation API together with a property-based crash-injection test that asserts no double-claim across N random crash points. The test is the gating constraint; the API is straightforward once the test infrastructure exists.
+Picking the wrong heartbeat cadence or timeout could reclaim a slot a slow-but-live peer is still using → double-use → data corruption. v0.7.2 shipped the reclamation API together with a property-based crash-injection test that asserts no double-claim across N random crash points.
 
-**Why this was patch-layout-compatible**: `reserved[36]` was never written by v0.6.x code, so adding `atomic<uint64> lease` at offset 96 (with 4 bytes of natural alignment padding before it) is invisible to old readers. Old writers don't touch the slice. Mixed-version deployments degrade gracefully — v0.6.x peers participating in the protocol simply never publish a lease; v0.7.x reclaimers will see `lease == 0` for those slots and (per v0.7.1 design) skip reclamation for them, falling back to the pre-v0.7 forever-busy behavior.
+**Why this was patch-layout-compatible**: `reserved[36]` was never written by v0.6.x code, so adding `atomic<uint64> lease` at offset 96 (with 4 bytes of natural alignment padding before it) is invisible to old readers. Old writers don't touch the slice. Mixed-version deployments degrade gracefully — v0.6.x peers participating in the protocol simply never publish a lease; v0.7.x reclaimers see `lease == 0` for those slots and skip reclamation for them, falling back to the pre-v0.7 forever-busy behavior.
 
 ## 3.6.1. Claim Generation & the Reclamation ABA Guard (v0.7.5)
 
-**Status**: implemented; targeted for the v0.7.5 release (not yet tagged — v0.7.4 shipped without `gen`). ABI-compatible (`gen` carved from `reserved`, total size unchanged at 128 bytes; protocol version stays `0x00070000`).
+**Status**: Shipped in v0.7.5. ABI-compatible (`gen` carved from `reserved`, total size unchanged at 128 bytes; protocol version stays `0x00070000`).
 
 **Problem (ABA)**: `TryReclaimAbandonedSlot` (§3.6) decides a slot is abandoned from an observed `state` and a stale `lease`, then CAS's `state` from the observed value back to `SLOT_FREE`. Between the observation and the CAS a peer can legitimately:
 

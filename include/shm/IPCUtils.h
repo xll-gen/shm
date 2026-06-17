@@ -34,11 +34,13 @@ namespace shm {
 static const uint32_t SHM_MAGIC = 0x584C4C21;
 
 /**
- * @brief Protocol Version v0.7.0 (0x00070000). Adds atomic uint64 `lease`
- *        at SlotHeader offset 96 (offset 92 is alignment padding) for
- *        crash-recovery (v0.7.1 reclamation).
- * High 16 bits: Major, Low 16 bits: Minor.
- * Breaking changes increment Major version.
+ * @brief Wire protocol version (0x00070000). High 16 bits: Major, low 16 bits: Minor.
+ *
+ * Intentionally PINNED across the entire ABI-compatible v0.7.x series — patch
+ * releases add fields carved from `reserved` (atomic uint64 `lease` at SlotHeader
+ * offset 96 in v0.7.0 for crash-recovery reclamation; atomic uint64 `gen` at offset
+ * 104 in v0.7.5 for the reclamation ABA guard) without bumping this constant, since
+ * old readers never touched those bytes. Only breaking layout changes increment Major.
  */
 static const uint32_t SHM_VERSION = 0x00070000;
 

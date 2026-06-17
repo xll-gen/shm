@@ -64,9 +64,11 @@ const (
 
 	// Magic is the magic number for validating shared memory ("XLL!").
 	Magic uint32 = 0x584C4C21
-	// Version is the current protocol version (v0.7.0). Adds SlotHeader.Lease
-	// at offset 96 (92 is alignment padding) for crash-recovery
-	// (reclamation in v0.7.1).
+	// Version is the wire protocol version. Intentionally PINNED across the
+	// ABI-compatible v0.7.x series — patch releases add fields carved from
+	// reserved space (SlotHeader.Lease at offset 96 in v0.7.0 for crash-recovery
+	// reclamation; SlotHeader.Gen at offset 104 in v0.7.5 for the reclamation ABA
+	// guard) without bumping this constant. Only breaking layout changes bump it.
 	Version uint32 = 0x00070000
 
 	// HostStateActive indicates the Host is spinning or processing.

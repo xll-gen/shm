@@ -66,9 +66,9 @@ func Connect(config ClientConfig) (*Client, error) {
 // ConnectDefault is a helper for backward compatibility or simple usage.
 // It connects with default settings (10s timeout).
 func ConnectDefault(name string) (*Client, error) {
-    return Connect(ClientConfig{
-        ShmName: name,
-    })
+	return Connect(ClientConfig{
+		ShmName: name,
+	})
 }
 
 // Handle registers the request handler function.
