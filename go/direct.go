@@ -629,44 +629,56 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, buffer []byte, msgType 
 		return nil, fmt.Errorf("no guest slots available")
 	}
 
-	// Use Round-Robin to pick a start index to reduce contention
+	// Use Round-Robin to pick a start index to reduce contention.
 	offset := atomic.AddUint32(&g.nextGuestSlot, 1)
 	startBase := int(g.numSlots)
 	numGuest := int(g.numGuestSlots)
 
+	// Slot acquisition waits up to `timeout` for a free guest slot rather than
+	// failing on a single non-blocking pass. A momentary shortage — e.g. an RTD
+	// connect storm saturating the small guest-slot pool — must not permanently
+	// strand the caller. This matters most for one-shot rtd-once pushes: they
+	// get exactly one SendUpdate, so a dropped acquisition left the cell stuck
+	// at #GETTING_DATA forever. Polling is best-effort, NOT FIFO: whichever
+	// waiter wins the CAS takes the freed slot. The response wait below keeps
+	// its own independent `timeout` budget.
+	acquireDeadline := time.Now().Add(timeout)
+	backoff := 100 * time.Microsecond
+
 	var slot *slotContext
-	for j := 0; j < numGuest; j++ {
-		idx := startBase + int((uint32(j)+offset)%uint32(numGuest))
-		s := &g.slots[idx]
-		currentState := atomic.LoadUint32(&s.header.State)
+	for {
+		for j := 0; j < numGuest; j++ {
+			idx := startBase + int((uint32(j)+offset)%uint32(numGuest))
+			s := &g.slots[idx]
+			currentState := atomic.LoadUint32(&s.header.State)
 
-		if currentState == SlotFree {
-			claimSlotGen(s.header)
-			if atomic.CompareAndSwapUint32(&s.header.State, SlotFree, SlotGuestBusy) {
-				atomic.StoreUint64(&s.header.Lease, MonotonicNanos())
-				slot = s
-				break
-			}
-		}
-
-		if currentState == SlotRespReady {
-			if atomic.LoadInt32(&s.ActiveWait) == 0 {
+			if currentState == SlotFree {
 				claimSlotGen(s.header)
-				if atomic.CompareAndSwapUint32(&s.header.State, SlotRespReady, SlotGuestBusy) {
+				if atomic.CompareAndSwapUint32(&s.header.State, SlotFree, SlotGuestBusy) {
 					atomic.StoreUint64(&s.header.Lease, MonotonicNanos())
 					slot = s
 					break
 				}
 			}
-		}
-	}
 
-	if slot == nil {
-		// v0.7.2: auto-reclaim. If the caller opted in via
-		// SetAutoReclaimTimeout, scan every guest slot and try
-		// reclaiming any whose lease is stale. Retry the acquisition
-		// once after the sweep — at most one retry, so a persistent
-		// shortage still returns the original error.
+			if currentState == SlotRespReady {
+				if atomic.LoadInt32(&s.ActiveWait) == 0 {
+					claimSlotGen(s.header)
+					if atomic.CompareAndSwapUint32(&s.header.State, SlotRespReady, SlotGuestBusy) {
+						atomic.StoreUint64(&s.header.Lease, MonotonicNanos())
+						slot = s
+						break
+					}
+				}
+			}
+		}
+		if slot != nil {
+			break
+		}
+
+		// v0.7.2: auto-reclaim. If the caller opted in via SetAutoReclaimTimeout,
+		// scan every guest slot and try reclaiming any whose lease is stale, then
+		// retry the acquisition from the freed slot(s).
 		reclaimThresh := time.Duration(atomic.LoadUint64(&g.autoReclaimTimeoutNs))
 		if reclaimThresh > 0 {
 			reclaimed := false
@@ -692,9 +704,29 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, buffer []byte, msgType 
 				}
 			}
 		}
-		if slot == nil {
+		if slot != nil {
+			break
+		}
+
+		// No slot this pass. Abort promptly if the guest is tearing down so
+		// shutdown is never blocked. Otherwise wait — bounded — for a slot to
+		// free and rescan, until the deadline.
+		if atomic.LoadInt32(&g.closing) == 1 {
+			return nil, fmt.Errorf("guest closing")
+		}
+		remaining := time.Until(acquireDeadline)
+		if remaining <= 0 {
 			return nil, fmt.Errorf("all guest slots busy")
 		}
+		if backoff > remaining {
+			backoff = remaining
+		}
+		time.Sleep(backoff)
+		if backoff < 2*time.Millisecond {
+			backoff *= 2
+		}
+		// Advance the round-robin start so each pass rescans from a fresh offset.
+		offset = atomic.AddUint32(&g.nextGuestSlot, 1)
 	}
 
 	if len(data) > len(slot.reqBuffer) {
