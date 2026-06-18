@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include <atomic>
+#include <cstddef> // offsetof — per-field ABI offset guards (R25)
 
 // Host/Guest Sleeping States
 
@@ -199,6 +200,22 @@ struct alignas(64) SlotHeader {
 static_assert(sizeof(SlotHeader) == 128, "SlotHeader must be exactly 128 bytes (ABI)");
 static_assert(alignof(SlotHeader) >= 64, "SlotHeader must be at least 64-byte aligned");
 
+// Per-field offset guards (R25). The size assert above catches total-size drift
+// but NOT field reordering that preserves 128 bytes (e.g. swapping reqSize/respSize
+// or moving the pre-lease alignment pad). These freeze every field offset and are
+// mirrored byte-for-byte by the Go side's unsafe.Offsetof guards in go/direct.go
+// and by SPECIFICATION.md §2.2.1. Update all three together if the layout ever changes.
+static_assert(offsetof(SlotHeader, state)      == 64,  "SlotHeader.state @64");
+static_assert(offsetof(SlotHeader, hostState)  == 68,  "SlotHeader.hostState @68");
+static_assert(offsetof(SlotHeader, guestState) == 72,  "SlotHeader.guestState @72");
+static_assert(offsetof(SlotHeader, msgSeq)     == 76,  "SlotHeader.msgSeq @76");
+static_assert(offsetof(SlotHeader, msgType)    == 80,  "SlotHeader.msgType @80");
+static_assert(offsetof(SlotHeader, reqSize)    == 84,  "SlotHeader.reqSize @84");
+static_assert(offsetof(SlotHeader, respSize)   == 88,  "SlotHeader.respSize @88");
+static_assert(offsetof(SlotHeader, lease)      == 96,  "SlotHeader.lease @96 (4B pad after respSize)");
+static_assert(offsetof(SlotHeader, gen)        == 104, "SlotHeader.gen @104");
+static_assert(offsetof(SlotHeader, reserved)   == 112, "SlotHeader.reserved @112");
+
 // Slot State Constants
 /**
  * @brief Enumeration of possible Slot states.
@@ -249,5 +266,16 @@ struct ExchangeHeader {
 
 // ABI safety: ExchangeHeader must remain exactly 64 bytes. Layout is frozen.
 static_assert(sizeof(ExchangeHeader) == 64, "ExchangeHeader must be exactly 64 bytes (ABI)");
+
+// Per-field offset guards (R25) — freeze every field offset against the Go mirror
+// (go/direct.go) and SPECIFICATION.md §2.1; the size assert alone misses reordering.
+static_assert(offsetof(ExchangeHeader, magic)         == 0,  "ExchangeHeader.magic @0");
+static_assert(offsetof(ExchangeHeader, version)       == 4,  "ExchangeHeader.version @4");
+static_assert(offsetof(ExchangeHeader, numSlots)      == 8,  "ExchangeHeader.numSlots @8");
+static_assert(offsetof(ExchangeHeader, numGuestSlots) == 12, "ExchangeHeader.numGuestSlots @12");
+static_assert(offsetof(ExchangeHeader, slotSize)      == 16, "ExchangeHeader.slotSize @16");
+static_assert(offsetof(ExchangeHeader, reqOffset)     == 20, "ExchangeHeader.reqOffset @20");
+static_assert(offsetof(ExchangeHeader, respOffset)    == 24, "ExchangeHeader.respOffset @24");
+static_assert(offsetof(ExchangeHeader, reserved)      == 28, "ExchangeHeader.reserved @28");
 
 }

@@ -140,6 +140,50 @@ var (
 	_ [unsafe.Sizeof(ExchangeHeader{}) - 64]byte
 )
 
+// Per-field offset guards (R25). The size asserts above catch total-size drift
+// but NOT field reordering that preserves 128/64 bytes (e.g. swapping ReqSize and
+// RespSize, or a wrong pre-Lease pad). unsafe.Offsetof is a constant expression, so
+// each dual-array pair fails the build on any offset mismatch — one side goes
+// negative if the field moved later, the other if it moved earlier. These mirror
+// the C++ offsetof asserts in include/shm/IPCUtils.h and SPECIFICATION.md §2.2.1/§2.1;
+// change all three together if the layout ever changes. (Blank pad/reserved fields
+// can't be named here; pinning Lease@96 and Gen@104 plus total size constrains them.)
+var (
+	_ [64 - unsafe.Offsetof(SlotHeader{}.State)]byte
+	_ [unsafe.Offsetof(SlotHeader{}.State) - 64]byte
+	_ [68 - unsafe.Offsetof(SlotHeader{}.HostState)]byte
+	_ [unsafe.Offsetof(SlotHeader{}.HostState) - 68]byte
+	_ [72 - unsafe.Offsetof(SlotHeader{}.GuestState)]byte
+	_ [unsafe.Offsetof(SlotHeader{}.GuestState) - 72]byte
+	_ [76 - unsafe.Offsetof(SlotHeader{}.MsgSeq)]byte
+	_ [unsafe.Offsetof(SlotHeader{}.MsgSeq) - 76]byte
+	_ [80 - unsafe.Offsetof(SlotHeader{}.MsgType)]byte
+	_ [unsafe.Offsetof(SlotHeader{}.MsgType) - 80]byte
+	_ [84 - unsafe.Offsetof(SlotHeader{}.ReqSize)]byte
+	_ [unsafe.Offsetof(SlotHeader{}.ReqSize) - 84]byte
+	_ [88 - unsafe.Offsetof(SlotHeader{}.RespSize)]byte
+	_ [unsafe.Offsetof(SlotHeader{}.RespSize) - 88]byte
+	_ [96 - unsafe.Offsetof(SlotHeader{}.Lease)]byte
+	_ [unsafe.Offsetof(SlotHeader{}.Lease) - 96]byte
+	_ [104 - unsafe.Offsetof(SlotHeader{}.Gen)]byte
+	_ [unsafe.Offsetof(SlotHeader{}.Gen) - 104]byte
+
+	_ [0 - unsafe.Offsetof(ExchangeHeader{}.Magic)]byte
+	_ [unsafe.Offsetof(ExchangeHeader{}.Magic) - 0]byte
+	_ [4 - unsafe.Offsetof(ExchangeHeader{}.Version)]byte
+	_ [unsafe.Offsetof(ExchangeHeader{}.Version) - 4]byte
+	_ [8 - unsafe.Offsetof(ExchangeHeader{}.NumSlots)]byte
+	_ [unsafe.Offsetof(ExchangeHeader{}.NumSlots) - 8]byte
+	_ [12 - unsafe.Offsetof(ExchangeHeader{}.NumGuestSlots)]byte
+	_ [unsafe.Offsetof(ExchangeHeader{}.NumGuestSlots) - 12]byte
+	_ [16 - unsafe.Offsetof(ExchangeHeader{}.SlotSize)]byte
+	_ [unsafe.Offsetof(ExchangeHeader{}.SlotSize) - 16]byte
+	_ [20 - unsafe.Offsetof(ExchangeHeader{}.ReqOffset)]byte
+	_ [unsafe.Offsetof(ExchangeHeader{}.ReqOffset) - 20]byte
+	_ [24 - unsafe.Offsetof(ExchangeHeader{}.RespOffset)]byte
+	_ [unsafe.Offsetof(ExchangeHeader{}.RespOffset) - 24]byte
+)
+
 // slotContext holds local runtime state for a slot.
 type slotContext struct {
 	header       *SlotHeader
