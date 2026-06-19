@@ -144,7 +144,7 @@ For large data transfers, the `STREAM_START` and `STREAM_CHUNK` message types ar
 **Total Size:** 24 Bytes.
 The payload follows immediately after the `ChunkHeader`.
 
-### 3.4. Data Alignment (Negative Size)
+#### 3.3.3. Data Alignment (Negative Size)
 
 The `reqSize` and `respSize` fields indicate the location of the data within the buffer:
 - **Positive (> 0):** Data starts at the beginning of the buffer (Offset 0).
@@ -224,7 +224,7 @@ The `state` field of `SlotHeader` is the synchronizing variable that publishes o
 - **Endianness:** The protocol assumes all peers are **Little Endian**.
 - **Padding:** Strict adherence to the padding bytes in `SlotHeader` and `ExchangeHeader` is required for binary compatibility.
 
-## 3.6. Lease Heartbeat (v0.7.0)
+### 3.6. Lease Heartbeat (v0.7.0)
 
 **Status**: Shipped. Layout + heartbeat-on-CAS landed in v0.7.0; the reclamation policy (`TryReclaimAbandonedSlot`) shipped in v0.7.2.
 
@@ -255,7 +255,7 @@ Picking the wrong heartbeat cadence or timeout could reclaim a slot a slow-but-l
 
 **Why this was patch-layout-compatible**: `reserved[36]` was never written by v0.6.x code, so adding `atomic<uint64> lease` at offset 96 (with 4 bytes of natural alignment padding before it) is invisible to old readers. Old writers don't touch the slice. Mixed-version deployments degrade gracefully — v0.6.x peers participating in the protocol simply never publish a lease; v0.7.x reclaimers see `lease == 0` for those slots and skip reclamation for them, falling back to the pre-v0.7 forever-busy behavior.
 
-## 3.6.1. Claim Generation & the Reclamation ABA Guard (v0.7.5)
+#### 3.6.1. Claim Generation & the Reclamation ABA Guard (v0.7.5)
 
 **Status**: Shipped in v0.7.5. ABI-compatible (`gen` carved from `reserved`, total size unchanged at 128 bytes; protocol version stays `0x00070000`).
 

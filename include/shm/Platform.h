@@ -203,12 +203,12 @@ public:
      *
      * NOT strictly monotonic — an NTP step can move the clock backward.
      * For lease purposes this is acceptable: a backward step causes a
-     * spurious reclamation candidate (caught by the v0.7.1 CAS guard,
+     * spurious reclamation candidate (caught by the v0.7.2 CAS guard,
      * which re-checks state before reclaiming); a forward step delays
      * reclamation. Neither corrupts data, both are rare.
      *
      * Despite the name "MonotonicNanos" we are NOT using a monotonic
-     * clock; kept this way so v0.7.1's `TryReclaimAbandonedSlot` API
+     * clock; kept this way so v0.7.2's `TryReclaimAbandonedSlot` API
      * has a stable identifier.
      */
     static uint64_t MonotonicNanos() {

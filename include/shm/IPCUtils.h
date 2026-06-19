@@ -156,10 +156,10 @@ struct alignas(64) SlotHeader {
      * behavior on peer crash.
      *
      * v0.7.0 only writes the lease — no reclamation logic yet. The
-     * `TryReclaimAbandonedSlot` API and auto-reclamation hook arrive in
-     * v0.7.1 together with a property-based crash-injection test.
-     * Until then this field is informational; consumers may read it to
-     * detect liveness manually.
+     * `TryReclaimAbandonedSlot` API and auto-reclamation hook shipped in
+     * v0.7.2 together with a property-based crash-injection test (see
+     * SPECIFICATION.md §3.6). In v0.7.0/v0.7.1 this field was informational;
+     * consumers could read it to detect liveness manually.
      */
     std::atomic<uint64_t> lease;
 
