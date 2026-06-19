@@ -16,7 +16,7 @@ cd ..
 
 # Build Go Server
 cd benchmarks/go
-go build -o server .
+go build -tags shm_benchstats -o server .
 cd ../..
 
 run_benchmark() {

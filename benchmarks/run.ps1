@@ -9,7 +9,7 @@ cmake --build build_bench --config Release
 # Build Go
 Write-Host "[Build] Go Guest..."
 Set-Location -Path "benchmarks/go"
-go build -o server.exe main.go
+go build -tags shm_benchstats -o server.exe main.go
 Set-Location -Path "../.."
 
 # Function to run a benchmark case

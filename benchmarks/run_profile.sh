@@ -21,7 +21,7 @@ cd ../..
 # Build Go
 echo "[Build] Go Guest..."
 cd benchmarks/go
-go build -o server main.go
+go build -tags shm_benchstats -o server main.go
 cd ../..
 
 run_case() {

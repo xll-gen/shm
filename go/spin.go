@@ -34,8 +34,15 @@ const (
 // Benchmark instrumentation: package-global counters measuring how often
 // Wait/WaitState resolve within the spin window vs. fall through to the
 // OS-wait path. Consumed by benchmarks/go/main.go to report spin efficiency
-// when tuning the adaptive constants above. Two relaxed atomic adds on the
-// post-wait path; not on the spin inner loop itself.
+// when tuning the adaptive constants above.
+//
+// The counters are always declared (so the benchmark module compiles without
+// build tags), but the post-wait recordSpinSuccess/recordSleepFallback/
+// recordIters writes are no-ops unless the package is built with
+// `-tags shm_benchstats` (see spin_stats_on.go / spin_stats_off.go). The
+// production Direct-Exchange hot path therefore performs zero atomic adds on
+// these three adjacent (single-cache-line) counters; the benchmark harness
+// passes the tag to get real numbers.
 var (
 	WaitStatsSpinSuccess   uint64
 	WaitStatsSleepFallback uint64
@@ -80,10 +87,10 @@ func (w *WaitStrategy) Wait(condition func() bool, sleepAction func()) bool {
 			runtime.Gosched()
 		}
 	}
-	atomic.AddUint64(&WaitStatsIterCount, uint64(iters))
+	recordIters(uint64(iters))
 
 	if ready {
-		atomic.AddUint64(&WaitStatsSpinSuccess, 1)
+		recordSpinSuccess()
 		if limit < int(waitStrategyMaxSpin) {
 			newLimit := limit + int(waitStrategyIncStep)
 			if newLimit > int(waitStrategyMaxSpin) {
@@ -92,7 +99,7 @@ func (w *WaitStrategy) Wait(condition func() bool, sleepAction func()) bool {
 			atomic.StoreInt32(&w.CurrentLimit, int32(newLimit))
 		}
 	} else {
-		atomic.AddUint64(&WaitStatsSleepFallback, 1)
+		recordSleepFallback()
 		if limit > int(waitStrategyMinSpin) {
 			newLimit := limit - int(waitStrategyDecStep)
 			if newLimit < int(waitStrategyMinSpin) {
@@ -143,10 +150,10 @@ func (w *WaitStrategy) WaitState(addr *uint32, want uint32, sleepAction func()) 
 			runtime.Gosched()
 		}
 	}
-	atomic.AddUint64(&WaitStatsIterCount, uint64(totalIters))
+	recordIters(uint64(totalIters))
 
 	if ready {
-		atomic.AddUint64(&WaitStatsSpinSuccess, 1)
+		recordSpinSuccess()
 		if int32(limit) < waitStrategyMaxSpin {
 			newLimit := int32(limit) + waitStrategyIncStep
 			if newLimit > waitStrategyMaxSpin {
@@ -157,7 +164,7 @@ func (w *WaitStrategy) WaitState(addr *uint32, want uint32, sleepAction func()) 
 		return true
 	}
 
-	atomic.AddUint64(&WaitStatsSleepFallback, 1)
+	recordSleepFallback()
 	if int32(limit) > waitStrategyMinSpin {
 		newLimit := int32(limit) - waitStrategyDecStep
 		if newLimit < waitStrategyMinSpin {

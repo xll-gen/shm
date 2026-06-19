@@ -146,7 +146,7 @@ function Invoke-Build {
     Write-Host "[Build] Go guest..." -ForegroundColor Cyan
     Push-Location (Join-Path $RepoRoot 'benchmarks/go')
     try {
-        & go build -o server.exe main.go
+        & go build -tags shm_benchstats -o server.exe main.go
         if ($LASTEXITCODE -ne 0) { throw "go build failed (exit $LASTEXITCODE)" }
     } finally {
         Pop-Location

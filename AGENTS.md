@@ -98,6 +98,7 @@ The Shared Memory layout is the contract between C++ (Host) and Go (Guest).
 2.  **C++ Headers**: `include/shm/IPCUtils.h` (Structs like `ExchangeHeader`, `SlotHeader`).
 3.  **Go Types**: `go/direct.go` (Structs like `ExchangeHeader`, `SlotHeader`).
 **Constraint**: These must be byte-compatible. Check alignment and padding carefully.
+**Per-field offset guards (R25)**: Beyond the total-size `static_assert`s, every named field of `SlotHeader`/`ExchangeHeader` now has a compile-time offset guard on **both** sides — C++ `static_assert(offsetof(...) == N)` (needs `<cstddef>`) in `IPCUtils.h`, and Go dual `unsafe.Offsetof` zero-array guards in `direct.go`. The Go guard is bidirectional (`[N - off]byte` *and* `[off - N]byte`) so moving a field either direction fails the build. A field reorder that preserves total size (e.g. swapping two same-width fields) slips past a size-only assert but is caught here. **When you add/move/resize a field, update the per-field offset asserts on both sides in the same commit** — they are the SSOT enforcement, with `SPECIFICATION.md §2.1/§2.2.1` carrying the human-readable offset columns.
 
 ### **Platform Primitives**
 Synchronization primitives must behave identically across languages and OSs.
@@ -153,6 +154,11 @@ The shm-protocol-guardian audit findings of 2026-05-16 have been addressed:
 * `SLOT_DONE = 3` annotated as reserved-for-future-extensions in C++, Go, and SPECIFICATION.md §3.1.
 * CHANGELOG.md v0.6.0 entry augmented.
 * ChunkHeader C++ side padded to 24 bytes — cross-language parity restored. static_assert added. SPECIFICATION.md §3.3.2 was already canonical.
+
+### **Completed (post-v0.7.7)**
+
+* **R25 (2026-06-18):** Per-field offset guards added for `SlotHeader`/`ExchangeHeader` on both C++ (`offsetof` `static_assert`) and Go (`unsafe.Offsetof` dual zero-array) sides — see the Protocol & Memory Layout constraint above. Catches a size-preserving field reorder that the existing size-only asserts miss.
+* **spin.go benchstats gate (2026-06-19):** The `WaitStatsSpinSuccess`/`SleepFallback`/`IterCount` counters were `atomic.Add`-ed on every `Wait`/`WaitState` in the production hot path. The writes now route through `recordSpinSuccess`/`recordSleepFallback`/`recordIters`, which are no-ops unless built with `-tags shm_benchstats` (`spin_stats_on.go` / `spin_stats_off.go`); the counters stay declared so the benchmark module always compiles. The 5 benchmark build scripts (`run.ps1`/`run.sh`/`run_profile.sh`/`run_stream.sh`/`harness.ps1`) now pass the tag to keep reporting real numbers. Production build performs zero atomic adds on those three counters.
 
 ## **CLAUDE.md / Agent Tool Compatibility**
 
