@@ -150,6 +150,30 @@ The `reqSize` and `respSize` fields indicate the location of the data within the
 - **Positive (> 0):** Data starts at the beginning of the buffer (Offset 0).
 - **Negative (< 0):** Data is aligned to the **end** of the buffer. The actual size is `abs(size)`. The start offset is `BufferSize - abs(size)`. This is typically used for FlatBuffers construction.
 
+#### 3.3.4. Reassembly Limits & Completion Contract
+
+A reassembler accepts `StreamHeader`/`ChunkHeader` messages from an untrusted peer. The wire layout (§3.3.1/§3.3.2) is the only thing the peer controls, so corrupt or malicious values MUST NOT drive unbounded allocation, silent truncation, or mis-delivery. Both the C++ Host (`StreamReassembler`) and the Go Guest (`NewStreamReassembler`) implement the **identical** contract below; a stream accepted by one peer is accepted by the other, and a stream rejected by one is rejected by the other.
+
+**Bounds (checked at `STREAM_START`, before any allocation).** A `StreamHeader` violating any bound MUST be rejected with `MSG_TYPE_SYSTEM_ERROR`:
+
+| Bound | Value | Field guarded |
+| :--- | :--- | :--- |
+| `maxStreamSize` | `1 << 30` (1 GiB) | `totalSize` |
+| `maxStreamChunks` | `1 << 20` | `totalChunks` |
+| `maxConcurrentStreams` | `1024` | number of in-flight (partially reassembled) streams |
+
+`totalChunks` MUST be validated **before** sizing the per-chunk slice/vector so an oversized header cannot trigger a giant allocation.
+
+**Completion contract.** A stream completes — and the `onStream` callback fires exactly once — only when **both**:
+1. `received == totalChunks` (every chunk index filled exactly once), and
+2. `Σ payloadSize == totalSize` (the assembled byte count equals the advertised total).
+
+If all chunks have arrived but `Σ payloadSize != totalSize`, the stream is **dropped** with `MSG_TYPE_SYSTEM_ERROR` rather than delivered truncated or garbled. As a per-chunk overflow guard, if the running assembled length would exceed `totalSize`, the stream is likewise rejected with `MSG_TYPE_SYSTEM_ERROR`.
+
+**Empty stream.** `totalChunks == 0` ⇔ `totalSize == 0`. A `STREAM_START` with `totalChunks == 0` and `totalSize != 0` (or vice versa) MUST be rejected with `MSG_TYPE_SYSTEM_ERROR`. A valid empty stream completes immediately at `STREAM_START` (callback fires once with empty data); no chunks follow.
+
+**Concurrent-stream bound (reclaim mechanism is implementation-defined).** Both peers MUST bound the number of simultaneously in-flight streams to `maxConcurrentStreams`, so a peer that opens streams but never finishes them cannot grow memory without limit. The mechanism used to reclaim capacity when the bound is reached is **implementation-defined and not part of the wire contract**: the Go Guest evicts the least-recently-active in-flight stream (count + LRU); the C++ Host prunes streams idle past a timeout (count + time-prune). Either reclaim strategy satisfies the contract. A chunk that arrives for a stream whose context was reclaimed is rejected with `MSG_TYPE_SYSTEM_ERROR`.
+
 ### 3.4. Host-to-Guest Flow
 
 1.  **Claim:** Host finds a slot in state `SLOT_FREE` and atomically sets it to `SLOT_BUSY`.

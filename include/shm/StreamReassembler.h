@@ -15,8 +15,13 @@ namespace shm {
  * @brief Configuration limits for StreamReassembler.
  */
 struct StreamReassemblerConfig {
-    size_t maxStreamSize = 128 * 1024 * 1024; // 128MB
-    size_t maxStreams = 100;
+    // Reassembly bounds. These defaults match the Go reference reassembler
+    // (go/stream.go: MaxStreamSize / MaxStreamChunks / MaxConcurrentStreams)
+    // and the SPECIFICATION.md §3.3.4 Reassembly Limits & Completion Contract.
+    // A stream accepted by one peer must be accepted by the other.
+    size_t maxStreamSize = 1 << 30;   // 1 GiB (bounds StreamHeader::totalSize)
+    size_t maxStreamChunks = 1 << 20; // bounds StreamHeader::totalChunks
+    size_t maxStreams = 1024;         // max concurrent in-flight streams
     uint32_t streamTimeoutMs = 10000;
 };
 
@@ -40,6 +45,13 @@ private:
         uint32_t totalChunks;
         uint32_t receivedChunks;
         std::vector<std::vector<uint8_t>> chunks;
+        // Per-index presence flag. Mirrors Go's nil-vs-non-nil sentinel
+        // (go/stream.go: chunks[i]==nil means "not yet received"): an empty
+        // chunk vector is ambiguous because a legitimately zero-length payload
+        // is also empty. Tracking presence explicitly keeps the dedup /
+        // receivedChunks accounting identical to the Go reference, so the same
+        // stream is accepted by both peers (SPEC §3.3.4).
+        std::vector<bool> seen;
         std::chrono::steady_clock::time_point startTime;
     };
 
@@ -90,15 +102,26 @@ public:
 
             const StreamHeader* header = static_cast<const StreamHeader*>(req);
 
-            // Checks
-            if (header->totalSize > config.maxStreamSize) {
+            // Bound checks (SPECIFICATION.md §3.3.4). A corrupt or malicious
+            // header must not drive a huge allocation. totalChunks is checked
+            // before the vector resize below so an oversized header cannot
+            // trigger a giant allocation.
+            if (header->totalSize > config.maxStreamSize ||
+                header->totalChunks > config.maxStreamChunks) {
                  msgType = MsgType::SYSTEM_ERROR;
                  respSize = 0;
                  return true;
             }
 
-            // Empty Stream or Zero Chunks
-            if (header->totalSize == 0 || header->totalChunks == 0) {
+            // Empty stream: totalChunks == 0 ⇔ totalSize == 0. A mismatch
+            // (zero chunks but nonzero size, or vice versa) is a protocol
+            // error and must be rejected, not delivered as empty.
+            if (header->totalChunks == 0) {
+                 if (header->totalSize != 0) {
+                     msgType = MsgType::SYSTEM_ERROR;
+                     respSize = 0;
+                     return true;
+                 }
                  std::vector<uint8_t> empty;
                  onStream(header->streamId, empty);
                  msgType = MsgType::NORMAL;
@@ -124,6 +147,7 @@ public:
 
             try {
                 ctx.chunks.resize(ctx.totalChunks);
+                ctx.seen.resize(ctx.totalChunks, false);
             } catch (...) {
                 msgType = MsgType::SYSTEM_ERROR; // OOM
                 respSize = 0;
@@ -167,8 +191,10 @@ public:
                  return true;
             }
 
-            // Idempotency: If already received, ignore
-            if (!ctx.chunks[header->chunkIndex].empty()) {
+            // Idempotency: if this index was already received, ignore. Use the
+            // explicit presence flag (not vector emptiness) so a zero-length
+            // payload is still counted exactly once — matching go/stream.go.
+            if (ctx.seen[header->chunkIndex]) {
                 msgType = MsgType::NORMAL;
                 respSize = 0;
                 return true;
@@ -183,14 +209,26 @@ public:
                  return true;
             }
 
+            ctx.seen[header->chunkIndex] = true;
             ctx.receivedChunks++;
 
             if (ctx.receivedChunks == ctx.totalChunks) {
-                // Assemble
+                // Assemble with strict completion validation (SPEC §3.3.4):
+                // the assembled byte count must equal the advertised totalSize.
+                // (a) A per-chunk overflow guard rejects a running length that
+                // would exceed totalSize. (b) After all chunks, the total must
+                // equal totalSize exactly, else the stream is dropped rather
+                // than delivered truncated/garbled.
                 std::vector<uint8_t> fullData;
                 try {
                     fullData.reserve(ctx.totalSize);
                     for (const auto& chunk : ctx.chunks) {
+                        if (fullData.size() + chunk.size() > ctx.totalSize) {
+                            streams.erase(it);
+                            msgType = MsgType::SYSTEM_ERROR;
+                            respSize = 0;
+                            return true;
+                        }
                         fullData.insert(fullData.end(), chunk.begin(), chunk.end());
                     }
                 } catch(...) {
@@ -198,6 +236,13 @@ public:
                      msgType = MsgType::SYSTEM_ERROR;
                      respSize = 0;
                      return true;
+                }
+
+                if (fullData.size() != ctx.totalSize) {
+                    streams.erase(it);
+                    msgType = MsgType::SYSTEM_ERROR;
+                    respSize = 0;
+                    return true;
                 }
 
                 streams.erase(it);
