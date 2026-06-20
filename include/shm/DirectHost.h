@@ -122,23 +122,26 @@ class DirectHost {
     std::shared_ptr<SharedState> sharedState;
 
     /**
-     * @brief Internal helper to wait for a response on a specific slot.
-     * Contains the adaptive spin/yield/wait logic.
+     * @brief Shared adaptive wait for SLOT_RESP_READY on an already-armed slot.
+     *
+     * Both the synchronous send path (WaitResponse) and the async completion
+     * path (WaitForSlot) need the identical spin/yield/event-wait loop, with its
+     * 0xFFFFFFFF infinite-timeout handling and 100ms wait chunks. They used to
+     * open-code byte-identical copies whose infinite-timeout branches could
+     * silently drift apart — the classic "one path hangs forever" hazard. This
+     * is now the single definition (R44).
+     *
+     * Precondition: the caller has already published the request
+     * (state==SLOT_REQ_READY) and signaled the guest, and has set
+     * hostState=ACTIVE + activeWait=true. This performs ONLY the wait — it does
+     * NOT publish the request, signal the guest, or clear activeWait; the caller
+     * owns those (the two paths arm the slot differently).
+     *
      * @param slot Pointer to the slot to wait on.
-     * @param timeoutMs Timeout in milliseconds.
-     * @return true if response is ready, false if error/timeout.
+     * @param timeoutMs Timeout in milliseconds (0xFFFFFFFF = infinite).
+     * @return true if response is ready, false on timeout.
      */
-    bool WaitResponse(Slot* slot, uint32_t timeoutMs) {
-        slot->activeWait.store(true, std::memory_order_relaxed);
-
-        slot->header->hostState.store(HOST_STATE_ACTIVE, std::memory_order_relaxed);
-
-        slot->header->state.store(SLOT_REQ_READY, std::memory_order_seq_cst);
-
-        if (slot->header->guestState.load(std::memory_order_seq_cst) == GUEST_STATE_WAITING) {
-            Platform::SignalEvent(slot->hReqEvent);
-        }
-
+    bool WaitForRespReady(Slot* slot, uint32_t timeoutMs) {
         auto checkReady = [&]() -> bool {
             return slot->header->state.load(std::memory_order_acquire) == SLOT_RESP_READY;
         };
@@ -157,7 +160,7 @@ class DirectHost {
                 auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
 
                 if (timeoutMs != 0xFFFFFFFF && elapsed >= timeoutMs) {
-                    SHM_LOG_DEBUG("WaitResponse timeout after ", elapsed, "ms");
+                    SHM_LOG_DEBUG("WaitForRespReady timeout after ", elapsed, "ms");
                     break; // Timeout, return and let caller fail
                 }
 
@@ -170,7 +173,29 @@ class DirectHost {
             slot->header->hostState.store(HOST_STATE_ACTIVE, std::memory_order_relaxed);
         };
 
-        bool ready = slot->waitStrategy.Wait(checkReady, sleepAction);
+        return slot->waitStrategy.Wait(checkReady, sleepAction);
+    }
+
+    /**
+     * @brief Internal helper to wait for a response on a specific slot.
+     * Publishes the request + signals the guest, then runs the shared wait
+     * (see WaitForRespReady).
+     * @param slot Pointer to the slot to wait on.
+     * @param timeoutMs Timeout in milliseconds.
+     * @return true if response is ready, false if error/timeout.
+     */
+    bool WaitResponse(Slot* slot, uint32_t timeoutMs) {
+        slot->activeWait.store(true, std::memory_order_relaxed);
+
+        slot->header->hostState.store(HOST_STATE_ACTIVE, std::memory_order_relaxed);
+
+        slot->header->state.store(SLOT_REQ_READY, std::memory_order_seq_cst);
+
+        if (slot->header->guestState.load(std::memory_order_seq_cst) == GUEST_STATE_WAITING) {
+            Platform::SignalEvent(slot->hReqEvent);
+        }
+
+        bool ready = WaitForRespReady(slot, timeoutMs);
 
         slot->activeWait.store(false, std::memory_order_release);
         return ready;
@@ -924,42 +949,15 @@ public:
         if (slotIdx < 0 || slotIdx >= (int32_t)numSlots) return Result<int>(Error::InvalidArgs);
         Slot* slot = &slots[slotIdx];
 
-        auto checkReady = [&]() -> bool {
-            return slot->header->state.load(std::memory_order_acquire) == SLOT_RESP_READY;
-        };
-
         uint32_t t = (timeoutMs == USE_DEFAULT_TIMEOUT) ? responseTimeoutMs : timeoutMs;
 
-        // Ensure activeWait is true (it should be from SendAcquiredAsync)
+        // The request was already published (SLOT_REQ_READY) and the guest
+        // signaled by SendAcquiredAsync; re-affirm the host-side wait flags and
+        // run the shared adaptive wait. Do NOT re-publish SLOT_REQ_READY here.
         slot->activeWait.store(true, std::memory_order_relaxed);
         slot->header->hostState.store(HOST_STATE_ACTIVE, std::memory_order_relaxed);
 
-        auto sleepAction = [&]() {
-            slot->header->hostState.store(HOST_STATE_WAITING, std::memory_order_seq_cst);
-            if (checkReady()) {
-                slot->header->hostState.store(HOST_STATE_ACTIVE, std::memory_order_relaxed);
-                return;
-            }
-
-            auto start = std::chrono::steady_clock::now();
-            while (!checkReady()) {
-                auto now = std::chrono::steady_clock::now();
-                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
-
-                if (t != 0xFFFFFFFF && elapsed >= t) {
-                    break;
-                }
-
-                uint32_t remaining = (t == 0xFFFFFFFF) ? 0xFFFFFFFF : (t - (uint32_t)elapsed);
-                uint32_t waitTime = (remaining > 100) ? 100 : remaining;
-                if (t == 0xFFFFFFFF) waitTime = 100;
-
-                Platform::WaitEvent(slot->hRespEvent, waitTime);
-            }
-            slot->header->hostState.store(HOST_STATE_ACTIVE, std::memory_order_relaxed);
-        };
-
-        bool ready = slot->waitStrategy.Wait(checkReady, sleepAction);
+        bool ready = WaitForRespReady(slot, t);
 
         slot->activeWait.store(false, std::memory_order_release);
 
