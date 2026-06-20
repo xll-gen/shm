@@ -15,6 +15,8 @@
 #include "WaitStrategy.h"
 #include "Result.h"
 #include "Logger.h"
+#include "SlotAllocator.h"
+#include "GuestCallWorker.h"
 
 namespace shm {
 
@@ -49,6 +51,13 @@ struct HostConfig {
  * to be paired with a specific Guest worker thread.
  * It uses a hybrid spin/wait strategy for low latency and utilizes
  * specific memory layout defined in IPCUtils.h.
+ *
+ * R44 refactor: the slot state machine has been extracted into SlotAllocator
+ * and the guest-call processing into GuestCallWorker. DirectHost is now a thin
+ * façade that owns shared-memory mapping, geometry, and lifetime, and delegates
+ * the send/acquire/wait API to its SlotAllocator member and the guest-call API
+ * to its GuestCallWorker member. The public API is byte-identical to the
+ * pre-split class — behavior, memory orders, and ABI are unchanged.
  */
 class DirectHost {
     void* shmBase;
@@ -59,147 +68,20 @@ class DirectHost {
     ShmHandle hMapFile;
     ShmHandle hLockFile;
     bool running;
-    uint32_t responseTimeoutMs;
-
-    /**
-     * @brief Stride for Message Sequence generation.
-     * Used to ensure global uniqueness of msgSeq without atomic contention.
-     * msgSeq = (previous_seq) + msgSeqStride.
-     */
-    uint32_t msgSeqStride;
-
-    /**
-     * @brief Internal representation of a Slot.
-     */
-    struct Slot {
-        SlotHeader* header;
-        uint8_t* reqBuffer;
-        uint8_t* respBuffer;
-        EventHandle hReqEvent;  // Signaled by Host (Wake Guest)
-        EventHandle hRespEvent; // Signaled by Guest (Wake Host)
-        uint32_t maxReqSize;
-        uint32_t maxRespSize;
-        WaitStrategy waitStrategy;
-        uint32_t msgSeq;
-        std::atomic<bool> activeWait;
-
-        Slot() : header(nullptr), reqBuffer(nullptr), respBuffer(nullptr),
-                 hReqEvent(nullptr), hRespEvent(nullptr),
-                 maxReqSize(0), maxRespSize(0), msgSeq(0), activeWait(false) {}
-
-        Slot(Slot&& other) noexcept : waitStrategy(other.waitStrategy) {
-            header = other.header;
-            reqBuffer = other.reqBuffer;
-            respBuffer = other.respBuffer;
-            hReqEvent = other.hReqEvent;
-            hRespEvent = other.hRespEvent;
-            maxReqSize = other.maxReqSize;
-            maxRespSize = other.maxRespSize;
-            msgSeq = other.msgSeq;
-            activeWait.store(other.activeWait.load());
-
-            other.header = nullptr;
-            other.hReqEvent = nullptr;
-            other.hRespEvent = nullptr;
-        }
-    };
-
-    std::vector<Slot> slots;
-    std::atomic<uint32_t> nextSlot{0}; // Round-robin hint
 
     // Config
     uint32_t slotSize; // Total payload size per slot
 
-    // v0.7.2: auto-reclaim threshold. When AcquireSlot's slow path
-    // completes a configurable number of full sweeps without finding a
-    // free slot, it attempts TryReclaimAbandonedSlot on each non-FREE
-    // slot with this threshold. Zero (default) disables auto-reclaim —
-    // callers who want it must SetAutoReclaimTimeoutNs(N).
-    std::atomic<uint64_t> autoReclaimTimeoutNs{0};
+    // Slot state machine (acquire / reclaim / wait / acquired-send paths).
+    // Owns slots, nextSlot, msgSeqStride, responseTimeoutMs, autoReclaimTimeoutNs.
+    SlotAllocator allocator_;
+
+    // Guest-call processing (worker thread + ProcessGuestCalls).
+    GuestCallWorker worker_;
 
     // Shared state to track DirectHost lifetime for ZeroCopySlots
     struct SharedState {};
     std::shared_ptr<SharedState> sharedState;
-
-    /**
-     * @brief Shared adaptive wait for SLOT_RESP_READY on an already-armed slot.
-     *
-     * Both the synchronous send path (WaitResponse) and the async completion
-     * path (WaitForSlot) need the identical spin/yield/event-wait loop, with its
-     * 0xFFFFFFFF infinite-timeout handling and 100ms wait chunks. They used to
-     * open-code byte-identical copies whose infinite-timeout branches could
-     * silently drift apart — the classic "one path hangs forever" hazard. This
-     * is now the single definition (R44).
-     *
-     * Precondition: the caller has already published the request
-     * (state==SLOT_REQ_READY) and signaled the guest, and has set
-     * hostState=ACTIVE + activeWait=true. This performs ONLY the wait — it does
-     * NOT publish the request, signal the guest, or clear activeWait; the caller
-     * owns those (the two paths arm the slot differently).
-     *
-     * @param slot Pointer to the slot to wait on.
-     * @param timeoutMs Timeout in milliseconds (0xFFFFFFFF = infinite).
-     * @return true if response is ready, false on timeout.
-     */
-    bool WaitForRespReady(Slot* slot, uint32_t timeoutMs) {
-        auto checkReady = [&]() -> bool {
-            return slot->header->state.load(std::memory_order_acquire) == SLOT_RESP_READY;
-        };
-
-        auto sleepAction = [&]() {
-            slot->header->hostState.store(HOST_STATE_WAITING, std::memory_order_seq_cst);
-
-            if (checkReady()) {
-                slot->header->hostState.store(HOST_STATE_ACTIVE, std::memory_order_relaxed);
-                return;
-            }
-
-            auto start = std::chrono::steady_clock::now();
-            while (!checkReady()) {
-                auto now = std::chrono::steady_clock::now();
-                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
-
-                if (timeoutMs != 0xFFFFFFFF && elapsed >= timeoutMs) {
-                    SHM_LOG_DEBUG("WaitForRespReady timeout after ", elapsed, "ms");
-                    break; // Timeout, return and let caller fail
-                }
-
-                uint32_t remaining = (timeoutMs == 0xFFFFFFFF) ? 0xFFFFFFFF : (timeoutMs - (uint32_t)elapsed);
-                uint32_t waitTime = (remaining > 100) ? 100 : remaining;
-                if (timeoutMs == 0xFFFFFFFF) waitTime = 100; // Cap infinite wait chunks
-
-                Platform::WaitEvent(slot->hRespEvent, waitTime);
-            }
-            slot->header->hostState.store(HOST_STATE_ACTIVE, std::memory_order_relaxed);
-        };
-
-        return slot->waitStrategy.Wait(checkReady, sleepAction);
-    }
-
-    /**
-     * @brief Internal helper to wait for a response on a specific slot.
-     * Publishes the request + signals the guest, then runs the shared wait
-     * (see WaitForRespReady).
-     * @param slot Pointer to the slot to wait on.
-     * @param timeoutMs Timeout in milliseconds.
-     * @return true if response is ready, false if error/timeout.
-     */
-    bool WaitResponse(Slot* slot, uint32_t timeoutMs) {
-        slot->activeWait.store(true, std::memory_order_relaxed);
-
-        slot->header->hostState.store(HOST_STATE_ACTIVE, std::memory_order_relaxed);
-
-        slot->header->state.store(SLOT_REQ_READY, std::memory_order_seq_cst);
-
-        if (slot->header->guestState.load(std::memory_order_seq_cst) == GUEST_STATE_WAITING) {
-            Platform::SignalEvent(slot->hReqEvent);
-        }
-
-        bool ready = WaitForRespReady(slot, timeoutMs);
-
-        slot->activeWait.store(false, std::memory_order_release);
-        return ready;
-    }
 
 public:
     /** @brief Helper class for managing a Zero-Copy slot. */
@@ -220,7 +102,7 @@ public:
         ~ZeroCopySlot() {
             if (auto lock = weakState.lock()) {
                 if (host && slotIdx >= 0) {
-                    host->slots[slotIdx].header->state.store(SLOT_FREE, std::memory_order_release);
+                    host->allocator_.slots[slotIdx].header->state.store(SLOT_FREE, std::memory_order_release);
                 }
             }
         }
@@ -234,7 +116,7 @@ public:
              if (this != &other) {
                  if (auto lock = weakState.lock()) {
                      if (host && slotIdx >= 0) {
-                         host->slots[slotIdx].header->state.store(SLOT_FREE, std::memory_order_release);
+                         host->allocator_.slots[slotIdx].header->state.store(SLOT_FREE, std::memory_order_release);
                      }
                  }
                  host = other.host;
@@ -257,13 +139,13 @@ public:
         /** @brief Gets the pointer to the Request Buffer. */
         uint8_t* GetReqBuffer() {
             if (!IsValid()) return nullptr;
-            return host->slots[slotIdx].reqBuffer;
+            return host->allocator_.slots[slotIdx].reqBuffer;
         }
 
         /** @brief Gets the maximum size of the Request Buffer. */
         int32_t GetMaxReqSize() {
              if (!IsValid()) return 0;
-             return host->slots[slotIdx].maxReqSize;
+             return host->allocator_.slots[slotIdx].maxReqSize;
         }
 
         /**
@@ -273,7 +155,7 @@ public:
         Result<void> Send(int32_t size, MsgType msgType, uint32_t timeoutMs = USE_DEFAULT_TIMEOUT) {
             if (!IsValid()) return Result<void>::Failure(Error::InvalidArgs);
 
-            Slot* slot = &host->slots[slotIdx];
+            Slot* slot = &host->allocator_.slots[slotIdx];
 
             uint32_t absSize = (size < 0) ? (0u - (uint32_t)size) : (uint32_t)size;
             if (absSize > slot->maxReqSize) {
@@ -284,10 +166,10 @@ public:
             slot->header->msgType = msgType;
             uint32_t currentSeq = slot->msgSeq;
             slot->header->msgSeq = currentSeq;
-            slot->msgSeq += host->msgSeqStride;
+            slot->msgSeq += host->allocator_.msgSeqStride;
 
-            uint32_t t = (timeoutMs == USE_DEFAULT_TIMEOUT) ? host->responseTimeoutMs : timeoutMs;
-            if (!host->WaitResponse(slot, t)) {
+            uint32_t t = (timeoutMs == USE_DEFAULT_TIMEOUT) ? host->allocator_.responseTimeoutMs : timeoutMs;
+            if (!host->allocator_.WaitResponse(slot, t)) {
                 slotIdx = -1;
                 return Result<void>::Failure(Error::Timeout);
             }
@@ -303,7 +185,7 @@ public:
             }
 
             if (slot->header->msgType == MsgType::SYSTEM_ERROR) {
-                 host->slots[slotIdx].header->state.store(SLOT_FREE, std::memory_order_release);
+                 host->allocator_.slots[slotIdx].header->state.store(SLOT_FREE, std::memory_order_release);
                  slotIdx = -1;
                  return Result<void>::Failure(Error::InternalError);
             }
@@ -318,7 +200,7 @@ public:
         Result<void> SendFlatBuffer(int32_t size, uint32_t timeoutMs = USE_DEFAULT_TIMEOUT) {
             if (!IsValid()) return Result<void>::Failure(Error::InvalidArgs);
 
-            Slot* slot = &host->slots[slotIdx];
+            Slot* slot = &host->allocator_.slots[slotIdx];
 
             int32_t absSize = size;
             if ((uint32_t)absSize > slot->maxReqSize) {
@@ -329,10 +211,10 @@ public:
             slot->header->msgType = MsgType::FLATBUFFER;
             uint32_t currentSeq = slot->msgSeq;
             slot->header->msgSeq = currentSeq;
-            slot->msgSeq += host->msgSeqStride;
+            slot->msgSeq += host->allocator_.msgSeqStride;
 
-            uint32_t t = (timeoutMs == USE_DEFAULT_TIMEOUT) ? host->responseTimeoutMs : timeoutMs;
-            if (!host->WaitResponse(slot, t)) {
+            uint32_t t = (timeoutMs == USE_DEFAULT_TIMEOUT) ? host->allocator_.responseTimeoutMs : timeoutMs;
+            if (!host->allocator_.WaitResponse(slot, t)) {
                 slotIdx = -1;
                 return Result<void>::Failure(Error::Timeout);
             }
@@ -347,7 +229,7 @@ public:
             }
 
             if (slot->header->msgType == MsgType::SYSTEM_ERROR) {
-                 host->slots[slotIdx].header->state.store(SLOT_FREE, std::memory_order_release);
+                 host->allocator_.slots[slotIdx].header->state.store(SLOT_FREE, std::memory_order_release);
                  slotIdx = -1;
                  return Result<void>::Failure(Error::InternalError);
             }
@@ -358,7 +240,7 @@ public:
         /** @brief Gets the pointer to the Response Buffer. */
         uint8_t* GetRespBuffer() {
              if (!IsValid()) return nullptr;
-             Slot* slot = &host->slots[slotIdx];
+             Slot* slot = &host->allocator_.slots[slotIdx];
              int32_t rSize = slot->header->respSize;
 
              if (rSize >= 0) return slot->respBuffer;
@@ -373,7 +255,7 @@ public:
         /** @brief Gets the size of the Response data. */
         int32_t GetRespSize() {
              if (!IsValid()) return 0;
-             Slot* slot = &host->slots[slotIdx];
+             Slot* slot = &host->allocator_.slots[slotIdx];
              int32_t rSize = slot->header->respSize;
 
              uint32_t absResp = (rSize < 0) ? (0u - (uint32_t)rSize) : (uint32_t)rSize;
@@ -386,7 +268,12 @@ public:
     /**
      * @brief Default constructor.
      */
-        DirectHost() : shmBase(nullptr), hMapFile(0), hLockFile(0), running(false), msgSeqStride(0), responseTimeoutMs(10000) {
+        DirectHost() : shmBase(nullptr), hMapFile(0), hLockFile(0), running(false) {
+            // SlotAllocator defaults: msgSeqStride=0, responseTimeoutMs=10000
+            // (matching the pre-split DirectHost member initializers).
+            allocator_.running = &running;
+            worker_.alloc = &allocator_;
+            worker_.running = &running;
             sharedState = std::make_shared<SharedState>();
         }
 
@@ -395,12 +282,24 @@ public:
      */
     ~DirectHost() { Shutdown(); }
 
+    // Non-copyable and non-movable. allocator_/worker_ hold raw back-pointers
+    // into this object (allocator_.running=&running, worker_.alloc=&allocator_,
+    // worker_.running=&running), wired once in the ctor; a copy or move would
+    // leave them dangling into the moved-from object in the hottest IPC path.
+    // The std::thread/std::atomic members already delete the implicit copy/move,
+    // so this is enforced today — make it explicit so a future change to
+    // SlotAllocator/GuestCallWorker movability can never silently restore it.
+    DirectHost(const DirectHost&) = delete;
+    DirectHost& operator=(const DirectHost&) = delete;
+    DirectHost(DirectHost&&) = delete;
+    DirectHost& operator=(DirectHost&&) = delete;
+
     /**
      * @brief Sets the timeout for waiting for a response.
      * @param ms Timeout in milliseconds. Default 10000.
      */
     void SetTimeout(uint32_t ms) {
-        responseTimeoutMs = ms;
+        allocator_.responseTimeoutMs = ms;
     }
 
     /**
@@ -426,8 +325,10 @@ public:
         this->numSlots = config.numHostSlots;
         this->numGuestSlots = config.numGuestSlots;
         this->slotSize = config.payloadSize;
+        allocator_.numSlots = numSlots;
+        allocator_.numGuestSlots = numGuestSlots;
 
-        this->msgSeqStride = numSlots + numGuestSlots;
+        allocator_.msgSeqStride = numSlots + numGuestSlots;
 
         uint32_t halfSize = slotSize / 2;
         halfSize = (halfSize / 64) * 64;
@@ -472,19 +373,19 @@ public:
         exHeader->reqOffset = reqOffset;
         exHeader->respOffset = respOffset;
 
-        slots.resize(totalSlots);
+        allocator_.slots.resize(totalSlots);
         uint8_t* ptr = (uint8_t*)shmBase + exchangeHeaderSize;
 
         for (uint32_t i = 0; i < totalSlots; ++i) {
-            slots[i].header = (SlotHeader*)ptr;
+            allocator_.slots[i].header = (SlotHeader*)ptr;
             uint8_t* dataBase = ptr + slotHeaderSize;
-            slots[i].reqBuffer = dataBase + reqOffset;
-            slots[i].respBuffer = dataBase + respOffset;
-            slots[i].maxReqSize = halfSize;
-            slots[i].maxRespSize = slotSize - respOffset;
+            allocator_.slots[i].reqBuffer = dataBase + reqOffset;
+            allocator_.slots[i].respBuffer = dataBase + respOffset;
+            allocator_.slots[i].maxReqSize = halfSize;
+            allocator_.slots[i].maxRespSize = slotSize - respOffset;
             // waitStrategy initialized by default constructor
 
-            slots[i].msgSeq = i + 1;
+            allocator_.slots[i].msgSeq = i + 1;
 
             std::string reqName;
             if (i < numSlots) {
@@ -494,19 +395,19 @@ public:
             }
             std::string respName = shmName + "_slot_" + std::to_string(i) + "_resp";
 
-            slots[i].hReqEvent = Platform::CreateNamedEvent(reqName.c_str());
-            slots[i].hRespEvent = Platform::CreateNamedEvent(respName.c_str());
+            allocator_.slots[i].hReqEvent = Platform::CreateNamedEvent(reqName.c_str());
+            allocator_.slots[i].hRespEvent = Platform::CreateNamedEvent(respName.c_str());
 
-            if (!slots[i].hReqEvent || !slots[i].hRespEvent) {
+            if (!allocator_.slots[i].hReqEvent || !allocator_.slots[i].hRespEvent) {
                 SHM_LOG_ERROR("Failed to create events for slot ", i);
                 running = true; // Enable Shutdown
                 Shutdown();
                 return Result<void>::Failure(Error::InternalError);
             }
 
-            slots[i].header->state.store(SLOT_FREE, std::memory_order_relaxed);
-            slots[i].header->hostState.store(HOST_STATE_ACTIVE, std::memory_order_relaxed);
-            slots[i].header->guestState.store(GUEST_STATE_ACTIVE, std::memory_order_relaxed);
+            allocator_.slots[i].header->state.store(SLOT_FREE, std::memory_order_relaxed);
+            allocator_.slots[i].header->hostState.store(HOST_STATE_ACTIVE, std::memory_order_relaxed);
+            allocator_.slots[i].header->guestState.store(GUEST_STATE_ACTIVE, std::memory_order_relaxed);
 
             ptr += perSlotTotal;
         }
@@ -549,9 +450,9 @@ public:
 
         Stop();
 
-        for (uint32_t i = 0; i < slots.size(); ++i) {
-             Platform::CloseEvent(slots[i].hReqEvent);
-             Platform::CloseEvent(slots[i].hRespEvent);
+        for (uint32_t i = 0; i < allocator_.slots.size(); ++i) {
+             Platform::CloseEvent(allocator_.slots[i].hReqEvent);
+             Platform::CloseEvent(allocator_.slots[i].hRespEvent);
 
              std::string reqName = shmName + "_slot_" + std::to_string(i);
              std::string respName = shmName + "_slot_" + std::to_string(i) + "_resp";
@@ -572,123 +473,7 @@ public:
      * @return The index of the acquired slot, or -1 if not running.
      */
     int32_t AcquireSlot() {
-        if (!running) return -1;
-
-        static thread_local uint32_t cachedSlotIdx = 0xFFFFFFFF;
-        Slot* slot = nullptr;
-        int32_t resultIdx = -1;
-
-        if (cachedSlotIdx < numSlots) {
-            Slot& s = slots[cachedSlotIdx];
-            uint32_t current = s.header->state.load(std::memory_order_acquire);
-            bool canClaim = (current == SLOT_FREE);
-            if (!canClaim) {
-                 if (current == SLOT_RESP_READY || current == SLOT_REQ_READY || current == SLOT_GUEST_BUSY) {
-                      if (!s.activeWait.load(std::memory_order_acquire)) {
-                          canClaim = true;
-                      }
-                 }
-            }
-
-            if (canClaim) {
-                // Bump the claim generation BEFORE the claiming CAS so a
-                // concurrent reclaimer's generation handshake sees the
-                // in-flight claim (SPECIFICATION.md §3.6.1).
-                s.header->gen.fetch_add(1, std::memory_order_acq_rel);
-                if (s.header->state.compare_exchange_strong(current, SLOT_BUSY, std::memory_order_acquire)) {
-                    s.header->lease.store(Platform::MonotonicNanos(), std::memory_order_release);
-                    slot = &s;
-                    resultIdx = (int32_t)cachedSlotIdx;
-                }
-            }
-        }
-
-        if (!slot) {
-            int retries = 0;
-            uint32_t idx = nextSlot.fetch_add(1, std::memory_order_relaxed) % numSlots;
-#ifdef SHM_DEBUG
-            // Nested-IPC deadlock detector (debug only). The README's
-            // "Nested IPC & Recursion" section warns that an inner call
-            // started while all slots are held by outer calls will spin
-            // forever waiting for a slot that will never be released.
-            // We count full sweeps with zero progress; after the
-            // threshold we emit a one-shot diagnostic so the caller can
-            // see the deadlock instead of a silent hang. We do NOT
-            // abort — production code without SHM_DEBUG keeps the old
-            // spin-forever semantics, so behavior is identical when
-            // compiled out.
-            int fullSweeps = 0;
-            bool diagnosticEmitted = false;
-            constexpr int kDeadlockSweepThreshold = 10000; // ~10k full sweeps
-#endif
-
-            while (true) {
-                Slot& s = slots[idx];
-                uint32_t current = s.header->state.load(std::memory_order_acquire);
-                bool canClaim = (current == SLOT_FREE);
-                if (!canClaim) {
-                     if (current == SLOT_RESP_READY || current == SLOT_REQ_READY || current == SLOT_GUEST_BUSY) {
-                          if (!s.activeWait.load(std::memory_order_acquire)) {
-                              canClaim = true;
-                          }
-                     }
-                }
-
-                if (canClaim) {
-                    // §3.6.1: bump generation before the claiming CAS.
-                    s.header->gen.fetch_add(1, std::memory_order_acq_rel);
-                    if (s.header->state.compare_exchange_strong(current, SLOT_BUSY, std::memory_order_acquire)) {
-                        s.header->lease.store(Platform::MonotonicNanos(), std::memory_order_release);
-                        slot = &s;
-                        cachedSlotIdx = idx;
-                        resultIdx = (int32_t)idx;
-                        break;
-                    }
-                }
-                idx++;
-                if (idx >= numSlots) {
-                    idx = 0;
-#ifdef SHM_DEBUG
-                    if (++fullSweeps == kDeadlockSweepThreshold && !diagnosticEmitted) {
-                        SHM_LOG_WARN(
-                            "DirectHost::AcquireSlot: ", kDeadlockSweepThreshold,
-                            " full sweeps with no free slot — potential "
-                            "nested-IPC deadlock. Per README 'Nested IPC & "
-                            "Recursion', numHostSlots must be >= "
-                            "N_threads * (Depth + 1).");
-                        diagnosticEmitted = true;
-                    }
-#endif
-                    // v0.7.2: auto-reclaim. After a full sweep with no
-                    // free slot, scan every non-FREE slot once and try
-                    // to reclaim any whose lease is stale by
-                    // `autoReclaimTimeoutNs`. Zero (default) disables
-                    // this entirely. CAS guard inside
-                    // TryReclaimAbandonedSlot keeps the operation safe
-                    // against concurrent live heartbeats.
-                    const uint64_t reclaimThresh =
-                        autoReclaimTimeoutNs.load(std::memory_order_relaxed);
-                    if (reclaimThresh > 0) {
-                        for (uint32_t i = 0; i < numSlots; ++i) {
-                            if (TryReclaimAbandonedSlot(
-                                    static_cast<int32_t>(i), reclaimThresh)) {
-                                SHM_LOG_WARN(
-                                    "DirectHost::AcquireSlot: reclaimed "
-                                    "abandoned slot ", i,
-                                    " (lease older than ", reclaimThresh,
-                                    " ns)");
-                            }
-                        }
-                    }
-                }
-                retries++;
-                if (retries > (int)numSlots * 100) {
-                    Platform::ThreadYield();
-                    retries = 0;
-                }
-            }
-        }
-        return resultIdx;
+        return allocator_.AcquireSlot();
     }
 
     /**
@@ -709,47 +494,7 @@ public:
      * @return The slot index (same as input), or -1 if failed.
      */
     int32_t AcquireSpecificSlot(int32_t slotIdx, uint32_t timeoutMs = USE_DEFAULT_TIMEOUT) {
-        if (!running || slotIdx < 0 || slotIdx >= (int32_t)numSlots) return -1;
-        Slot* slot = &slots[slotIdx];
-
-        uint32_t effectiveTimeout = (timeoutMs == USE_DEFAULT_TIMEOUT) ? responseTimeoutMs : timeoutMs;
-        auto start = std::chrono::steady_clock::now();
-        int retries = 0;
-
-        while(true) {
-             uint32_t current = slot->header->state.load(std::memory_order_acquire);
-             bool canClaim = (current == SLOT_FREE);
-             if (!canClaim && (current == SLOT_RESP_READY || current == SLOT_REQ_READY)) {
-                  if (!slot->activeWait.load(std::memory_order_acquire)) {
-                      canClaim = true;
-                  }
-             }
-
-             if (canClaim) {
-                 // §3.6.1: bump generation before the claiming CAS.
-                 slot->header->gen.fetch_add(1, std::memory_order_acq_rel);
-                 if (slot->header->state.compare_exchange_strong(current, SLOT_BUSY, std::memory_order_acquire)) {
-                     slot->header->lease.store(Platform::MonotonicNanos(), std::memory_order_release);
-                     break;
-                 }
-             }
-
-             Platform::CpuRelax();
-             retries++;
-             if (retries > 1000) {
-                 if (effectiveTimeout != 0xFFFFFFFF) {
-                     auto now = std::chrono::steady_clock::now();
-                     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
-                     if (elapsed >= effectiveTimeout) {
-                         return -1;
-                     }
-                 }
-
-                 Platform::ThreadYield();
-                 retries = 0;
-             }
-        }
-        return slotIdx;
+        return allocator_.AcquireSpecificSlot(slotIdx, timeoutMs);
     }
 
     /**
@@ -770,14 +515,14 @@ public:
      * @param timeoutNs Threshold in nanoseconds. 0 = disabled.
      */
     void SetAutoReclaimTimeoutNs(uint64_t timeoutNs) {
-        autoReclaimTimeoutNs.store(timeoutNs, std::memory_order_relaxed);
+        allocator_.SetAutoReclaimTimeoutNs(timeoutNs);
     }
 
     /**
      * @brief Returns the current auto-reclaim threshold (0 = disabled).
      */
     uint64_t GetAutoReclaimTimeoutNs() const {
-        return autoReclaimTimeoutNs.load(std::memory_order_relaxed);
+        return allocator_.GetAutoReclaimTimeoutNs();
     }
 
     /**
@@ -789,81 +534,17 @@ public:
      * `now - lease > maxLeaseAgeNs` it tries to CAS the state back to
      * SLOT_FREE.
      *
-     * Safety / ABA hazard (v0.7.5): a bare `state` CAS is NOT sufficient.
-     * Between the lease read and the CAS a peer can legitimately finish the
-     * slot (state -> FREE), have it reused, and re-claim it so `state` lands
-     * back on the SAME observed value with a FRESH lease. A bare
-     * CAS(state, observed, FREE) would then wrongly reclaim a live slot.
-     * Worse, the fresh lease is published only AFTER the re-claiming CAS, so
-     * even re-reading `lease` before the CAS cannot close the window (the
-     * "lease-publication-lag").
-     *
-     * We close it with the claim-generation handshake (§3.6.1): every claim
-     * path bumps `gen` BEFORE its state-claiming CAS. The reclaimer snapshots
-     * `gen`, verifies staleness, then wins the reclaim by
-     * `compare_exchange(gen, gen+1)`. Because a claim's `gen` bump precedes
-     * any `state` change, the reclaim CAS fails whenever a claim has begun —
-     * including the lease-lag window. The final `state` CAS (from the
-     * observed value) then arbitrates a same-generation reclaim against a
-     * SLOT_RESP_READY zombie re-claim.
+     * See SlotAllocator::TryReclaimAbandonedSlot for the full ABA-hazard and
+     * claim-generation-handshake discussion (§3.6.1).
      *
      * @param slotIdx The slot to inspect.
      * @param maxLeaseAgeNs Maximum tolerated age in nanoseconds. Slots
      *                     whose lease is older than this are candidates
      *                     for reclamation.
-     * @return true if the slot was reclaimed. false if (a) the slot was
-     *         already FREE, (b) lease was zero (peer never heartbeated),
-     *         (c) lease was fresher than the threshold, (d) the lease
-     *         changed before the handshake (peer heartbeated/re-claimed),
-     *         (e) the generation CAS lost (a claim began), or (f) the final
-     *         state CAS lost a race against a concurrent claim.
+     * @return true if the slot was reclaimed.
      */
     bool TryReclaimAbandonedSlot(int32_t slotIdx, uint64_t maxLeaseAgeNs) {
-        if (slotIdx < 0 || slotIdx >= (int32_t)(numSlots + numGuestSlots)) {
-            return false;
-        }
-        Slot* slot = &slots[slotIdx];
-
-        // Snapshot the claim generation FIRST. Every claim bumps gen before
-        // transitioning state (§3.6.1), so any claim that begins after this
-        // load — even one whose lease store has not yet landed — is caught
-        // by the generation CAS below.
-        uint64_t gen = slot->header->gen.load(std::memory_order_acquire);
-
-        uint32_t state = slot->header->state.load(std::memory_order_acquire);
-        if (state == SLOT_FREE) {
-            return false;
-        }
-        uint64_t lease = slot->header->lease.load(std::memory_order_acquire);
-        if (lease == 0) {
-            // Peer never wrote a lease — either v0.6.x peer or a slot
-            // that has somehow skipped the heartbeat. Refuse to reclaim:
-            // we cannot tell stale from never-stamped.
-            return false;
-        }
-        uint64_t now = Platform::MonotonicNanos();
-        if (now <= lease || (now - lease) <= maxLeaseAgeNs) {
-            return false;
-        }
-        // Cheap common-case rejection: a refreshed lease means a live owner
-        // heartbeated/re-claimed and already published its lease.
-        if (slot->header->lease.load(std::memory_order_acquire) != lease) {
-            return false;
-        }
-        // Generation handshake: win the exclusive right to reclaim. Fails if
-        // any claim bumped gen since our snapshot (including the lease-lag
-        // window, where state is re-claimed but the fresh lease is pending).
-        if (!slot->header->gen.compare_exchange_strong(
-                gen, gen + 1, std::memory_order_acq_rel)) {
-            return false;
-        }
-        // We won the generation. Publish SLOT_FREE via CAS from the observed
-        // state (not a blind store): a claim that bumped gen AFTER our
-        // winning CAS — e.g. reclaiming a SLOT_RESP_READY zombie — will have
-        // advanced state via its own claiming CAS, and this CAS arbitrates
-        // the final race. A burned gen tick is harmless (gen only advances).
-        return slot->header->state.compare_exchange_strong(
-            state, SLOT_FREE, std::memory_order_acq_rel);
+        return allocator_.TryReclaimAbandonedSlot(slotIdx, maxLeaseAgeNs);
     }
 
     /**
@@ -872,8 +553,7 @@ public:
      * @return Pointer to the buffer, or nullptr if invalid.
      */
     uint8_t* GetReqBuffer(int32_t slotIdx) {
-        if (slotIdx < 0 || slotIdx >= (int32_t)numSlots) return nullptr;
-        return slots[slotIdx].reqBuffer;
+        return allocator_.GetReqBuffer(slotIdx);
     }
 
     /**
@@ -882,8 +562,7 @@ public:
      * @return Max size in bytes.
      */
     int32_t GetMaxReqSize(int32_t slotIdx) {
-        if (slotIdx < 0 || slotIdx >= (int32_t)numSlots) return 0;
-        return (int32_t)slots[slotIdx].maxReqSize;
+        return allocator_.GetMaxReqSize(slotIdx);
     }
 
     /**
@@ -891,8 +570,7 @@ public:
      * Used for custom protocols like RingBuffer.
      */
     void SignalSlot(int32_t slotIdx) {
-        if (slotIdx < 0 || slotIdx >= (int32_t)numSlots) return;
-        Platform::SignalEvent(slots[slotIdx].hReqEvent);
+        allocator_.SignalSlot(slotIdx);
     }
 
     /**
@@ -903,8 +581,7 @@ public:
      * @return true if signaled, false if timeout.
      */
     bool WaitForSlotEvent(int32_t slotIdx, uint32_t timeoutMs = 0xFFFFFFFF) {
-        if (slotIdx < 0 || slotIdx >= (int32_t)numSlots) return false;
-        return Platform::WaitEvent(slots[slotIdx].hRespEvent, timeoutMs);
+        return allocator_.WaitForSlotEvent(slotIdx, timeoutMs);
     }
 
     /**
@@ -913,31 +590,7 @@ public:
      * @return Result<void> Success or Error.
      */
     Result<void> SendAcquiredAsync(int32_t slotIdx, int32_t size, MsgType msgType) {
-        if (slotIdx < 0 || slotIdx >= (int32_t)numSlots) return Result<void>::Failure(Error::InvalidArgs);
-        Slot* slot = &slots[slotIdx];
-
-        uint32_t absSize = (size < 0) ? (0u - (uint32_t)size) : (uint32_t)size;
-        if (absSize > slot->maxReqSize) {
-             slot->header->state.store(SLOT_FREE, std::memory_order_release);
-             return Result<void>::Failure(Error::BufferTooSmall);
-        }
-
-        slot->header->reqSize = size;
-        slot->header->msgType = msgType;
-        slot->header->msgSeq = slot->msgSeq;
-        slot->msgSeq += msgSeqStride;
-
-        // Mark activeWait to prevent theft during async operation
-        slot->activeWait.store(true, std::memory_order_relaxed);
-
-        slot->header->hostState.store(HOST_STATE_ACTIVE, std::memory_order_relaxed);
-        slot->header->state.store(SLOT_REQ_READY, std::memory_order_seq_cst);
-
-        if (slot->header->guestState.load(std::memory_order_seq_cst) == GUEST_STATE_WAITING) {
-            Platform::SignalEvent(slot->hReqEvent);
-        }
-
-        return Result<void>::Success();
+        return allocator_.SendAcquiredAsync(slotIdx, size, msgType);
     }
 
     /**
@@ -946,58 +599,7 @@ public:
      * @return Result<int> Response size.
      */
     Result<int> WaitForSlot(int32_t slotIdx, std::vector<uint8_t>& outResp, uint32_t timeoutMs = USE_DEFAULT_TIMEOUT) {
-        if (slotIdx < 0 || slotIdx >= (int32_t)numSlots) return Result<int>(Error::InvalidArgs);
-        Slot* slot = &slots[slotIdx];
-
-        uint32_t t = (timeoutMs == USE_DEFAULT_TIMEOUT) ? responseTimeoutMs : timeoutMs;
-
-        // The request was already published (SLOT_REQ_READY) and the guest
-        // signaled by SendAcquiredAsync; re-affirm the host-side wait flags and
-        // run the shared adaptive wait. Do NOT re-publish SLOT_REQ_READY here.
-        slot->activeWait.store(true, std::memory_order_relaxed);
-        slot->header->hostState.store(HOST_STATE_ACTIVE, std::memory_order_relaxed);
-
-        bool ready = WaitForRespReady(slot, t);
-
-        slot->activeWait.store(false, std::memory_order_release);
-
-        if (!ready) {
-             return Result<int>(Error::Timeout);
-        }
-
-        uint32_t expectedSeq = slot->msgSeq - msgSeqStride;
-        if (slot->header->msgSeq != expectedSeq) {
-             // Release the slot before reporting the violation; otherwise the
-             // slot stays in SLOT_RESP_READY indefinitely (the happy-path
-             // SLOT_FREE store below is only reached on success).
-             slot->header->state.store(SLOT_FREE, std::memory_order_release);
-             return Result<int>(Error::ProtocolViolation);
-        }
-
-        if (slot->header->msgType == MsgType::SYSTEM_ERROR) {
-             slot->header->state.store(SLOT_FREE, std::memory_order_release);
-             return Result<int>(Error::InternalError);
-        }
-
-        int resultSize = 0;
-        int32_t respSize = slot->header->respSize;
-        uint32_t absResp = (respSize < 0) ? (0u - (uint32_t)respSize) : (uint32_t)respSize;
-
-        if (absResp > slot->maxRespSize) absResp = slot->maxRespSize;
-
-        outResp.resize(absResp);
-        if (absResp > 0) {
-            if (respSize >= 0) {
-                memcpy(outResp.data(), slot->respBuffer, absResp);
-            } else {
-                uint32_t offset = slot->maxRespSize - absResp;
-                memcpy(outResp.data(), slot->respBuffer + offset, absResp);
-            }
-        }
-        resultSize = (int)absResp;
-
-        slot->header->state.store(SLOT_FREE, std::memory_order_release);
-        return Result<int>(resultSize);
+        return allocator_.WaitForSlot(slotIdx, outResp, timeoutMs);
     }
 
     /**
@@ -1005,63 +607,7 @@ public:
      * @return Result<int> Bytes read (response size) on success, or Error on failure.
      */
     Result<int> SendAcquired(int32_t slotIdx, int32_t size, MsgType msgType, std::vector<uint8_t>& outResp, uint32_t timeoutMs = USE_DEFAULT_TIMEOUT) {
-        if (slotIdx < 0 || slotIdx >= (int32_t)numSlots) return Result<int>(Error::InvalidArgs);
-        Slot* slot = &slots[slotIdx];
-
-        uint32_t absSize = (size < 0) ? (0u - (uint32_t)size) : (uint32_t)size;
-        if (absSize > slot->maxReqSize) {
-             slot->header->state.store(SLOT_FREE, std::memory_order_release);
-             return Result<int>(Error::BufferTooSmall);
-        }
-
-        slot->header->reqSize = size;
-        slot->header->msgType = msgType;
-        uint32_t currentSeq = slot->msgSeq;
-        slot->header->msgSeq = currentSeq;
-        slot->msgSeq += msgSeqStride;
-
-        uint32_t t = (timeoutMs == USE_DEFAULT_TIMEOUT) ? responseTimeoutMs : timeoutMs;
-        bool ready = WaitResponse(slot, t);
-
-        if (!ready) {
-             return Result<int>(Error::Timeout);
-        }
-
-        if (slot->header->msgSeq != currentSeq) {
-             // Release the slot before reporting the violation; otherwise the
-             // slot stays in SLOT_RESP_READY indefinitely (the happy-path
-             // SLOT_FREE store below is only reached on success).
-             slot->header->state.store(SLOT_FREE, std::memory_order_release);
-             return Result<int>(Error::ProtocolViolation);
-        }
-
-        if (slot->header->msgType == MsgType::SYSTEM_ERROR) {
-             slot->header->state.store(SLOT_FREE, std::memory_order_release);
-             return Result<int>(Error::InternalError);
-        }
-
-        int resultSize = 0;
-        if (ready) {
-            int32_t respSize = slot->header->respSize;
-            uint32_t absResp = (respSize < 0) ? (0u - (uint32_t)respSize) : (uint32_t)respSize;
-
-            if (absResp > slot->maxRespSize) absResp = slot->maxRespSize;
-
-            outResp.resize(absResp);
-            if (absResp > 0) {
-                if (respSize >= 0) {
-                    memcpy(outResp.data(), slot->respBuffer, absResp);
-                } else {
-                    uint32_t offset = slot->maxRespSize - absResp;
-                    memcpy(outResp.data(), slot->respBuffer + offset, absResp);
-                }
-            }
-            resultSize = (int)absResp;
-        }
-
-        slot->header->state.store(SLOT_FREE, std::memory_order_release);
-
-        return Result<int>(resultSize);
+        return allocator_.SendAcquired(slotIdx, size, msgType, outResp, timeoutMs);
     }
 
     /**
@@ -1074,7 +620,7 @@ public:
 
         if (size != 0) {
             if (!data) {
-                slots[idx].header->state.store(SLOT_FREE, std::memory_order_release);
+                allocator_.slots[idx].header->state.store(SLOT_FREE, std::memory_order_release);
                 return Result<int>(Error::InvalidArgs);
             }
 
@@ -1082,7 +628,7 @@ public:
             uint32_t uAbsSize = (size < 0) ? (0u - (uint32_t)size) : (uint32_t)size;
 
             if (uAbsSize > (uint32_t)max) {
-                slots[idx].header->state.store(SLOT_FREE, std::memory_order_release);
+                allocator_.slots[idx].header->state.store(SLOT_FREE, std::memory_order_release);
                 return Result<int>(Error::BufferTooSmall);
             }
 
@@ -1106,7 +652,7 @@ public:
 
         if (size != 0) {
             if (!data) {
-                slots[idx].header->state.store(SLOT_FREE, std::memory_order_release);
+                allocator_.slots[idx].header->state.store(SLOT_FREE, std::memory_order_release);
                 return Result<int>(Error::InvalidArgs);
             }
 
@@ -1114,7 +660,7 @@ public:
             uint32_t uAbsSize = (size < 0) ? (0u - (uint32_t)size) : (uint32_t)size;
 
             if (uAbsSize > (uint32_t)max) {
-                slots[idx].header->state.store(SLOT_FREE, std::memory_order_release);
+                allocator_.slots[idx].header->state.store(SLOT_FREE, std::memory_order_release);
                 return Result<int>(Error::BufferTooSmall);
             }
 
@@ -1129,35 +675,8 @@ public:
     }
 
 
-    using GuestCallHandler = std::function<int32_t(const uint8_t*, int32_t, uint8_t*, uint32_t, MsgType)>;
+    using GuestCallHandler = GuestCallWorker::GuestCallHandler;
 
-private:
-    std::thread guestWorker;
-    std::atomic<bool> guestWorkerRunning{false};
-
-    void GuestWorkerLoop(GuestCallHandler handler, int32_t maxBatchSize) {
-        EventHandle waitEvent = nullptr;
-        // Since all guest slots share the same reqEvent (shmName + "_guest_call"),
-        // we can wait on the first one.
-        if (numGuestSlots > 0 && numSlots + numGuestSlots <= slots.size()) {
-             waitEvent = slots[numSlots].hReqEvent;
-        }
-
-        while (guestWorkerRunning.load(std::memory_order_relaxed)) {
-            // Wait for signal (timeout 1s to check for shutdown)
-            if (waitEvent) {
-                 Platform::WaitEvent(waitEvent, 1000);
-            } else {
-                 // Should not happen if Start checks numGuestSlots
-                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            }
-
-            int processed = ProcessGuestCalls(handler, maxBatchSize);
-            (void)processed;
-        }
-    }
-
-public:
     /**
      * @brief Starts the background worker for Guest Calls.
      *
@@ -1165,20 +684,14 @@ public:
      * @param maxBatchSize Max requests to process in one burst (default 100).
      */
     void Start(GuestCallHandler handler, int32_t maxBatchSize = 100) {
-        if (numGuestSlots == 0) return;
-        if (guestWorkerRunning.exchange(true)) return;
-        guestWorker = std::thread(&DirectHost::GuestWorkerLoop, this, handler, maxBatchSize);
+        worker_.Start(handler, maxBatchSize);
     }
 
     /**
      * @brief Stops the background worker.
      */
     void Stop() {
-        if (guestWorkerRunning.exchange(false)) {
-            if (guestWorker.joinable()) {
-                guestWorker.join();
-            }
-        }
+        worker_.Stop();
     }
 
     /**
@@ -1187,57 +700,7 @@ public:
      */
     template <typename Handler>
     int ProcessGuestCalls(Handler&& handler, int limit = -1) {
-        if (!running) return 0;
-        int processed = 0;
-
-        for (uint32_t i = numSlots; i < numSlots + numGuestSlots; ++i) {
-            if (limit > 0 && processed >= limit) break;
-            Slot* slot = &slots[i];
-
-            uint32_t current = slot->header->state.load(std::memory_order_acquire);
-            if (current != SLOT_REQ_READY) continue;
-
-            // §3.6.1: bump generation before the claiming CAS.
-            slot->header->gen.fetch_add(1, std::memory_order_acq_rel);
-            if (slot->header->state.compare_exchange_strong(current, SLOT_BUSY, std::memory_order_acq_rel)) {
-                slot->header->lease.store(Platform::MonotonicNanos(), std::memory_order_release);
-                int32_t reqSize = slot->header->reqSize;
-                const uint8_t* reqData = nullptr;
-                uint32_t absReqSize = (reqSize < 0) ? (0u - (uint32_t)reqSize) : (uint32_t)reqSize;
-
-                if (absReqSize > slot->maxReqSize) {
-                    slot->header->respSize = 0;
-                    slot->header->msgType = MsgType::SYSTEM_ERROR;
-                    slot->header->state.store(SLOT_RESP_READY, std::memory_order_seq_cst);
-                    Platform::SignalEvent(slot->hRespEvent);
-                    processed++;
-                    continue;
-                }
-
-                if (reqSize >= 0) {
-                     reqData = slot->reqBuffer;
-                } else {
-                     uint32_t offset = slot->maxReqSize - absReqSize;
-                     reqData = slot->reqBuffer + offset;
-                }
-
-                int32_t respSize = handler(reqData, (int32_t)absReqSize, slot->respBuffer, slot->maxRespSize, slot->header->msgType);
-
-                uint32_t absRespSize = (respSize < 0) ? (0u - (uint32_t)respSize) : (uint32_t)respSize;
-                if (absRespSize > slot->maxRespSize) {
-                    respSize = 0;
-                    slot->header->msgType = MsgType::SYSTEM_ERROR;
-                }
-
-                slot->header->respSize = respSize;
-
-                slot->header->state.store(SLOT_RESP_READY, std::memory_order_seq_cst);
-                Platform::SignalEvent(slot->hRespEvent);
-
-                processed++;
-            }
-        }
-        return processed;
+        return worker_.ProcessGuestCalls(std::forward<Handler>(handler), limit);
     }
 };
 
