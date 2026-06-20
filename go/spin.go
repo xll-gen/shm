@@ -90,32 +90,45 @@ func (w *WaitStrategy) Wait(condition func() bool, sleepAction func()) bool {
 	recordIters(uint64(iters))
 
 	if ready {
-		recordSpinSuccess()
-		if limit < int(waitStrategyMaxSpin) {
-			newLimit := limit + int(waitStrategyIncStep)
-			if newLimit > int(waitStrategyMaxSpin) {
-				newLimit = int(waitStrategyMaxSpin)
-			}
-			atomic.StoreInt32(&w.CurrentLimit, int32(newLimit))
-		}
+		w.recordOutcome(true, int32(limit))
 	} else {
-		recordSleepFallback()
-		if limit > int(waitStrategyMinSpin) {
-			newLimit := limit - int(waitStrategyDecStep)
-			if newLimit < int(waitStrategyMinSpin) {
-				newLimit = int(waitStrategyMinSpin)
-			}
-			atomic.StoreInt32(&w.CurrentLimit, int32(newLimit))
-		}
-
+		w.recordOutcome(false, int32(limit))
 		sleepAction()
-
 		if condition() {
 			ready = true
 		}
 	}
 
 	return ready
+}
+
+// recordOutcome folds the post-wait bookkeeping shared by Wait and WaitState:
+// it records the spin/sleep counters (no-ops without -tags shm_benchstats) and
+// adapts CurrentLimit — widening by IncStep on a spin-resolved wait (hit) or
+// narrowing by DecStep when the wait fell through to sleepAction (miss), each
+// clamped to [waitStrategyMinSpin, waitStrategyMaxSpin]. limit is the snapshot
+// the wait loop ran with. Callers invoke sleepAction themselves after a miss so
+// the counter/limit update is published before the (blocking) OS wait.
+func (w *WaitStrategy) recordOutcome(hit bool, limit int32) {
+	if hit {
+		recordSpinSuccess()
+		if limit < waitStrategyMaxSpin {
+			newLimit := limit + waitStrategyIncStep
+			if newLimit > waitStrategyMaxSpin {
+				newLimit = waitStrategyMaxSpin
+			}
+			atomic.StoreInt32(&w.CurrentLimit, newLimit)
+		}
+		return
+	}
+	recordSleepFallback()
+	if limit > waitStrategyMinSpin {
+		newLimit := limit - waitStrategyDecStep
+		if newLimit < waitStrategyMinSpin {
+			newLimit = waitStrategyMinSpin
+		}
+		atomic.StoreInt32(&w.CurrentLimit, newLimit)
+	}
 }
 
 // WaitState is the assembly-driven fast path for the common case
@@ -153,26 +166,11 @@ func (w *WaitStrategy) WaitState(addr *uint32, want uint32, sleepAction func()) 
 	recordIters(uint64(totalIters))
 
 	if ready {
-		recordSpinSuccess()
-		if int32(limit) < waitStrategyMaxSpin {
-			newLimit := int32(limit) + waitStrategyIncStep
-			if newLimit > waitStrategyMaxSpin {
-				newLimit = waitStrategyMaxSpin
-			}
-			atomic.StoreInt32(&w.CurrentLimit, newLimit)
-		}
+		w.recordOutcome(true, int32(limit))
 		return true
 	}
 
-	recordSleepFallback()
-	if int32(limit) > waitStrategyMinSpin {
-		newLimit := int32(limit) - waitStrategyDecStep
-		if newLimit < waitStrategyMinSpin {
-			newLimit = waitStrategyMinSpin
-		}
-		atomic.StoreInt32(&w.CurrentLimit, newLimit)
-	}
-
+	w.recordOutcome(false, int32(limit))
 	sleepAction()
 
 	if atomic.LoadUint32(addr) == want {
