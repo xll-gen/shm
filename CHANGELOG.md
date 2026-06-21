@@ -1,5 +1,47 @@
 # Changelog
 
+## [v0.7.9] - 2026-06-22
+
+No wire-protocol/ABI change — `SHM_VERSION` remains `0x00070000`. (Corrects the
+`VERSION` file, which had lagged at 0.7.7 through the v0.7.8 tag.)
+
+### Changed
+
+- **Stream reassembler brought into contract parity with the Go reference
+  (R26).** `StreamReassembler` (C++) and `NewStreamReassembler` (Go) processed
+  the same wire format with different limits/completion checks. They are now
+  unified on a single contract, documented in `SPECIFICATION.md` §3.3.4:
+  - Config defaults aligned: `maxStreamSize` 128 MiB → 1 GiB, `maxStreams`
+    100 → 1024, and a new `maxStreamChunks` (1<<20) bound checked before the
+    chunk-vector resize.
+  - **Stricter completion (behavior change):** a stream completes only when
+    `receivedChunks == totalChunks` AND `Σ payloadSize == totalSize`; a
+    size-mismatch is now dropped (`SYSTEM_ERROR`) instead of delivered
+    truncated. Empty-stream rule tightened to `totalChunks==0 ⇔ totalSize==0`.
+  - Dedup now uses an explicit per-index presence flag instead of vector
+    emptiness, fixing a C++/Go divergence where a duplicated zero-length chunk
+    was double-counted. The reclaim mechanism (Go LRU vs C++ time-prune) stays
+    implementation-defined per the spec.
+- **`DirectHost` decomposed (R44).** The twin adaptive wait loops in
+  `WaitResponse`/`WaitForSlot` are unified into a single `WaitForRespReady`
+  (removes the "one path hangs" drift hazard), and the ~1280-line god header is
+  split into `SlotAllocator.h` (slot state machine) + `GuestCallWorker.h`
+  (guest-call worker) with `DirectHost` as a façade. Public API byte-identical;
+  memory orders, the §3.6.1 claim handshake, and geometry unchanged.
+- Per-field offset guards added for `SlotHeader`/`ExchangeHeader` (R25), proving
+  the layout is frozen against field reordering.
+- `WaitStats` counters gated behind the `shm_benchstats` build tag.
+- `SPECIFICATION.md` §3 heading drift fixed; reclamation version refs corrected.
+
+## [v0.7.8] - 2026-06-18
+
+### Fixed
+
+- Guest-call path now waits for a free guest slot up to the call timeout instead
+  of failing immediately when all guest slots are momentarily busy (fixes RTD
+  once-grid stranding under slot pressure). `SPECIFICATION.md` + `SHM_VERSION`
+  comments aligned with the shipped v0.7.x layout.
+
 ## [v0.7.7] - 2026-06-13
 
 ### Changed
