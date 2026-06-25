@@ -1,5 +1,21 @@
 # Changelog
 
+## [v0.7.10] - 2026-06-25
+
+No wire-protocol/ABI change — `SHM_VERSION` remains `0x00070000`.
+
+### Changed
+
+- **Removed a dead `len(reqBuf) < 24` guard in `StreamSender.Send`'s chunk
+  goroutine (`go/stream_sender.go`).** The immediately preceding overflow check
+  `if len(reqBuf) < chunkHeaderSize+len(chunkSlice)` already guarantees
+  `len(reqBuf) >= chunkHeaderSize` (`chunkHeaderSize == 24`, pinned by the
+  compile-time size assert in `stream.go`), on the same un-resliced internal SHM
+  slice, so the `< 24` branch was unreachable. Pure dead-code removal — no
+  behavior change. Found by a cross-repo over-defensive-logic audit (2026-06-25).
+  The analogous `< 24` check on the **exported `StreamStart` / C++↔Go wire path**
+  was deliberately kept (see `AGENTS.md` → Confirmed-Correct Decisions).
+
 ## [v0.7.9] - 2026-06-22
 
 No wire-protocol/ABI change — `SHM_VERSION` remains `0x00070000`. (Corrects the

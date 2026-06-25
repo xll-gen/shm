@@ -126,6 +126,37 @@ flagged by past reviews and confirmed correct — do not "fix" or re-propose:
 * The **header-only** C++ library structure is a design decision (see Project
   Structure) — no `.cpp` files for library logic.
 
+### Over-defensive-logic audit (2026-06-25)
+
+A cross-repo audit looked for guards that are redundant because a caller already
+guarantees a safe/complete value. **One** was removed (v0.7.10): the dead
+`len(reqBuf) < 24` re-check in `StreamSender.Send`'s chunk goroutine
+(`go/stream_sender.go`), subsumed by the preceding
+`len(reqBuf) < chunkHeaderSize+len(chunkSlice)` check on the same un-resliced
+internal slice. The following look similar but are **load-bearing — do NOT
+remove**:
+
+* The `len(reqBuf) < 24` / size guard on the **exported `StreamStart` path** —
+  it sits on the public API surface and the C++↔Go shared-memory **wire
+  boundary**. Local provability does not license removal here.
+* `HandleAck`'s `len(chunkData) == 0` guard — internally redundant given
+  `GetNextChunk`'s return contract, but kept for its **exported wire-dispatch**
+  posture (it validates a value that, on the dispatch path, originates from peer
+  bytes).
+* `GuestWorkerLoop`'s `numSlots+numGuestSlots <= slots.size()` bounds conjunct —
+  `DirectHost::Init` sets the counts *before* the fallible `resize`, leaving a
+  real partial-Init window; the check guards a raw `operator[]` over
+  independently-mutable public members. Keep it.
+
+**Rule of thumb.** Two ordered length checks on the *same un-resliced* buffer
+collapse: if an earlier guard tests `len(buf) < K + n` (`n >= 0`, `K` a
+compile-time-pinned constant) a later `len(buf) < K` is dead. But a guard is
+safe to delete *only* when it lives entirely inside one trust domain over an
+internally-produced value — never on an exported API, the C++↔Go SHM wire, or
+raw peer bytes, and never when it doubles as a behavior-selecting branch. Prefer
+**compile-time size asserts** (the dual `_ [K - sizeof] / [sizeof - K]` pattern)
+over runtime size re-checks.
+
 ## **Known Improvement Backlog**
 
 From a code review on 2026-05-16. Address as part of normal work.

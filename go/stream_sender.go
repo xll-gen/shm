@@ -169,16 +169,10 @@ func (s *StreamSender) Send(data []byte, streamID uint64) error {
 				return
 			}
 
-			// Write Header manually
-			// ChunkHeader is 24 bytes (with padding)
-			if len(reqBuf) < 24 {
-				select {
-				case errChan <- fmt.Errorf("buffer too small for ChunkHeader"):
-				default:
-				}
-				return
-			}
-
+			// Write Header manually. The line above already guarantees
+			// len(reqBuf) >= chunkHeaderSize+len(chunkSlice) >= chunkHeaderSize
+			// (== 24, pinned by the compile-time size assert in stream.go), so
+			// the header writes below are in bounds without a separate <24 check.
 			binary.LittleEndian.PutUint64(reqBuf[0:], streamID)
 			binary.LittleEndian.PutUint32(reqBuf[8:], idx)
 			binary.LittleEndian.PutUint32(reqBuf[12:], uint32(len(chunkSlice)))
