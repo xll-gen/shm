@@ -19,6 +19,54 @@ This repo's contract is **transport only**: never embed protocol-specific assump
 * **No ARM support**: neither Windows-on-ARM nor Apple Silicon is a target. Cache-line sizes other than 64 bytes are out of scope for tuning.
 * **Single-architecture matching at runtime**: C++ Host and Go Guest in a given deployment MUST run on the same architecture and bitness. Cross-arch IPC is not supported.
 
+## **Affinity Recommendations**
+
+`ClientConfig.AffinityMode` (Go) / `--affinity` (bench binaries) controls
+worker placement. The default `AffinityAuto` is **chipset-aware** as of
+v0.8.2: it inspects the host topology at startup and picks the most
+specific mode the hardware supports.
+
+**`AffinityAuto` resolution order** (see `affinity.go::resolveAuto`):
+
+1. If LTP_PC_SMT pairs are reported AND `numSlots <= len(SmtPairs())` →
+   `AffinitySibling`. Each slot N pins to one SMT LP of physical core
+   `N % numPairs`; the matching C++ host pins to the other LP, putting
+   both endpoints on shared L1d/L2.
+2. Else if `len(CcxMasks()) > 1` → `AffinityLocal` (CCX-wide mask). Covers
+   chiplets where slot count exceeds SMT-pair count, plus multi-socket
+   Xeon without exposed LTP_PC_SMT.
+3. Else → `AffinityNone` (no-pin). Monolithic-L3 hosts, no-SMT CPUs, and
+   constrained VMs land here.
+
+The 2026-06-26 SMT-sibling A/B on Ryzen 9 3900X (see `EXPERIMENTS.md`
+§"2026-06-26 SMT-sibling co-location" and the SMT-sibling table in
+`BENCHMARK_RESULTS.md`) showed `AffinitySibling` beats `AffinityLocal`
+by **+24 % to +74 %** across 1/4/8 threads × 64 B / 1024 B payloads. The
+win comes from two effects: shared-L1d coherency on the SlotHeader line,
+and *deterministic non-collision placement* of host and guest LPs (CCX-wide
+masks let the OS scheduler occasionally co-locate both endpoints on the
+same LP, periodically stalling the spin).
+
+**Operator guidance** for explicit overrides:
+
+* **Chiplet AMD (Ryzen / Threadripper / Epyc)** — `AffinityAuto` already
+  picks `AffinitySibling` for typical slot counts. Verify on the *actual
+  deployment host* before relying on the magnitude of the measured win.
+* **Monolithic-L3 Intel single-socket with SMT** — `AffinityAuto` picks
+  `AffinitySibling` if `numSlots <= numPairs`. Unmeasured on this family;
+  the non-collision effect should still help even without a cross-CCD
+  bounce to eliminate. If you observe regression, set
+  `AffinityMode = AffinityNone` to opt out.
+* **Hybrid Intel (Alder Lake P+E)** — `enumerateSmtPairs` skips E-cores
+  (no LTP_PC_SMT). `AffinityAuto` picks `AffinitySibling` only when
+  `numSlots <= numPCorePairs`; otherwise it falls through to no-pin
+  (monolithic L3). Measure if your workload exceeds P-core count.
+* **Constrained VMs / hosts without LTP_PC_SMT topology** —
+  `AffinityAuto` degrades to either `AffinityLocal` (multi-CCX) or
+  `AffinityNone`. No worker is ever pinned to a single LP without a
+  documented sibling, so the §Exp 5 starvation pattern is avoided by
+  construction.
+
 ## **Codebase Authority**
 
 *   **SPECIFICATION.md:** This file is the **single source of truth** for the protocol, memory layout, and architecture. Always consult `SPECIFICATION.md` before making changes to the core IPC logic.

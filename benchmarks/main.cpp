@@ -25,10 +25,13 @@ bool GUEST_CALL_MODE = false;
 bool STREAM_MODE = false;
 int IN_FLIGHT = 0; // 0 = mode-default (stream: 4, normal: 1). Set via -i <n>.
 // AffinityMode (mirrors Go's affinity.go enum):
-//   0 = auto   (default; pin to CCX[N % numCCX] iff multi-CCX, else no-op)
-//   1 = none   (explicit off)
-//   2 = local  (force pin even on monolithic-L3 hosts)
-// Set via --affinity auto | none | local.
+//   0 = auto    (default; pin to CCX[N % numCCX] iff multi-CCX, else no-op)
+//   1 = none    (explicit off)
+//   2 = local   (force pin even on monolithic-L3 hosts)
+//   3 = sibling (opt-in; pin host worker N to one SMT LP of physical core
+//                [N % numPairs], guest goroutine to the other LP — see
+//                shm/go/affinity.go::AffinitySibling)
+// Set via --affinity auto | none | local | sibling.
 int AFFINITY_MODE = 0;
 
 struct BenchmarkStats {
@@ -64,24 +67,41 @@ std::string FormatNumber(double n) {
 }
 
 void WorkerThread(DirectHost* host, int id, int totalSlots) {
-    // CPU affinity: pin this host worker thread to the same CCX (shared-L3
-    // LP set) that the corresponding guest worker pins to, via a
-    // deterministic slot-index round-robin mapping. Co-locating the host
-    // and guest on one L3 region eliminates the cross-CCD Infinity Fabric
-    // bounce on every state-line transition (Ryzen 3900X: ~80-100ns ->
-    // ~30-50ns per bounce on Zen 2). PAUSE-every-iter handles the same-
-    // physical-core SMT-sibling case if the OS scheduler places us there
-    // inside the CCX mask.
+    // CPU affinity: pin this host worker thread to the LP its matching
+    // guest goroutine targets, via a deterministic slot-index round-robin
+    // mapping. Mode semantics (mirror Go's affinity.go::resolveAuto):
     //
-    // Mode semantics (mirror Go's affinity.go):
-    //   0 = auto:  pin iff multi-CCX (chiplet AMD, multi-socket Xeon).
-    //              Skip on monolithic-L3 hosts (most single-socket Intel
-    //              desktops) where same-as-all-LPs mask adds no value.
-    //   1 = none:  explicit opt-out.
-    //   2 = local: force pin even with len(masks)==1.
-    if (AFFINITY_MODE != 1) {
+    //   0 = auto:    chipset-aware. If LTP_PC_SMT pairs are reported and
+    //                totalSlots fits within numPairs → Sibling. Else if
+    //                multi-CCX → Local. Else → no-pin.
+    //   1 = none:    explicit opt-out.
+    //   2 = local:   force CCX-mask pin even on monolithic-L3 hosts.
+    //   3 = sibling: pin host worker N to the host LP of physical core
+    //                [N % numPairs]; the matching Go guest pins to the
+    //                other LP, putting both endpoints on shared L1d/L2.
+    //
+    // The shared-L1d invariant of Sibling mode is documented at length
+    // in shm/EXPERIMENTS.md §"2026-06-26 SMT-sibling co-location".
+    int resolved = AFFINITY_MODE;
+    if (resolved == 0) {
+        auto pairs = shm::Platform::EnumerateSmtPairs();
         auto masks = shm::Platform::EnumerateCcxMasks();
-        if (!masks.empty() && !(AFFINITY_MODE == 0 && masks.size() <= 1)) {
+        if (!pairs.empty() && totalSlots > 0 && totalSlots <= static_cast<int>(pairs.size())) {
+            resolved = 3; // sibling
+        } else if (masks.size() > 1) {
+            resolved = 2; // local
+        } else {
+            resolved = 1; // none
+        }
+    }
+    if (resolved == 3) {
+        auto pairs = shm::Platform::EnumerateSmtPairs();
+        if (!pairs.empty()) {
+            shm::Platform::PinCurrentThreadAffinity(pairs[id % pairs.size()].host);
+        }
+    } else if (resolved == 2) {
+        auto masks = shm::Platform::EnumerateCcxMasks();
+        if (!masks.empty()) {
             shm::Platform::PinCurrentThreadAffinity(masks[id % masks.size()]);
         }
     }
@@ -207,7 +227,7 @@ int main(int argc, char** argv) {
             std::cout << "  -c <bytes>      Chunk size for Stream Mode (default: 4096)." << std::endl;
             std::cout << "  -d <seconds>    Duration in seconds (default: 10)" << std::endl;
             std::cout << "  -i <n>          In-flight chunks per stream worker (default: 4 in stream mode, 1 otherwise)" << std::endl;
-            std::cout << "  --affinity <m>  Worker thread CPU affinity: auto | none | local (default: auto)" << std::endl;
+            std::cout << "  --affinity <m>  Worker thread CPU affinity: auto | none | local | sibling (default: auto)" << std::endl;
             std::cout << "  -v              Verbose logging" << std::endl;
             std::cout << "  --name <name>   SHM Name (default: SimpleIPC)" << std::endl;
             std::cout << "  --guest-call    Enable Guest Call mode" << std::endl;
@@ -224,7 +244,8 @@ int main(int argc, char** argv) {
             if (strcmp(m, "auto") == 0) AFFINITY_MODE = 0;
             else if (strcmp(m, "none") == 0) AFFINITY_MODE = 1;
             else if (strcmp(m, "local") == 0) AFFINITY_MODE = 2;
-            else { std::cerr << "Unknown --affinity value: " << m << " (use 'auto', 'none', or 'local')\n"; return 1; }
+            else if (strcmp(m, "sibling") == 0) AFFINITY_MODE = 3;
+            else { std::cerr << "Unknown --affinity value: " << m << " (use 'auto', 'none', 'local', or 'sibling')\n"; return 1; }
         }
         if (strcmp(argv[i], "-v") == 0) VERBOSE = true;
         if (strcmp(argv[i], "--name") == 0 && i + 1 < argc) SHM_NAME = argv[++i];
@@ -257,10 +278,13 @@ int main(int argc, char** argv) {
     std::cout << "  Guest Call Mode: " << (GUEST_CALL_MODE ? "Enabled" : "Disabled") << std::endl;
     {
         auto masks = shm::Platform::EnumerateCcxMasks();
+        auto pairs = shm::Platform::EnumerateSmtPairs();
         const char* modeLabel = (AFFINITY_MODE == 0) ? "auto" :
-                                (AFFINITY_MODE == 1) ? "none" : "local";
+                                (AFFINITY_MODE == 1) ? "none" :
+                                (AFFINITY_MODE == 2) ? "local" : "sibling";
         std::cout << "  Affinity: " << modeLabel
-                  << " (CCXs detected: " << masks.size() << ")" << std::endl;
+                  << " (CCXs detected: " << masks.size()
+                  << ", SMT pairs: " << pairs.size() << ")" << std::endl;
     }
 
     DirectHost host;

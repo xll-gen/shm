@@ -934,7 +934,7 @@ func (g *DirectGuest) workerLoop(idx int, handler func([]byte, []byte, MsgType) 
 	// goroutine migrate during shutdown, which is moot for exiting
 	// workers but matches the §Exp 5 lesson that LockOSThread without a
 	// target LP set is the failure mode, not LockOSThread itself.
-	pinSlotWorker(idx, g.affinityMode)
+	pinSlotWorker(idx, int(g.numSlots), g.affinityMode)
 
 	for {
 		if atomic.LoadInt32(&g.closing) == 1 {

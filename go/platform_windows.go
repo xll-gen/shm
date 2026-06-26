@@ -210,8 +210,13 @@ func unlinkShm(name string) {
 const (
 	// LOGICAL_PROCESSOR_RELATIONSHIP value for the RelationCache enumeration.
 	relationCache = 2
+	// LOGICAL_PROCESSOR_RELATIONSHIP value for RelationProcessorCore.
+	relationProcessorCore = 0
 	// PROCESSOR_CACHE_TYPE value for CacheUnified.
 	cacheTypeUnified = 0
+	// PROCESSOR_RELATIONSHIP.Flags bit indicating the physical core
+	// hosts more than one logical processor (i.e. SMT enabled).
+	ltpPcSmt = 0x1
 )
 
 // enumerateCcxMasks returns one KAFFINITY mask per shared-L3 logical-processor
@@ -291,6 +296,88 @@ func enumerateCcxMasks() []uint64 {
 		off += uintptr(size)
 	}
 	return masks
+}
+
+// enumerateSmtPairs returns one (host, guest) single-LP mask pair per
+// physical core reported by GetLogicalProcessorInformationEx
+// (RelationProcessorCore) that has the LTP_PC_SMT flag set and exactly
+// two LPs in its GroupMask. The lowest set bit becomes the host LP, the
+// next-lowest becomes the guest LP — both sides (Go guest and C++ host)
+// derive the same ordering so they end up on opposite SMT siblings of
+// the same physical core.
+//
+// Skipped:
+//   - PROCESSOR_RELATIONSHIP entries without LTP_PC_SMT (efficiency cores
+//     on hybrid CPUs, no-SMT parts) — sibling mode requires shared L1d
+//   - GroupCount != 1 (multi-group >64-LP partitions out of scope)
+//   - cores reporting other than exactly 2 SMT siblings (SMT-4 POWER is
+//     not a Windows/x86 case; defensive guard for unexpected topologies)
+//
+// Returns nil when no usable pair is found — caller (AffinitySibling)
+// must treat that as "no pin" rather than fall back to a wider mask, to
+// keep the experiment's invariant (host/guest on shared L1d) explicit.
+func enumerateSmtPairs() []SmtPair {
+	var need uint32
+	procGetLogicalProcessorInformationEx.Call(uintptr(relationProcessorCore), 0, uintptr(unsafe.Pointer(&need)))
+	if need == 0 {
+		return nil
+	}
+	buf := make([]byte, need)
+	r1, _, _ := procGetLogicalProcessorInformationEx.Call(
+		uintptr(relationProcessorCore),
+		uintptr(unsafe.Pointer(&buf[0])),
+		uintptr(unsafe.Pointer(&need)),
+	)
+	if r1 == 0 {
+		return nil
+	}
+	// SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX layout for RelationProcessorCore:
+	//   DWORD Relationship            // outer +0  (4)  — must be 0
+	//   DWORD Size                    // outer +4  (4)
+	//   PROCESSOR_RELATIONSHIP {      // outer +8
+	//     BYTE  Flags                 // outer +8       (LTP_PC_SMT = 0x1)
+	//     BYTE  EfficiencyClass       // outer +9
+	//     BYTE  Reserved[20]          // outer +10
+	//     WORD  GroupCount            // outer +30
+	//     GROUP_AFFINITY GroupMask[]: // outer +32
+	//       KAFFINITY Mask            // outer +32 (8 on amd64)
+	//       WORD Group                // outer +40
+	//       WORD Reserved[3]          // outer +42
+	//   }
+	var pairs []SmtPair
+	off := uintptr(0)
+	for off < uintptr(need) {
+		rel := *(*uint32)(unsafe.Pointer(&buf[off]))
+		size := *(*uint32)(unsafe.Pointer(&buf[off+4]))
+		if size == 0 {
+			break
+		}
+		if rel == relationProcessorCore && size >= 48 {
+			flags := buf[off+8]
+			groupCount := *(*uint16)(unsafe.Pointer(&buf[off+30]))
+			if flags&ltpPcSmt != 0 && groupCount == 1 {
+				mask := *(*uint64)(unsafe.Pointer(&buf[off+32]))
+				if popcount64(mask) == 2 {
+					host := mask & (^mask + 1) // lowest set bit
+					guest := mask & ^host       // remaining bit
+					pairs = append(pairs, SmtPair{Host: host, Guest: guest})
+				}
+			}
+		}
+		off += uintptr(size)
+	}
+	return pairs
+}
+
+// popcount64 returns the Hamming weight of x. Plain Go to avoid a
+// math/bits import bleeding into platform_windows.go's compile bag.
+func popcount64(x uint64) int {
+	n := 0
+	for x != 0 {
+		x &= x - 1
+		n++
+	}
+	return n
 }
 
 // pinCurrentThreadAffinity binds the current OS thread to the given LP mask

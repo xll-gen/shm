@@ -289,6 +289,84 @@ public:
     }
 
     /**
+     * @brief One physical core's two SMT logical-processor masks.
+     *
+     * `host` and `guest` are single-bit KAFFINITY masks targeting the
+     * two LPs that share L1d/L2 on a single physical core. The C++ host
+     * binary should pin slot N's worker thread to `pairs[N % pairs.size()].host`;
+     * the Go guest pins its slot-N goroutine to `.guest`, putting the
+     * two endpoints of the ping-pong on shared L1d/L2.
+     */
+    struct SmtPair {
+        uint64_t host;
+        uint64_t guest;
+    };
+
+    /**
+     * @brief Enumerates SMT-sibling LP pairs (one per SMT-capable
+     *        physical core).
+     *
+     * Returns one (host, guest) entry per PROCESSOR_RELATIONSHIP whose
+     * Flags has LTP_PC_SMT set and whose GroupMask reports exactly two
+     * LPs in a single processor group. The lowest set bit becomes
+     * `host`, the next-lowest becomes `guest` — the Go side derives the
+     * same ordering (see shm/go/platform_windows.go::enumerateSmtPairs),
+     * so the two binaries land on opposite SMT siblings of the same
+     * physical core for the same slot index.
+     *
+     * Skipped:
+     *   - cores without LTP_PC_SMT (efficiency cores, no-SMT parts)
+     *   - GroupCount != 1 (multi-group >64-LP partitions)
+     *   - cores not reporting exactly 2 SMT siblings (SMT-4 POWER etc.)
+     *
+     * Returns an empty vector when no SMT pair is reported; callers
+     * should treat that as "AffinitySibling unavailable" and skip
+     * pinning (falling back to a wider mask would silently break the
+     * shared-L1d invariant of sibling mode).
+     */
+    static std::vector<SmtPair> EnumerateSmtPairs() {
+        std::vector<SmtPair> pairs;
+        constexpr LOGICAL_PROCESSOR_RELATIONSHIP kRelProcCore =
+            RelationProcessorCore; // value 0
+        DWORD need = 0;
+        GetLogicalProcessorInformationEx(kRelProcCore, nullptr, &need);
+        if (need == 0) return pairs;
+        std::vector<uint8_t> buffer(need);
+        if (!GetLogicalProcessorInformationEx(
+                kRelProcCore,
+                reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data()),
+                &need)) {
+            return pairs;
+        }
+        size_t off = 0;
+        while (off + 8 <= need) {
+            uint8_t* p = buffer.data() + off;
+            uint32_t rel  = *reinterpret_cast<uint32_t*>(p + 0);
+            uint32_t size = *reinterpret_cast<uint32_t*>(p + 4);
+            if (size == 0) break;
+            if (rel == kRelProcCore && size >= 48 && off + size <= need) {
+                uint8_t flags = p[8];
+                uint16_t groupCount = *reinterpret_cast<uint16_t*>(p + 30);
+                // LTP_PC_SMT == 0x1
+                if ((flags & 0x1) != 0 && groupCount == 1) {
+                    uint64_t mask = *reinterpret_cast<uint64_t*>(p + 32);
+                    // popcount via Kernighan: must be exactly 2 bits.
+                    uint64_t m = mask;
+                    int bits = 0;
+                    while (m) { m &= (m - 1); ++bits; if (bits > 2) break; }
+                    if (bits == 2) {
+                        uint64_t host  = mask & (~mask + 1); // lowest set bit
+                        uint64_t guest = mask & ~host;
+                        pairs.push_back({host, guest});
+                    }
+                }
+            }
+            off += size;
+        }
+        return pairs;
+    }
+
+    /**
      * @brief Pins the current thread to the given LP mask.
      *
      * Returns the previous affinity mask (0 on failure). Caller should

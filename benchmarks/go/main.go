@@ -25,7 +25,7 @@ var (
 	memProfile    = flag.String("memprofile", "", "Write memory profile to file")
 	guestCallMode = flag.Bool("guest-call", false, "Enable Guest Call benchmark mode")
 	streamMode    = flag.Bool("stream", false, "Enable Stream benchmark mode")
-	affinityFlag  = flag.String("affinity", "auto", "Worker affinity mode: auto | none | local")
+	affinityFlag  = flag.String("affinity", "auto", "Worker affinity mode: auto | none | local | sibling")
 )
 
 func main() {
@@ -57,11 +57,14 @@ func main() {
 		affinityMode = shm.AffinityNone
 	case "local":
 		affinityMode = shm.AffinityLocal
+	case "sibling":
+		affinityMode = shm.AffinitySibling
 	default:
-		log.Fatalf("unknown -affinity value %q (use 'auto', 'none', or 'local')", *affinityFlag)
+		log.Fatalf("unknown -affinity value %q (use 'auto', 'none', 'local', or 'sibling')", *affinityFlag)
 	}
 	masks := shm.CcxMasks()
-	fmt.Printf("  Affinity: %s (CCXs detected: %d)\n", affinityMode, len(masks))
+	pairs := shm.SmtPairs()
+	fmt.Printf("  Affinity: %s (CCXs detected: %d, SMT pairs: %d)\n", affinityMode, len(masks), len(pairs))
 
 	client, err := shm.Connect(shm.ClientConfig{
 		ShmName:           *shmName,

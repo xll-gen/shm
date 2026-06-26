@@ -1,5 +1,59 @@
 # Changelog
 
+## [v0.8.2] - 2026-06-26
+
+No wire-protocol/ABI change — `SHM_VERSION` remains `0x00070000`.
+
+### Added
+
+- **`AffinitySibling` (`AffinityMode = 3`)** — opt-in pinning that
+  co-locates each slot's C++ host worker and Go guest goroutine on the
+  two SMT siblings of one physical core. New `Platform::EnumerateSmtPairs`
+  (C++) and `shm.SmtPairs()` (Go) enumerate LTP_PC_SMT physical cores via
+  `GetLogicalProcessorInformationEx(RelationProcessorCore)` and return
+  single-bit (host, guest) LP-mask pairs (lowest bit → host, next-lowest
+  → guest; both sides derive the same ordering). Benchmark binary and
+  `harness.ps1` accept `--affinity sibling` / `-Affinity sibling`.
+
+### Changed
+
+- **`AffinityAuto` is now chipset-aware.** `affinity.go::resolveAuto`
+  picks the most specific mode the host topology supports:
+  1. `len(SmtPairs()) > 0 && numSlots <= len(SmtPairs())` →
+     `AffinitySibling`.
+  2. `len(CcxMasks()) > 1` → `AffinityLocal`.
+  3. otherwise → `AffinityNone`.
+  Pre-v0.8.2 behaviour is preserved wherever Sibling is not safe (Auto
+  never pins to a single LP without a documented SMT sibling). Threaded
+  numSlots through `affinityMaskForSlot` / `pinSlotWorker`; the C++
+  bench `WorkerThread` mirrors the same resolution against `totalSlots`.
+- **`go/affinity_test.go`** — `TestAffinityAutoChipsetAware` covers the
+  new resolution table; `TestAffinityMaskForSlot` simplified to focus on
+  the explicit (non-Auto) CCX round-robin invariants;
+  `TestSmtPairsTopology` / `TestAffinityMaskForSlotSibling` validate the
+  new enumeration and slot-to-pair mapping.
+
+### Measured
+
+- Ryzen 9 3900X (2026-06-26, `harness.ps1 -HighPriority`, best-of-3):
+  `AffinitySibling` beat `AffinityLocal` by **+24 % to +74 %** across
+  1/4/8 threads × 64 B / 1024 B payloads. `AvgItersPerSpin` dropped
+  15 – 38 % across the matrix; `SleepFallback` stayed at ≈0 %. The
+  dominant effect is *deterministic non-collision placement* of host
+  and guest LPs — CCX-wide masks let the OS scheduler co-locate both
+  endpoints on the same LP, periodically stalling the spin. Shared-L1d
+  cache locality is real but secondary. See `EXPERIMENTS.md` §"2026-06-26
+  SMT-sibling co-location" and `BENCHMARK_RESULTS.md` §"SMT-sibling A/B"
+  for setup and per-cell numbers.
+
+### Operator notes
+
+- See `AGENTS.md` §"Affinity Recommendations" for per-CPU-family guidance
+  (chiplet AMD, monolithic-L3 Intel, hybrid Intel P+E, constrained VMs).
+  Untested families: hybrid Intel P+E (Auto skips E-cores), monolithic-L3
+  Intel single-socket, realistic asymmetric workloads (consumer doing
+  real CPU work between requests).
+
 ## [v0.7.10] - 2026-06-25
 
 No wire-protocol/ABI change — `SHM_VERSION` remains `0x00070000`.

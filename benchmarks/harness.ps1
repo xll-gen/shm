@@ -39,14 +39,20 @@ param(
     # to reproduce the pre-v0.7.12 serialized-chunk numbers.
     [int]$InFlight = 0,
     # Worker CPU affinity mode.
-    #   'auto'  (default) — pin slot-N's host worker thread and Go guest
-    #                       goroutine to CCX[N % numCCX] WHEN the host
-    #                       reports >1 shared-L3 group (chiplet AMD,
-    #                       multi-socket Xeon). No-op on monolithic-L3
-    #                       hosts (most single-socket Intel desktops).
-    #   'none'            — explicit OS-scheduler-decides.
-    #   'local'           — force CCX pin even on monolithic-L3.
-    [ValidateSet('auto','none','local')]
+    #   'auto'    (default) — pin slot-N's host worker thread and Go guest
+    #                         goroutine to CCX[N % numCCX] WHEN the host
+    #                         reports >1 shared-L3 group (chiplet AMD,
+    #                         multi-socket Xeon). No-op on monolithic-L3
+    #                         hosts (most single-socket Intel desktops).
+    #   'none'              — explicit OS-scheduler-decides.
+    #   'local'             — force CCX pin even on monolithic-L3.
+    #   'sibling'           — opt-in: pin host worker N to one SMT LP of
+    #                         physical core [N % numPairs], guest to the
+    #                         other LP. Trades pipeline resource sharing
+    #                         for shared-L1d coherency on the SlotHeader
+    #                         line. Falls back to no-pin if the host has
+    #                         no LTP_PC_SMT pairs (E-only / no-SMT / VM).
+    [ValidateSet('auto','none','local','sibling')]
     [string]$Affinity = 'auto',
 
     [string]$OutDir,
