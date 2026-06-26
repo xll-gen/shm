@@ -7,17 +7,20 @@ import (
 )
 
 var (
-	kernel32                = syscall.NewLazyDLL("kernel32.dll")
-	procCreateEventW        = kernel32.NewProc("CreateEventW")
-	procOpenEventW          = kernel32.NewProc("OpenEventW")
-	procSetEvent            = kernel32.NewProc("SetEvent")
-	procWaitForSingleObject = kernel32.NewProc("WaitForSingleObject")
-	procCloseHandle         = kernel32.NewProc("CloseHandle")
-	procCreateFileMappingW  = kernel32.NewProc("CreateFileMappingW")
-	procOpenFileMappingW    = kernel32.NewProc("OpenFileMappingW")
-	procMapViewOfFile       = kernel32.NewProc("MapViewOfFile")
-	procUnmapViewOfFile     = kernel32.NewProc("UnmapViewOfFile")
-	procVirtualQuery        = kernel32.NewProc("VirtualQuery")
+	kernel32                              = syscall.NewLazyDLL("kernel32.dll")
+	procCreateEventW                      = kernel32.NewProc("CreateEventW")
+	procOpenEventW                        = kernel32.NewProc("OpenEventW")
+	procSetEvent                          = kernel32.NewProc("SetEvent")
+	procWaitForSingleObject               = kernel32.NewProc("WaitForSingleObject")
+	procCloseHandle                       = kernel32.NewProc("CloseHandle")
+	procCreateFileMappingW                = kernel32.NewProc("CreateFileMappingW")
+	procOpenFileMappingW                  = kernel32.NewProc("OpenFileMappingW")
+	procMapViewOfFile                     = kernel32.NewProc("MapViewOfFile")
+	procUnmapViewOfFile                   = kernel32.NewProc("UnmapViewOfFile")
+	procVirtualQuery                      = kernel32.NewProc("VirtualQuery")
+	procGetLogicalProcessorInformationEx  = kernel32.NewProc("GetLogicalProcessorInformationEx")
+	procSetThreadAffinityMask             = kernel32.NewProc("SetThreadAffinityMask")
+	procGetCurrentThread                  = kernel32.NewProc("GetCurrentThread")
 )
 
 // memoryBasicInformation mirrors the Win32 MEMORY_BASIC_INFORMATION struct on
@@ -198,4 +201,110 @@ func closeShm(h ShmHandle, addr uintptr, size uint64) {
 // unlinkShm implementation for Windows.
 func unlinkShm(name string) {
 	// No-op on Windows
+}
+
+// ---------------------------------------------------------------------------
+// CPU affinity (opt-in; see AffinityMode in affinity.go).
+// ---------------------------------------------------------------------------
+
+const (
+	// LOGICAL_PROCESSOR_RELATIONSHIP value for the RelationCache enumeration.
+	relationCache = 2
+	// PROCESSOR_CACHE_TYPE value for CacheUnified.
+	cacheTypeUnified = 0
+)
+
+// enumerateCcxMasks returns one KAFFINITY mask per shared-L3 logical-processor
+// group reported by GetLogicalProcessorInformationEx(RelationCache). On
+// chiplet CPUs (Ryzen / Threadripper / Epyc) each mask covers the LPs of a
+// single CCX/CCD that share an L3 slice, so threads pinned to the same mask
+// see ~30-50ns intra-CCX cache coherency instead of ~80-100ns cross-CCD via
+// Infinity Fabric. Returns nil on systems that report no L3 (very old
+// Windows, constrained VMs); the caller must treat that as "affinity not
+// supported" and fall back to AffinityNone.
+//
+// SAFETY: the call returns the actual buffer length on the first probe and
+// re-uses that length on the populated call; passing a too-small buffer
+// receives ERROR_INSUFFICIENT_BUFFER (122) and is retried.
+func enumerateCcxMasks() []uint64 {
+	// Probe for the required buffer size.
+	var need uint32
+	procGetLogicalProcessorInformationEx.Call(uintptr(relationCache), 0, uintptr(unsafe.Pointer(&need)))
+	if need == 0 {
+		return nil
+	}
+	buf := make([]byte, need)
+	r1, _, _ := procGetLogicalProcessorInformationEx.Call(
+		uintptr(relationCache),
+		uintptr(unsafe.Pointer(&buf[0])),
+		uintptr(unsafe.Pointer(&need)),
+	)
+	if r1 == 0 {
+		return nil
+	}
+	// SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX is variable-size, Size at
+	// offset 4 gives the per-entry stride. For RelationCache the union
+	// member is CACHE_RELATIONSHIP, and Windows 10 1709 grew its
+	// Reserved field from DWORD Reserved[1] to BYTE Reserved[18] +
+	// WORD GroupCount + (union GroupMask | GroupMasks[]) so the
+	// GROUP_AFFINITY now starts at offset 32 within CACHE_RELATIONSHIP
+	// (offset 40 from the outer struct base):
+	//
+	//   DWORD Relationship            // outer +0  (4)
+	//   DWORD Size                    // outer +4  (4)
+	//   CACHE_RELATIONSHIP {          // outer +8
+	//     BYTE  Level                 // outer +8
+	//     BYTE  Associativity         // outer +9
+	//     WORD  LineSize              // outer +10
+	//     DWORD CacheSize             // outer +12
+	//     DWORD Type                  // outer +16 (PROCESSOR_CACHE_TYPE)
+	//     BYTE  Reserved[18]          // outer +20
+	//     WORD  GroupCount            // outer +38
+	//     GROUP_AFFINITY GroupMask:   // outer +40
+	//       KAFFINITY Mask            // outer +40 (8 on amd64)
+	//       WORD Group                // outer +48
+	//       WORD Reserved[3]          // outer +50
+	//   }
+	//
+	// We require a single-group entry (GroupCount==1) — multi-group
+	// (>64-LP partitions) is out of scope for the AffinityLocal trial.
+	var masks []uint64
+	off := uintptr(0)
+	for off < uintptr(need) {
+		rel := *(*uint32)(unsafe.Pointer(&buf[off]))
+		size := *(*uint32)(unsafe.Pointer(&buf[off+4]))
+		if rel == relationCache && size >= 56 { // need at least 1 GroupMask
+			level := buf[off+8]
+			cacheType := *(*uint32)(unsafe.Pointer(&buf[off+16]))
+			groupCount := *(*uint16)(unsafe.Pointer(&buf[off+38]))
+			if level == 3 && cacheType == cacheTypeUnified && groupCount == 1 {
+				mask := *(*uint64)(unsafe.Pointer(&buf[off+40]))
+				if mask != 0 {
+					masks = append(masks, mask)
+				}
+			}
+		}
+		if size == 0 {
+			// Defensive: stop on malformed entries rather than infinite-loop.
+			break
+		}
+		off += uintptr(size)
+	}
+	return masks
+}
+
+// pinCurrentThreadAffinity binds the current OS thread to the given LP mask
+// via SetThreadAffinityMask. Returns the previous mask (0 on failure). Caller
+// must runtime.LockOSThread() first to keep the goroutine on this thread —
+// otherwise the Go scheduler may migrate the goroutine to a different OS
+// thread that does not carry the new affinity. Mask 0 is treated as "no
+// change" rather than the Win32 "all LPs" interpretation, so we don't
+// silently widen affinity on a degenerate input.
+func pinCurrentThreadAffinity(mask uint64) uint64 {
+	if mask == 0 {
+		return 0
+	}
+	hThread, _, _ := procGetCurrentThread.Call()
+	prev, _, _ := procSetThreadAffinityMask.Call(hThread, uintptr(mask))
+	return uint64(prev)
 }

@@ -5,6 +5,8 @@
 #endif
 #include <windows.h>
 #include <string>
+#include <vector>
+#include <cstdint>
 
 typedef HANDLE EventHandle;
 typedef HANDLE ShmHandle;
@@ -229,6 +231,74 @@ public:
      */
     static int GetPid() {
         return (int)GetCurrentProcessId();
+    }
+
+    /**
+     * @brief Enumerates shared-L3 logical-processor masks.
+     *
+     * One KAFFINITY mask per L3 cache slice reported by
+     * GetLogicalProcessorInformationEx(RelationCache). On chiplet CPUs
+     * (Ryzen / Threadripper / Epyc) each entry covers the LPs of one
+     * CCX / CCD that share an L3 slice — pinning host worker thread N
+     * and the matching guest goroutine to the same mask co-locates the
+     * SlotHeader cache traffic in one L3 region, eliminating cross-CCD
+     * Infinity Fabric bounces.
+     *
+     * Returns an empty vector when no L3 cache is reported (very old
+     * Windows or constrained VM); callers should treat that as
+     * "affinity unsupported" and fall through to no pinning.
+     *
+     * @note Layout note: the GROUP_AFFINITY inside CACHE_RELATIONSHIP
+     *       moved to offset 32 (40 from the outer struct base) after
+     *       Windows 10 1709 (Reserved grew to BYTE[18] + GroupCount).
+     *       This implementation requires single-group entries
+     *       (GroupCount == 1) — multi-group >64-LP partitions are out
+     *       of scope for the AffinityLocal trial.
+     */
+    static std::vector<uint64_t> EnumerateCcxMasks() {
+        std::vector<uint64_t> masks;
+        DWORD need = 0;
+        GetLogicalProcessorInformationEx(RelationCache, nullptr, &need);
+        if (need == 0) return masks;
+        std::vector<uint8_t> buffer(need);
+        if (!GetLogicalProcessorInformationEx(
+                RelationCache,
+                reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data()),
+                &need)) {
+            return masks;
+        }
+        size_t off = 0;
+        while (off + 8 <= need) {
+            uint8_t* p = buffer.data() + off;
+            uint32_t rel  = *reinterpret_cast<uint32_t*>(p + 0);
+            uint32_t size = *reinterpret_cast<uint32_t*>(p + 4);
+            if (size == 0) break; // malformed entry
+            if (rel == RelationCache && size >= 56 && off + size <= need) {
+                uint8_t level = p[8];
+                uint32_t cacheType = *reinterpret_cast<uint32_t*>(p + 16);
+                uint16_t groupCount = *reinterpret_cast<uint16_t*>(p + 38);
+                // PROCESSOR_CACHE_TYPE::CacheUnified == 0
+                if (level == 3 && cacheType == 0 && groupCount == 1) {
+                    uint64_t mask = *reinterpret_cast<uint64_t*>(p + 40);
+                    if (mask != 0) masks.push_back(mask);
+                }
+            }
+            off += size;
+        }
+        return masks;
+    }
+
+    /**
+     * @brief Pins the current thread to the given LP mask.
+     *
+     * Returns the previous affinity mask (0 on failure). Caller should
+     * skip the call when mask == 0 to avoid the Win32 "all LPs"
+     * silent-widening interpretation.
+     */
+    static uint64_t PinCurrentThreadAffinity(uint64_t mask) {
+        if (mask == 0) return 0;
+        DWORD_PTR prev = SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR)mask);
+        return (uint64_t)prev;
     }
 
     /**
