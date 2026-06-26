@@ -16,6 +16,14 @@ type ClientConfig struct {
 	// RetryInterval is the interval between connection attempts.
 	// Default: 100 milliseconds.
 	RetryInterval time.Duration
+	// AffinityMode controls per-slot worker goroutine CPU placement.
+	// Default AffinityNone preserves backward-compatible OS-scheduler
+	// behaviour. AffinityLocal pins each worker to the CCX (shared-L3
+	// LP set) at index `slotIdx % numCCX` — see affinity.go. Opt-in
+	// because the underlying GetLogicalProcessorInformationEx /
+	// SetThreadAffinityMask coupling is best validated on the actual
+	// production host before being relied on.
+	AffinityMode AffinityMode
 }
 
 // Client is the high-level API for the Guest side of the IPC.
@@ -52,6 +60,7 @@ func Connect(config ClientConfig) (*Client, error) {
 		g, err = NewDirectGuest(config.ShmName)
 
 		if err == nil {
+			g.affinityMode = config.AffinityMode
 			return &Client{guest: g}, nil
 		}
 

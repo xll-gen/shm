@@ -227,6 +227,12 @@ type DirectGuest struct {
 	// and tries TryReclaimAbandonedSlot with this threshold. Zero
 	// (default) disables auto-reclaim — opt-in for safety.
 	autoReclaimTimeoutNs uint64
+
+	// v0.8.0-alpha: opt-in CPU affinity for worker goroutines. Default
+	// AffinityNone preserves OS-scheduler behaviour. AffinityLocal pins
+	// each slot's worker goroutine to the CCX (shared-L3 LP set) at
+	// index `idx % numCCX`. See affinity.go.
+	affinityMode AffinityMode
 }
 
 // NewDirectGuest initializes the DirectGuest by attaching to an existing shared memory region.
@@ -919,6 +925,16 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, buffer []byte, msgType 
 // workerLoop is the main loop for a single slot worker.
 func (g *DirectGuest) workerLoop(idx int, handler func([]byte, []byte, MsgType) (int32, MsgType)) {
 	defer g.wg.Done()
+
+	// Opt-in CPU affinity (see affinity.go). No-op for AffinityNone, which
+	// is the backward-compatible default. Pinning happens BEFORE the spin
+	// loop so the affinity mask is in effect for every iteration the
+	// goroutine runs. We deliberately do NOT pair this with
+	// runtime.UnlockOSThread on exit — releasing would let a residual
+	// goroutine migrate during shutdown, which is moot for exiting
+	// workers but matches the §Exp 5 lesson that LockOSThread without a
+	// target LP set is the failure mode, not LockOSThread itself.
+	pinSlotWorker(idx, g.affinityMode)
 
 	for {
 		if atomic.LoadInt32(&g.closing) == 1 {
