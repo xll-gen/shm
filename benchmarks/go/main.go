@@ -25,7 +25,7 @@ var (
 	memProfile    = flag.String("memprofile", "", "Write memory profile to file")
 	guestCallMode = flag.Bool("guest-call", false, "Enable Guest Call benchmark mode")
 	streamMode    = flag.Bool("stream", false, "Enable Stream benchmark mode")
-	affinityFlag  = flag.String("affinity", "none", "Worker affinity mode: none | local")
+	affinityFlag  = flag.String("affinity", "auto", "Worker affinity mode: auto | none | local")
 )
 
 func main() {
@@ -51,12 +51,14 @@ func main() {
 	// High-level Client API
 	var affinityMode shm.AffinityMode
 	switch *affinityFlag {
-	case "none", "":
+	case "auto", "":
+		affinityMode = shm.AffinityAuto
+	case "none":
 		affinityMode = shm.AffinityNone
 	case "local":
 		affinityMode = shm.AffinityLocal
 	default:
-		log.Fatalf("unknown -affinity value %q (use 'none' or 'local')", *affinityFlag)
+		log.Fatalf("unknown -affinity value %q (use 'auto', 'none', or 'local')", *affinityFlag)
 	}
 	masks := shm.CcxMasks()
 	fmt.Printf("  Affinity: %s (CCXs detected: %d)\n", affinityMode, len(masks))

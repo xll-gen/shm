@@ -25,9 +25,10 @@ bool GUEST_CALL_MODE = false;
 bool STREAM_MODE = false;
 int IN_FLIGHT = 0; // 0 = mode-default (stream: 4, normal: 1). Set via -i <n>.
 // AffinityMode (mirrors Go's affinity.go enum):
-//   0 = none   (default, OS scheduler decides)
-//   1 = local  (pin worker thread N to CCX[N % numCCX] — shared-L3 region)
-// Set via --affinity local | none.
+//   0 = auto   (default; pin to CCX[N % numCCX] iff multi-CCX, else no-op)
+//   1 = none   (explicit off)
+//   2 = local  (force pin even on monolithic-L3 hosts)
+// Set via --affinity auto | none | local.
 int AFFINITY_MODE = 0;
 
 struct BenchmarkStats {
@@ -63,17 +64,24 @@ std::string FormatNumber(double n) {
 }
 
 void WorkerThread(DirectHost* host, int id, int totalSlots) {
-    // Opt-in CPU affinity: pin this host worker thread to the same CCX
-    // (shared-L3 LP set) that the corresponding guest worker pins to,
-    // via a deterministic slot-index round-robin mapping. Co-locating
-    // the host/guest pair on one L3 region eliminates the cross-CCD
-    // Infinity Fabric bounce on every state-line transition (Ryzen
-    // 3900X: ~80-100ns -> ~30-50ns per bounce on Zen 2). PAUSE-every-iter
-    // handles the same-physical-core SMT-sibling case if the OS
-    // scheduler happens to place us there inside the CCX mask.
-    if (AFFINITY_MODE == 1) {
+    // CPU affinity: pin this host worker thread to the same CCX (shared-L3
+    // LP set) that the corresponding guest worker pins to, via a
+    // deterministic slot-index round-robin mapping. Co-locating the host
+    // and guest on one L3 region eliminates the cross-CCD Infinity Fabric
+    // bounce on every state-line transition (Ryzen 3900X: ~80-100ns ->
+    // ~30-50ns per bounce on Zen 2). PAUSE-every-iter handles the same-
+    // physical-core SMT-sibling case if the OS scheduler places us there
+    // inside the CCX mask.
+    //
+    // Mode semantics (mirror Go's affinity.go):
+    //   0 = auto:  pin iff multi-CCX (chiplet AMD, multi-socket Xeon).
+    //              Skip on monolithic-L3 hosts (most single-socket Intel
+    //              desktops) where same-as-all-LPs mask adds no value.
+    //   1 = none:  explicit opt-out.
+    //   2 = local: force pin even with len(masks)==1.
+    if (AFFINITY_MODE != 1) {
         auto masks = shm::Platform::EnumerateCcxMasks();
-        if (!masks.empty()) {
+        if (!masks.empty() && !(AFFINITY_MODE == 0 && masks.size() <= 1)) {
             shm::Platform::PinCurrentThreadAffinity(masks[id % masks.size()]);
         }
     }
@@ -199,7 +207,7 @@ int main(int argc, char** argv) {
             std::cout << "  -c <bytes>      Chunk size for Stream Mode (default: 4096)." << std::endl;
             std::cout << "  -d <seconds>    Duration in seconds (default: 10)" << std::endl;
             std::cout << "  -i <n>          In-flight chunks per stream worker (default: 4 in stream mode, 1 otherwise)" << std::endl;
-            std::cout << "  --affinity <m>  Worker thread CPU affinity: none | local (default: none)" << std::endl;
+            std::cout << "  --affinity <m>  Worker thread CPU affinity: auto | none | local (default: auto)" << std::endl;
             std::cout << "  -v              Verbose logging" << std::endl;
             std::cout << "  --name <name>   SHM Name (default: SimpleIPC)" << std::endl;
             std::cout << "  --guest-call    Enable Guest Call mode" << std::endl;
@@ -213,9 +221,10 @@ int main(int argc, char** argv) {
         if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) IN_FLIGHT = atoi(argv[++i]);
         if (strcmp(argv[i], "--affinity") == 0 && i + 1 < argc) {
             const char* m = argv[++i];
-            if (strcmp(m, "local") == 0) AFFINITY_MODE = 1;
-            else if (strcmp(m, "none") == 0) AFFINITY_MODE = 0;
-            else { std::cerr << "Unknown --affinity value: " << m << " (use 'none' or 'local')\n"; return 1; }
+            if (strcmp(m, "auto") == 0) AFFINITY_MODE = 0;
+            else if (strcmp(m, "none") == 0) AFFINITY_MODE = 1;
+            else if (strcmp(m, "local") == 0) AFFINITY_MODE = 2;
+            else { std::cerr << "Unknown --affinity value: " << m << " (use 'auto', 'none', or 'local')\n"; return 1; }
         }
         if (strcmp(argv[i], "-v") == 0) VERBOSE = true;
         if (strcmp(argv[i], "--name") == 0 && i + 1 < argc) SHM_NAME = argv[++i];
@@ -248,7 +257,8 @@ int main(int argc, char** argv) {
     std::cout << "  Guest Call Mode: " << (GUEST_CALL_MODE ? "Enabled" : "Disabled") << std::endl;
     {
         auto masks = shm::Platform::EnumerateCcxMasks();
-        const char* modeLabel = (AFFINITY_MODE == 1) ? "local" : "none";
+        const char* modeLabel = (AFFINITY_MODE == 0) ? "auto" :
+                                (AFFINITY_MODE == 1) ? "none" : "local";
         std::cout << "  Affinity: " << modeLabel
                   << " (CCXs detected: " << masks.size() << ")" << std::endl;
     }

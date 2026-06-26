@@ -38,13 +38,16 @@ param(
     # 0 = let main.cpp pick the mode default (stream=4, normal=1). Set to 1
     # to reproduce the pre-v0.7.12 serialized-chunk numbers.
     [int]$InFlight = 0,
-    # Worker CPU affinity mode. 'none' = OS scheduler decides (default,
-    # backward-compatible). 'local' = pin slot-N's host worker thread and
-    # Go guest goroutine to the same CCX (shared-L3 LP set) at index
-    # `N % numCCX`. On chiplet CPUs (Ryzen / Threadripper / Epyc) co-locates
-    # the pair on one L3 region, removing cross-CCD Infinity Fabric bounces.
-    [ValidateSet('none','local')]
-    [string]$Affinity = 'none',
+    # Worker CPU affinity mode.
+    #   'auto'  (default) — pin slot-N's host worker thread and Go guest
+    #                       goroutine to CCX[N % numCCX] WHEN the host
+    #                       reports >1 shared-L3 group (chiplet AMD,
+    #                       multi-socket Xeon). No-op on monolithic-L3
+    #                       hosts (most single-socket Intel desktops).
+    #   'none'            — explicit OS-scheduler-decides.
+    #   'local'           — force CCX pin even on monolithic-L3.
+    [ValidateSet('auto','none','local')]
+    [string]$Affinity = 'auto',
 
     [string]$OutDir,
     [string]$ShmName = 'SimpleIPC',

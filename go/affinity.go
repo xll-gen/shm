@@ -6,16 +6,21 @@ import (
 )
 
 // AffinityMode selects how worker goroutines bind themselves to physical CPU
-// resources. It is an opt-in client/host config field; the default zero
-// value (AffinityNone) preserves backward-compatible OS-scheduler behaviour.
+// resources. The zero value (AffinityAuto) applies CCX-aware pinning
+// automatically when the host topology benefits — chiplet CPUs (Ryzen /
+// Threadripper / Epyc) and multi-socket Xeon — and is a no-op on
+// monolithic-L3 systems (most single-socket Intel desktops, single-CCX
+// Zen parts, constrained VMs). Set AffinityNone for explicit opt-out.
 //
-// On chiplet CPUs (Zen 2 / 3 / 4 / Threadripper / Epyc) the dominant
-// 64-byte ping-pong cost between host and guest is the cross-CCD cache-line
-// bounce (~80-100ns) traversing Infinity Fabric. Pinning the host worker
-// thread and guest worker goroutine for the same slot index to the SAME
-// CCX (shared L3) reduces that to ~30-50ns intra-CCX coherency, which can
-// substantially improve multi-thread scaling efficiency in the benchmark
-// matrix.
+// On chiplet CPUs the dominant 64-byte ping-pong cost between host and
+// guest is the cross-CCD cache-line bounce (~80-100ns) traversing
+// Infinity Fabric. Pinning the host worker thread and guest worker
+// goroutine for the same slot index to the SAME CCX (shared L3) reduces
+// that to ~30-50ns intra-CCX coherency. On Ryzen 9 3900X measurements
+// showed +25-57% multi-thread throughput. On monolithic-L3 Intel single-
+// socket systems Auto becomes a no-op (CcxMasks() returns one mask
+// covering all LPs, which has no coherency benefit), so callers see no
+// regression.
 //
 // SMT-sibling collision risk: AffinityLocal pins to a whole CCX mask (3+
 // physical cores × 2 SMT siblings), so the OS scheduler chooses within the
@@ -26,19 +31,34 @@ import (
 type AffinityMode int
 
 const (
-	// AffinityNone — no pinning; the OS scheduler decides placement.
-	// Backward-compatible default.
-	AffinityNone AffinityMode = 0
-	// AffinityLocal — pin each worker goroutine to the CCX (shared-L3
-	// group) at index `slotIdx % len(EnumerateCcxMasks())`. Two slots N
-	// and N+numCCX land on the same CCX. A host and guest that follow
-	// the same deterministic mapping co-locate on the same L3 region.
-	AffinityLocal AffinityMode = 1
+	// AffinityAuto — default (zero value). Apply AffinityLocal pinning
+	// when the host topology reports >1 shared-L3 group (chiplet CPUs,
+	// multi-socket Xeon); fall through to no pinning on monolithic-L3
+	// systems where LockOSThread + same-as-all-LPs mask would add
+	// runtime overhead without coherency benefit. New in v0.8.1: pre-
+	// v0.8.1 the zero value was AffinityNone-equivalent; this default-
+	// enable is backward-compatible on Intel single-socket hosts
+	// (no-op) and unlocks the chiplet win on AMD by default.
+	AffinityAuto AffinityMode = 0
+	// AffinityNone — explicit opt-out; no pinning regardless of
+	// topology. Use when the caller wants to manage thread placement
+	// itself (e.g. via SetProcessAffinityMask before spawning).
+	AffinityNone AffinityMode = 1
+	// AffinityLocal — force CCX-mask pinning even on monolithic-L3
+	// systems. On a single-CCX host this still calls LockOSThread +
+	// SetThreadAffinityMask(allLPs), which prevents Go-scheduler
+	// migration but does not constrain LP placement. Useful when the
+	// caller wants the deterministic-placement property of pinning
+	// for reasons beyond coherency (e.g. cross-NUMA-node guarding on
+	// hardware that reports a single L3 per socket).
+	AffinityLocal AffinityMode = 2
 )
 
 // String returns a short label for diagnostics / logging.
 func (m AffinityMode) String() string {
 	switch m {
+	case AffinityAuto:
+		return "auto"
 	case AffinityNone:
 		return "none"
 	case AffinityLocal:
@@ -68,8 +88,17 @@ func CcxMasks() []uint64 {
 
 // affinityMaskForSlot computes the LP mask a worker for the given slot
 // index should bind to under the given AffinityMode. Returns 0 when no
-// pinning should occur (AffinityNone, empty CCX list, or any future
-// degenerate mode).
+// pinning should occur:
+//   - AffinityNone (explicit opt-out)
+//   - empty CCX list (topology unavailable)
+//   - AffinityAuto with len(masks) <= 1 (monolithic-L3 Intel desktop /
+//     single-CCX Zen / constrained VM — no coherency benefit, so we skip
+//     the LockOSThread + syscall to avoid the small runtime cost)
+//
+// AffinityLocal forces the pin even when len(masks) == 1; in that case
+// the worker is bound to the single all-LP mask, which is a no-op for
+// LP selection but still calls LockOSThread (deliberate — caller asked
+// for explicit Local).
 func affinityMaskForSlot(slotIdx int, mode AffinityMode) uint64 {
 	if mode == AffinityNone {
 		return 0
@@ -78,10 +107,11 @@ func affinityMaskForSlot(slotIdx int, mode AffinityMode) uint64 {
 	if len(masks) == 0 {
 		return 0
 	}
-	if mode == AffinityLocal {
-		return masks[slotIdx%len(masks)]
+	if mode == AffinityAuto && len(masks) <= 1 {
+		return 0
 	}
-	return 0
+	// AffinityAuto with multi-CCX, OR explicit AffinityLocal.
+	return masks[slotIdx%len(masks)]
 }
 
 // pinSlotWorker is the canonical worker-side entry point invoked by every
