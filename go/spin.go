@@ -48,13 +48,39 @@ const (
 // recordIters writes are no-ops unless the package is built with
 // `-tags shm_benchstats` (see spin_stats_on.go / spin_stats_off.go). The
 // production Direct-Exchange hot path therefore performs zero atomic adds on
-// these three adjacent (single-cache-line) counters; the benchmark harness
-// passes the tag to get real numbers.
+// these counters; the benchmark harness passes the tag to get real numbers.
+//
+// 2026-06-26 cache-line isolation: previously the three counters were declared
+// as adjacent `uint64` vars, which the linker packs into one 64-byte cache
+// line. Under `-tags shm_benchstats` with N>=4 guest goroutines, every RTT
+// fired `atomic.AddUint64` on two of them (recordSpinSuccess + recordIters),
+// ping-ponging the shared line across all participating cores. The
+// instrumentation itself was the bottleneck the bench tried to characterise.
+// The counters now live in `paddedU64` structs, each exactly one cache line,
+// so the three hot atomic adds touch three distinct lines.
+type paddedU64 struct {
+	v   uint64
+	_   [56]byte // pad to 64-byte cache line (uint64 = 8B + 56B tail = 64B)
+}
+
 var (
-	WaitStatsSpinSuccess   uint64
-	WaitStatsSleepFallback uint64
-	WaitStatsIterCount     uint64
+	waitStatsSpinSuccess   paddedU64
+	waitStatsSleepFallback paddedU64
+	waitStatsIterCount     paddedU64
 )
+
+// WaitStatsSpinSuccess returns the count of spin loops that resolved within
+// the adaptive limit (i.e. the condition became true before the OS-wait
+// fallback fired). Atomic-safe; returns 0 in builds without `-tags shm_benchstats`.
+func WaitStatsSpinSuccess() uint64 { return atomic.LoadUint64(&waitStatsSpinSuccess.v) }
+
+// WaitStatsSleepFallback returns the count of waits that exhausted the spin
+// window and fell through to the OS-wait sleepAction.
+func WaitStatsSleepFallback() uint64 { return atomic.LoadUint64(&waitStatsSleepFallback.v) }
+
+// WaitStatsIterCount returns the total spin iterations accumulated across all
+// resolved waits. Combined with WaitStatsSpinSuccess gives AvgItersPerSpin.
+func WaitStatsIterCount() uint64 { return atomic.LoadUint64(&waitStatsIterCount.v) }
 
 // WaitStrategy is the single adaptive spin/sleep strategy used by Direct
 // Exchange slots. It exposes only CurrentLimit for diagnostics; do not poke at
