@@ -34,6 +34,10 @@ param(
     [ValidateSet('normal', 'stream', 'guest-call')]
     [string]$Mode = 'normal',
     [int]$ChunkSize = 4096,
+    # In-flight chunks per stream worker (StreamSender pipelining depth).
+    # 0 = let main.cpp pick the mode default (stream=4, normal=1). Set to 1
+    # to reproduce the pre-v0.7.12 serialized-chunk numbers.
+    [int]$InFlight = 0,
 
     [string]$OutDir,
     [string]$ShmName = 'SimpleIPC',
@@ -302,6 +306,7 @@ function Invoke-Case {
     $clientArgs = @('-t', $ThreadCount, '-s', $PayloadSize, '-d', $Duration, '--name', $ShmName)
     if ($Mode -eq 'stream')     { $clientArgs += @('--stream', '-c', $ChunkSize) }
     if ($Mode -eq 'guest-call') { $clientArgs += '--guest-call' }
+    if ($InFlight -gt 0)        { $clientArgs += @('-i', $InFlight) }
     if ($VerboseRun)            { $clientArgs += '-v' }
 
     $client = Start-Process -FilePath $CppBinaryResolved `
@@ -355,7 +360,8 @@ $startedAt = Get-Date
 Write-Host ""
 Write-Host "[Harness] Repo:    $RepoRoot"
 Write-Host "[Harness] OutDir:  $OutDir"
-Write-Host "[Harness] Matrix:  threads=$($Threads -join ',') payloads=$($Payloads -join ',') mode=$Mode duration=${Duration}s repeats=$Repeats (total=$total)"
+$inFlightLabel = if ($InFlight -gt 0) { "inFlight=$InFlight" } else { "inFlight=mode-default" }
+Write-Host "[Harness] Matrix:  threads=$($Threads -join ',') payloads=$($Payloads -join ',') mode=$Mode duration=${Duration}s repeats=$Repeats $inFlightLabel (total=$total)"
 if ($HighPriority) { Write-Host "[Harness] HighPriority: ON (process priority HIGH, Ultimate/High power plan)" }
 Write-Host ""
 
