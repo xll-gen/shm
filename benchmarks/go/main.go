@@ -25,6 +25,7 @@ var (
 	memProfile    = flag.String("memprofile", "", "Write memory profile to file")
 	guestCallMode = flag.Bool("guest-call", false, "Enable Guest Call benchmark mode")
 	streamMode    = flag.Bool("stream", false, "Enable Stream benchmark mode")
+	affinityFlag  = flag.String("affinity", "none", "Worker affinity mode: none | local")
 )
 
 func main() {
@@ -48,10 +49,23 @@ func main() {
 	fmt.Printf("  Stream Mode: %v\n", *streamMode)
 
 	// High-level Client API
+	var affinityMode shm.AffinityMode
+	switch *affinityFlag {
+	case "none", "":
+		affinityMode = shm.AffinityNone
+	case "local":
+		affinityMode = shm.AffinityLocal
+	default:
+		log.Fatalf("unknown -affinity value %q (use 'none' or 'local')", *affinityFlag)
+	}
+	masks := shm.CcxMasks()
+	fmt.Printf("  Affinity: %s (CCXs detected: %d)\n", affinityMode, len(masks))
+
 	client, err := shm.Connect(shm.ClientConfig{
 		ShmName:           *shmName,
 		ConnectionTimeout: 30 * time.Second,
 		RetryInterval:     100 * time.Millisecond,
+		AffinityMode:      affinityMode,
 	})
 	if err != nil {
 		log.Fatalf("Failed to connect to SHM: %v", err)

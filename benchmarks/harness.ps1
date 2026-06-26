@@ -38,6 +38,13 @@ param(
     # 0 = let main.cpp pick the mode default (stream=4, normal=1). Set to 1
     # to reproduce the pre-v0.7.12 serialized-chunk numbers.
     [int]$InFlight = 0,
+    # Worker CPU affinity mode. 'none' = OS scheduler decides (default,
+    # backward-compatible). 'local' = pin slot-N's host worker thread and
+    # Go guest goroutine to the same CCX (shared-L3 LP set) at index
+    # `N % numCCX`. On chiplet CPUs (Ryzen / Threadripper / Epyc) co-locates
+    # the pair on one L3 region, removing cross-CCD Infinity Fabric bounces.
+    [ValidateSet('none','local')]
+    [string]$Affinity = 'none',
 
     [string]$OutDir,
     [string]$ShmName = 'SimpleIPC',
@@ -287,7 +294,7 @@ function Invoke-Case {
     Stop-Stragglers
 
     # Start Go server
-    $serverArgs = @('-w', $ThreadCount, '-name', $ShmName)
+    $serverArgs = @('-w', $ThreadCount, '-name', $ShmName, '-affinity', $Affinity)
     if ($Mode -eq 'stream')     { $serverArgs += '-stream' }
     if ($Mode -eq 'guest-call') { $serverArgs += '-guest-call' }
     if ($VerboseRun)            { $serverArgs += '-v' }
@@ -303,7 +310,7 @@ function Invoke-Case {
     Start-Sleep -Seconds $StartupSeconds
 
     # Start C++ client
-    $clientArgs = @('-t', $ThreadCount, '-s', $PayloadSize, '-d', $Duration, '--name', $ShmName)
+    $clientArgs = @('-t', $ThreadCount, '-s', $PayloadSize, '-d', $Duration, '--name', $ShmName, '--affinity', $Affinity)
     if ($Mode -eq 'stream')     { $clientArgs += @('--stream', '-c', $ChunkSize) }
     if ($Mode -eq 'guest-call') { $clientArgs += '--guest-call' }
     if ($InFlight -gt 0)        { $clientArgs += @('-i', $InFlight) }
@@ -361,7 +368,7 @@ Write-Host ""
 Write-Host "[Harness] Repo:    $RepoRoot"
 Write-Host "[Harness] OutDir:  $OutDir"
 $inFlightLabel = if ($InFlight -gt 0) { "inFlight=$InFlight" } else { "inFlight=mode-default" }
-Write-Host "[Harness] Matrix:  threads=$($Threads -join ',') payloads=$($Payloads -join ',') mode=$Mode duration=${Duration}s repeats=$Repeats $inFlightLabel (total=$total)"
+Write-Host "[Harness] Matrix:  threads=$($Threads -join ',') payloads=$($Payloads -join ',') mode=$Mode duration=${Duration}s repeats=$Repeats $inFlightLabel affinity=$Affinity (total=$total)"
 if ($HighPriority) { Write-Host "[Harness] HighPriority: ON (process priority HIGH, Ultimate/High power plan)" }
 Write-Host ""
 
