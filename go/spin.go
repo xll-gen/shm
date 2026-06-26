@@ -16,6 +16,13 @@ const waitStrategyAsmChunk uintptr = 4096
 // one strategy is used by every Direct Exchange slot, host and guest alike.
 // If a new workload demands different tuning, change the constants here,
 // re-run benchmarks/harness.ps1, and update EXPERIMENTS.md.
+//
+// NOTE: a time-based-calibration variant of these constants (measure per-iter
+// PAUSE cost at init, express the window in wall-clock time) was prototyped and
+// benchmarked on an 8-LP VM (see IMPROVEMENT_BACKLOG.md "스핀 전략 튜닝"). A
+// ~200µs target regressed throughput up to −65%; a ~3ms target merely tied
+// these fixed constants. Net null/negative on the only host tested, so the
+// fixed iteration counts stand.
 const (
 	// Spin window is sized to bridge the typical Direct Exchange inter-request
 	// gap on a non-oversubscribed system. kMaxSpin × per-iter cost (~2–5 ns on

@@ -313,16 +313,13 @@ int main(int argc, char** argv) {
     std::cout << "  Avg Latency:    " << std::fixed << std::setprecision(2) << avgLat << " us" << std::endl;
     std::cout << "  Errors:         " << FormatNumber(totalErr) << std::endl;
 
-    uint64_t hostSpin  = shm::WaitStrategyStats::SpinSuccess().load();
-    uint64_t hostSleep = shm::WaitStrategyStats::SleepFallback().load();
-    uint64_t hostTotal = hostSpin + hostSleep;
-    double sleepPct = hostTotal > 0 ? (100.0 * (double)hostSleep / (double)hostTotal) : 0.0;
-    uint64_t hostIters = shm::WaitStrategyStats::IterCount().load();
-    double avgIters = hostSpin > 0 ? (double)hostIters / (double)hostSpin : 0.0;
-    std::cout << "  [HostWS] SpinSuccess:   " << FormatNumber(hostSpin) << std::endl;
-    std::cout << "  [HostWS] SleepFallback: " << FormatNumber(hostSleep)
-              << " (" << std::fixed << std::setprecision(2) << sleepPct << "%)" << std::endl;
-    std::cout << "  [HostWS] AvgItersPerSpin: " << std::fixed << std::setprecision(1) << avgIters << std::endl;
+    // NOTE: the host-side [HostWS] spin-stats diagnostic that used to print here
+    // referenced shm::WaitStrategyStats, which no longer exists in
+    // include/shm/WaitStrategy.h (the C++ host WaitStrategy is a header-only
+    // class with no global counters — the Go side likewise gates its WaitStats
+    // behind the shm_benchstats build tag). The block was dropped to unblock the
+    // benchmark build; throughput/latency above are unaffected. See
+    // IMPROVEMENT_BACKLOG.md (shm benchmark drift).
 
     return 0;
 }
