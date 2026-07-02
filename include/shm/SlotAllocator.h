@@ -182,6 +182,57 @@ public:
     }
 
     /**
+     * @brief Claim slot @p s for a new Host transaction (state -> SLOT_BUSY).
+     *
+     * Handles a free slot and the zombie-steal case (a non-FREE slot with no
+     * local active waiter — a stale REQ/RESP/GUEST_BUSY a peer abandoned). The
+     * zombie steal uses the §3.6.1 generation CAS handshake, exactly as
+     * TryReclaimAbandonedSlot and the Go guest-side tryClaimGuestSlot do:
+     * snapshot `gen` BEFORE observing `state`, then win the exclusive right to
+     * recycle the slot via compare_exchange(gen, gen+1). Because every claim
+     * path bumps `gen` before its state CAS, a concurrent legitimate claim that
+     * recycled the zombie across generations (state cycles back to the SAME
+     * observed value under a fresh transaction) advances `gen` and makes this
+     * CAS fail, so the stealer yields instead of CAS-stealing a live
+     * transaction's response. A free-slot claim needs no handshake (SLOT_FREE
+     * is unambiguous) and keeps the plain fetch_add bump; racers on a free slot
+     * arbitrate on the state CAS itself.
+     *
+     * @return true on success (state left at SLOT_BUSY, lease refreshed).
+     */
+    bool tryClaimSlot(Slot& s) {
+        // Snapshot gen BEFORE the state load: a recycle republishes the same
+        // observed state under a fresh gen, so a snapshot taken after the state
+        // load could already reflect the fresh transaction and the CAS would
+        // wrongly succeed against it.
+        uint64_t genObserved = s.header->gen.load(std::memory_order_acquire);
+        uint32_t current = s.header->state.load(std::memory_order_acquire);
+
+        if (current == SLOT_FREE) {
+            s.header->gen.fetch_add(1, std::memory_order_acq_rel);
+            if (s.header->state.compare_exchange_strong(current, SLOT_BUSY, std::memory_order_acquire)) {
+                s.header->lease.store(Platform::MonotonicNanos(), std::memory_order_release);
+                return true;
+            }
+            return false;
+        }
+
+        if ((current == SLOT_RESP_READY || current == SLOT_REQ_READY || current == SLOT_GUEST_BUSY)
+                && !s.activeWait.load(std::memory_order_acquire)) {
+            // Zombie steal: win the recycle right via the gen CAS handshake
+            // (§3.6.1) BEFORE the state CAS, so a concurrent legitimate claim
+            // is detected (gen changed) and we yield.
+            if (s.header->gen.compare_exchange_strong(genObserved, genObserved + 1, std::memory_order_acq_rel)) {
+                if (s.header->state.compare_exchange_strong(current, SLOT_BUSY, std::memory_order_acquire)) {
+                    s.header->lease.store(Platform::MonotonicNanos(), std::memory_order_release);
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
      * @brief Acquires a free slot for Zero-Copy usage.
      * @return The index of the acquired slot, or -1 if not running.
      */
@@ -194,26 +245,9 @@ public:
 
         if (cachedSlotIdx < numSlots) {
             Slot& s = slots[cachedSlotIdx];
-            uint32_t current = s.header->state.load(std::memory_order_acquire);
-            bool canClaim = (current == SLOT_FREE);
-            if (!canClaim) {
-                 if (current == SLOT_RESP_READY || current == SLOT_REQ_READY || current == SLOT_GUEST_BUSY) {
-                      if (!s.activeWait.load(std::memory_order_acquire)) {
-                          canClaim = true;
-                      }
-                 }
-            }
-
-            if (canClaim) {
-                // Bump the claim generation BEFORE the claiming CAS so a
-                // concurrent reclaimer's generation handshake sees the
-                // in-flight claim (SPECIFICATION.md §3.6.1).
-                s.header->gen.fetch_add(1, std::memory_order_acq_rel);
-                if (s.header->state.compare_exchange_strong(current, SLOT_BUSY, std::memory_order_acquire)) {
-                    s.header->lease.store(Platform::MonotonicNanos(), std::memory_order_release);
-                    slot = &s;
-                    resultIdx = (int32_t)cachedSlotIdx;
-                }
+            if (tryClaimSlot(s)) {
+                slot = &s;
+                resultIdx = (int32_t)cachedSlotIdx;
             }
         }
 
@@ -238,26 +272,11 @@ public:
 
             while (true) {
                 Slot& s = slots[idx];
-                uint32_t current = s.header->state.load(std::memory_order_acquire);
-                bool canClaim = (current == SLOT_FREE);
-                if (!canClaim) {
-                     if (current == SLOT_RESP_READY || current == SLOT_REQ_READY || current == SLOT_GUEST_BUSY) {
-                          if (!s.activeWait.load(std::memory_order_acquire)) {
-                              canClaim = true;
-                          }
-                     }
-                }
-
-                if (canClaim) {
-                    // §3.6.1: bump generation before the claiming CAS.
-                    s.header->gen.fetch_add(1, std::memory_order_acq_rel);
-                    if (s.header->state.compare_exchange_strong(current, SLOT_BUSY, std::memory_order_acquire)) {
-                        s.header->lease.store(Platform::MonotonicNanos(), std::memory_order_release);
-                        slot = &s;
-                        cachedSlotIdx = idx;
-                        resultIdx = (int32_t)idx;
-                        break;
-                    }
+                if (tryClaimSlot(s)) {
+                    slot = &s;
+                    cachedSlotIdx = idx;
+                    resultIdx = (int32_t)idx;
+                    break;
                 }
                 idx++;
                 if (idx >= numSlots) {
@@ -320,21 +339,8 @@ public:
         int retries = 0;
 
         while(true) {
-             uint32_t current = slot->header->state.load(std::memory_order_acquire);
-             bool canClaim = (current == SLOT_FREE);
-             if (!canClaim && (current == SLOT_RESP_READY || current == SLOT_REQ_READY)) {
-                  if (!slot->activeWait.load(std::memory_order_acquire)) {
-                      canClaim = true;
-                  }
-             }
-
-             if (canClaim) {
-                 // §3.6.1: bump generation before the claiming CAS.
-                 slot->header->gen.fetch_add(1, std::memory_order_acq_rel);
-                 if (slot->header->state.compare_exchange_strong(current, SLOT_BUSY, std::memory_order_acquire)) {
-                     slot->header->lease.store(Platform::MonotonicNanos(), std::memory_order_release);
-                     break;
-                 }
+             if (tryClaimSlot(*slot)) {
+                 break;
              }
 
              Platform::CpuRelax();

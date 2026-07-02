@@ -42,8 +42,10 @@ func (s *GuestSlot) ResponseBuffer() []byte {
 // Send signals the Host to process the request currently in the RequestBuffer.
 //
 // size: The size of the data written.
-//       Positive: Data starts at index 0.
-//       Negative: Data ends at the end of the buffer (End-Aligned).
+//
+//	Positive: Data starts at index 0.
+//	Negative: Data ends at the end of the buffer (End-Aligned).
+//
 // msgType: The message type.
 //
 // Returns:
@@ -192,35 +194,16 @@ func (g *DirectGuest) AcquireGuestSlot() (*GuestSlot, error) {
 		i := startBase + int((uint32(j)+offset)%uint32(numGuest))
 		s := &g.slots[i]
 
-		currentState := atomic.LoadUint32(&s.header.State)
-
-		// Case 1: Slot is Free
-		if currentState == SlotFree {
-			claimSlotGen(s.header)
-			if atomic.CompareAndSwapUint32(&s.header.State, SlotFree, SlotGuestBusy) { // Use SlotGuestBusy (5)
-				atomic.StoreUint64(&s.header.Lease, MonotonicNanos())
-				return &GuestSlot{
-					guest:   g,
-					slotIdx: i,
-					slot:    s,
-				}, nil
-			}
-		}
-
-		// Case 2: Slot is stuck in RESP_READY (Zombie).
-		// Reclaim ONLY if no local process is actively waiting.
-		if currentState == SlotRespReady {
-			if atomic.LoadInt32(&s.ActiveWait) == 0 {
-				claimSlotGen(s.header)
-				if atomic.CompareAndSwapUint32(&s.header.State, SlotRespReady, SlotGuestBusy) {
-					atomic.StoreUint64(&s.header.Lease, MonotonicNanos())
-					return &GuestSlot{
-						guest:   g,
-						slotIdx: i,
-						slot:    s,
-					}, nil
-				}
-			}
+		// Claim a Free slot, or steal a SlotRespReady zombie (late host
+		// response whose waiter timed out, ActiveWait==0) via the Gen CAS
+		// handshake that arbitrates against a concurrent legitimate re-use of
+		// the same zombie (§3.6.1). See tryClaimGuestSlot in direct.go.
+		if tryClaimGuestSlot(s) {
+			return &GuestSlot{
+				guest:   g,
+				slotIdx: i,
+				slot:    s,
+			}, nil
 		}
 	}
 

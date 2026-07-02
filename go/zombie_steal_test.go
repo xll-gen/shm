@@ -266,6 +266,90 @@ func TestGuestSlot_ReleaseAfterTimeoutDoesNotFreeHostOwnedSlot(t *testing.T) {
 	s2.Release()
 }
 
+// TestGuestSlot_ZombieSteal_YieldsToConcurrentReclaim is the deterministic
+// regression for the cross-generation zombie-steal bug (2026-07-02 MED #1).
+//
+// The bug: a Case-2 zombie stealer read State==SlotRespReady, checked
+// ActiveWait==0, and then did a bare "bump Gen, CAS(State->GuestBusy)". If it
+// was preempted between the observation and the CAS, a DIFFERENT acquirer
+// could legitimately steal the same zombie, post a new request, and have the
+// host complete it — cycling State back to SlotRespReady over a DIFFERENT
+// (live) transaction. The preempted stealer's bare State CAS then succeeded
+// against that fresh response and hijacked it; the rightful owner's
+// consume-claim CAS failed with "slot reclaimed while consuming response",
+// destroying the response (an rtd-once push stuck at #GETTING_DATA forever).
+//
+// The fix applies the TryReclaimAbandonedSlot Gen CAS handshake (§3.6.1) to
+// the steal path: snapshot Gen before observing State, then win the recycle
+// right via CAS(Gen, observed, observed+1). A concurrent legitimate claim
+// advances Gen and makes this CAS fail, so the stealer yields.
+//
+// This drives the window deterministically via the stealPreCASHook seam: the
+// hook models the concurrent legitimate reclaim (D) happening after the
+// stealer (B) observed the zombie but before its Gen CAS. Pre-fix, B steals
+// (AcquireGuestSlot returns the slot and D's response is clobbered); post-fix
+// B yields (AcquireGuestSlot errors, D's transaction is intact).
+func TestGuestSlot_ZombieSteal_YieldsToConcurrentReclaim(t *testing.T) {
+	env := newZombieStealEnv(t, "ZombieStealGenHandshakeSHM", 1)
+	defer env.Close()
+
+	guest, err := NewDirectGuest(env.name)
+	if err != nil {
+		t.Fatalf("NewDirectGuest failed: %v", err)
+	}
+	defer guest.Close()
+
+	hdr := env.slotHeader(1)
+
+	// Seed a genuine zombie: a late host response whose original waiter timed
+	// out. State=SlotRespReady, ActiveWait==0 (fresh slotContext), Gen==0.
+	const dSeq = uint32(4242)
+	dResp := []byte("D-LIVE-RESPONSE")
+	copy(env.respBuf(1), dResp)
+	hdr.RespSize = int32(len(dResp))
+	hdr.MsgType = MsgTypeNormal
+	hdr.MsgSeq = dSeq
+	atomic.StoreUint32(&hdr.State, SlotRespReady)
+
+	// After B observes the zombie but before its Gen CAS, D legitimately
+	// recycles THIS slot: D's claim advances Gen (§3.6.1), D becomes the
+	// active owner (ActiveWait=1), and its fresh response is republished as
+	// SlotRespReady. B's Gen CAS must now detect the changed Gen and yield.
+	var hookFired int32
+	var dGen uint64
+	stealPreCASHook = func(s *slotContext) {
+		atomic.AddInt32(&hookFired, 1)
+		claimSlotGen(s.header) // D's claim bumps Gen BEFORE B's Gen CAS
+		dGen = atomic.LoadUint64(&s.header.Gen)
+		atomic.StoreInt32(&s.ActiveWait, 1)                // D is now consuming
+		atomic.StoreUint32(&s.header.State, SlotRespReady) // D's fresh response
+	}
+	t.Cleanup(func() { stealPreCASHook = nil })
+
+	thief, terr := guest.AcquireGuestSlot()
+
+	if atomic.LoadInt32(&hookFired) != 1 {
+		t.Fatalf("steal hook fired %d times, want 1 (steal window not exercised)", hookFired)
+	}
+	if terr == nil {
+		thief.Release()
+		t.Fatal("AcquireGuestSlot stole a zombie that was concurrently reclaimed into a live transaction — Gen handshake failed")
+	}
+	// D's transaction must be intact and untouched by B.
+	if st := atomic.LoadUint32(&hdr.State); st != SlotRespReady {
+		t.Fatalf("post-steal state = %d, want SlotRespReady (%d) — B corrupted D's slot", st, SlotRespReady)
+	}
+	if g := atomic.LoadUint64(&hdr.Gen); g != dGen {
+		t.Fatalf("Gen = %d, want %d — B must not advance Gen past D's claim", g, dGen)
+	}
+	if hdr.MsgSeq != dSeq {
+		t.Fatalf("MsgSeq = %d, want %d — B overwrote D's transaction", hdr.MsgSeq, dSeq)
+	}
+	if got := string(env.respBuf(1)[:hdr.RespSize]); got != string(dResp) {
+		t.Fatalf("response = %q, want %q — B clobbered D's live response", got, dResp)
+	}
+}
+
 // TestGuestSlot_ConcurrentConsumersNoCorruption stress-drives the steal
 // window: workers hold ResponseBuffer() for a while before Release while
 // other workers continuously try to acquire slots. With an echo host, any

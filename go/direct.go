@@ -636,6 +636,76 @@ func claimSlotGen(h *SlotHeader) {
 	atomic.AddUint64(&h.Gen, 1)
 }
 
+// stealPreCASHook is a test-only seam fired inside tryClaimGuestSlot after a
+// zombie slot (SlotRespReady && ActiveWait==0) has been observed but BEFORE
+// the generation-CAS handshake that wins the right to recycle it. Production
+// builds leave it nil, so the branch that calls it is a single never-taken
+// nil check. Tests set it to deterministically drive the steal-vs-legitimate
+// -reclaim race: a concurrent claimer legitimately recycles the same zombie
+// into a fresh transaction inside this window, and the fix must make the
+// stealer's Gen CAS fail so it yields instead of hijacking the live response.
+// See zombie_steal_test.go.
+var stealPreCASHook func(s *slotContext)
+
+// tryClaimGuestSlot attempts to claim guest slot s for a new Guest transaction,
+// returning true on success (State is left at SlotGuestBusy and Lease
+// refreshed). It handles the two claimable shapes a scanning acquirer meets:
+//
+//   - SlotFree: a normal claim. claimSlotGen bumps Gen before the state CAS
+//     (§3.6.1); two racers on a free slot arbitrate on the State CAS itself.
+//
+//   - SlotRespReady with ActiveWait==0: a *zombie* — a late Host response
+//     whose original waiter already timed out. Recycling it is a steal, and a
+//     bare "bump Gen, CAS(State)" is NOT airtight. Between observing the zombie
+//     and the CAS, another acquirer can legitimately steal the SAME zombie,
+//     post a new request, and have the Host complete it, cycling State back to
+//     SlotRespReady backed by a DIFFERENT transaction. A bare State CAS then
+//     succeeds against that fresh response and hijacks it: the rightful owner's
+//     consume-claim CAS (SendGuestCall / GuestSlot.Send) fails with "slot
+//     reclaimed while consuming response", destroying a live response. We close
+//     this ABA window with the SAME Gen CAS handshake TryReclaimAbandonedSlot
+//     uses (§3.6.1): snapshot Gen BEFORE observing State, then win the
+//     exclusive right to recycle via CAS(Gen, observed, observed+1). Because
+//     every claim path advances Gen before its state CAS, any intervening
+//     legitimate claim bumps Gen and makes this CAS fail — including the
+//     lease-publication-lag window — so the stealer yields instead of stealing.
+func tryClaimGuestSlot(s *slotContext) bool {
+	// Snapshot Gen BEFORE loading State so the zombie-steal handshake below
+	// can detect any claim that recycled the slot after our observation. The
+	// snapshot must precede the State load: a claim that recycles the zombie
+	// bumps Gen before republishing SlotRespReady, so a snapshot taken after
+	// the State load could already reflect the fresh transaction's Gen and the
+	// CAS would wrongly succeed against it.
+	genObserved := atomic.LoadUint64(&s.header.Gen)
+
+	switch atomic.LoadUint32(&s.header.State) {
+	case SlotFree:
+		claimSlotGen(s.header)
+		if atomic.CompareAndSwapUint32(&s.header.State, SlotFree, SlotGuestBusy) {
+			atomic.StoreUint64(&s.header.Lease, MonotonicNanos())
+			return true
+		}
+	case SlotRespReady:
+		if atomic.LoadInt32(&s.ActiveWait) != 0 {
+			return false
+		}
+		if stealPreCASHook != nil {
+			stealPreCASHook(s)
+		}
+		// Win the exclusive right to recycle this zombie via the Gen CAS
+		// handshake, mirroring TryReclaimAbandonedSlot (§3.6.1). Fails if any
+		// claim bumped Gen since our snapshot, so a concurrent legitimate
+		// re-use of the same zombie is detected and we yield.
+		if atomic.CompareAndSwapUint64(&s.header.Gen, genObserved, genObserved+1) {
+			if atomic.CompareAndSwapUint32(&s.header.State, SlotRespReady, SlotGuestBusy) {
+				atomic.StoreUint64(&s.header.Lease, MonotonicNanos())
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // SendGuestCall sends a request to the Host using a Guest Slot.
 // It blocks until a response is received or the default timeout occurs.
 //
@@ -700,26 +770,13 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, buffer []byte, msgType 
 		for j := 0; j < numGuest; j++ {
 			idx := startBase + int((uint32(j)+offset)%uint32(numGuest))
 			s := &g.slots[idx]
-			currentState := atomic.LoadUint32(&s.header.State)
 
-			if currentState == SlotFree {
-				claimSlotGen(s.header)
-				if atomic.CompareAndSwapUint32(&s.header.State, SlotFree, SlotGuestBusy) {
-					atomic.StoreUint64(&s.header.Lease, MonotonicNanos())
-					slot = s
-					break
-				}
-			}
-
-			if currentState == SlotRespReady {
-				if atomic.LoadInt32(&s.ActiveWait) == 0 {
-					claimSlotGen(s.header)
-					if atomic.CompareAndSwapUint32(&s.header.State, SlotRespReady, SlotGuestBusy) {
-						atomic.StoreUint64(&s.header.Lease, MonotonicNanos())
-						slot = s
-						break
-					}
-				}
+			// Claim a Free slot, or steal a SlotRespReady zombie via the Gen
+			// CAS handshake that yields to a concurrent legitimate re-use of
+			// the same zombie (§3.6.1). See tryClaimGuestSlot.
+			if tryClaimGuestSlot(s) {
+				slot = s
+				break
 			}
 		}
 		if slot != nil {
@@ -741,14 +798,8 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, buffer []byte, msgType 
 			if reclaimed {
 				for j := 0; j < numGuest; j++ {
 					idx := startBase + j
-					s := &g.slots[idx]
-					if atomic.LoadUint32(&s.header.State) != SlotFree {
-						continue
-					}
-					claimSlotGen(s.header)
-					if atomic.CompareAndSwapUint32(&s.header.State, SlotFree, SlotGuestBusy) {
-						atomic.StoreUint64(&s.header.Lease, MonotonicNanos())
-						slot = s
+					if tryClaimGuestSlot(&g.slots[idx]) {
+						slot = &g.slots[idx]
 						break
 					}
 				}
