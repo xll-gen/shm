@@ -1,5 +1,33 @@
 # Changelog
 
+## [v0.8.3] - 2026-07-02
+
+No wire-protocol/ABI change — `SHM_VERSION` remains `0x00070000`. Slot-claim
+logic and error-propagation fixes only; `SlotHeader` layout untouched.
+
+### Fixed
+
+- **Cross-generation zombie-slot steal** — the Case-2 zombie-slot claim paths
+  (Go `AcquireGuestSlot` / `sendGuestCallInternal`, C++ `AcquireSlot` /
+  `AcquireSpecificSlot`) recycled a `RespReady && !activeWait` slot with only a
+  bare `Gen` bump plus a `State` CAS, with no ABA protection. A stealer
+  preempted between observing the zombie and its `State` CAS could hijack a
+  concurrent claimant's fresh, live transaction — the rightful owner then hit a
+  spurious "slot reclaimed while consuming response" failure (for rtd-once, a
+  permanent `#GETTING_DATA`). Both sides now route these steals through a shared
+  helper (`tryClaimGuestSlot` / `SlotAllocator::tryClaimSlot`) that snapshots
+  `Gen` **before** the `State` load and wins the recycle via `CAS(Gen, observed,
+  observed+1)` before the `State` CAS — the same linearizer
+  `TryReclaimAbandonedSlot` uses (SPECIFICATION §3.6.1). `SLOT_FREE` claims keep
+  the plain bump (no transaction-identity ambiguity); `ProcessGuestCalls` is
+  unchanged (it claims a genuine `SLOT_REQ_READY`, not a steal).
+- **`StreamSender` swallowed reassembler rejections** — `StreamSender.Send`
+  discarded the response `MsgType`, so a receiver rejection surfaced as
+  `MsgType::SYSTEM_ERROR` (size/stream-count overflow, OOM, unknown/evicted
+  stream) was reported as success — silent data loss. It now converts
+  `SYSTEM_ERROR` to an error (mirroring `SendGuestCall`), returning immediately
+  on a StreamStart rejection so no chunks are wasted.
+
 ## [v0.8.2] - 2026-06-26
 
 No wire-protocol/ABI change — `SHM_VERSION` remains `0x00070000`.
