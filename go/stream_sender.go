@@ -82,11 +82,19 @@ func (s *StreamSender) Send(data []byte, streamID uint64) error {
 		binary.LittleEndian.PutUint32(reqBuf[16:], uint32(totalChunks))
 		binary.LittleEndian.PutUint32(reqBuf[20:], 0) // Reserved
 
-		// Send
-		_, _, err = slot.Send(int32(headerSize), MsgTypeStreamStart)
+		// Send. The reassembler signals rejection (unknown/duplicate stream,
+		// size overflow, OOM, eviction pressure) not via a transport error but
+		// via respType == MsgTypeSystemError with err == nil — mirror
+		// SendGuestCall and surface it as an error. Return immediately so the
+		// chunk goroutines below never fire against a stream the host refused
+		// to start (which would waste slots on chunks it will also reject).
+		_, respType, serr := slot.Send(int32(headerSize), MsgTypeStreamStart)
 		slot.Release()
-		if err != nil {
-			return fmt.Errorf("failed to send Stream Start: %v", err)
+		if serr != nil {
+			return fmt.Errorf("failed to send Stream Start: %v", serr)
+		}
+		if respType == MsgTypeSystemError {
+			return fmt.Errorf("stream start rejected by host (streamID %d): system error", streamID)
 		}
 	}
 
@@ -182,8 +190,14 @@ func (s *StreamSender) Send(data []byte, streamID uint64) error {
 			// Write Data
 			copy(reqBuf[chunkHeaderSize:], chunkSlice)
 
-			// Send
-			_, _, err := slot.Send(int32(chunkHeaderSize+len(chunkSlice)), MsgTypeStreamChunk)
+			// Send. A reassembler rejection arrives as respType ==
+			// MsgTypeSystemError with a nil transport error (see StreamStart
+			// above); fold it into err so the existing errChan path propagates
+			// it and the whole Send fails instead of silently losing the chunk.
+			_, respType, err := slot.Send(int32(chunkHeaderSize+len(chunkSlice)), MsgTypeStreamChunk)
+			if err == nil && respType == MsgTypeSystemError {
+				err = fmt.Errorf("stream chunk %d rejected by host (streamID %d): system error", idx, streamID)
+			}
 			if err != nil {
 				select {
 				case errChan <- err:
