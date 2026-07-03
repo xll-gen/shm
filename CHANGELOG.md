@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [v0.8.5] - 2026-07-04
 
 No wire-protocol/ABI change — `SHM_VERSION` remains `0x00070000`;
 `SlotHeader`/`ExchangeHeader` layouts untouched. Claim-cycle, benchmark
