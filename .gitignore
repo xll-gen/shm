@@ -7,6 +7,7 @@
 bin/
 build/
 build_bench/
+build_tests/
 server
 
 # Benchmark output (commit selectively under benchmarks/results/<named>/)

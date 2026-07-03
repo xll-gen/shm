@@ -133,6 +133,53 @@ section — earlier numbers under-report throughput by the removed bench
 overhead and their sub-µs "Avg Latency" values were microsecond-truncation
 artifacts. Compare new runs only against this section onward.
 
+### Claim-cycle + benchstats-sharding + stream-reassembly pass (2026-07-04)
+
+Same host and method (`harness.ps1 -HighPriority`, 10 s cells, best of 3,
+AffinityAuto→Sibling). Three change groups A/B'd in one session against a
+re-measured v0.8.4 baseline; see `EXPERIMENTS.md` §2026-07-04 for the
+decomposition (Go benchstats sharding + C++ CopySmall measured via
+`--legacy-claim`, then the held-slot send path on top).
+
+**Normal mode** (bench now uses the held-slot session path by default;
+`--legacy-claim` reproduces the per-op claim/free cycle):
+
+| Cell | v0.8.4 baseline | legacy-claim (sharding+CopySmall) | held-slot (default) | total Δ |
+|:---|---:|---:|---:|---:|
+| 1T / 64 B   | 8,771,712  | 9,599,504  | 11,336,149 | **+29.2%** |
+| 4T / 64 B   | 15,456,644 | 26,451,968 | 26,548,853 | **+71.7%** |
+| 8T / 64 B   | 18,676,220 | 46,486,386 | 46,868,570 | **+150.9%** |
+| 1T / 1024 B | 6,842,516  | 6,982,004  | 8,304,851  | **+21.4%** |
+| 4T / 1024 B | 12,057,332 | 17,327,546 | 19,524,285 | **+61.9%** |
+| 8T / 1024 B | 17,708,633 | 32,089,904 | 33,688,239 | **+90.2%** |
+
+**⚠ 4T/8T discontinuity:** the multi-thread jump is dominated by the Go
+`shm_benchstats` counter sharding — the old globally-contended counters
+throttled every instrumented multi-thread cell, so 4T/8T rows above this
+section under-report the library. 1T cells remain comparable to the
+2026-07-03 table.
+
+**Stream mode** (4 KiB chunks, in-flight 1, best of 2, ops/s; direct-into-
+destination reassembler):
+
+| Stream size \ Threads | 1 | 4 | 8 |
+|:---|---:|---:|---:|
+| 64 KiB (v0.8.4 → new)  | 30,142 → **54,204** | 24,980 → **44,884** | 20,767 → **30,577** |
+| 1 MiB                  | 1,926 → **4,141**   | 2,284 → **3,049**   | 1,874 → **2,271** |
+| 16 MiB                 | 106 → **186**       | 134 → **150**       | 150 → 126 |
+
+In-flight depth 2 (the shipping library default) measured *slower* than
+depth 1 on every one of these cells with the new reassembler — the bench
+default stays 1 and the library default is under review (backlog; re-test
+after the stream slot-affinity fix).
+
+**Guest-call cell** (1T/64B, echo): the old hand-rolled bench listener ran at
+the 15.6 ms Windows timer quantum → **~64 ops/s**; with the library
+event-driven worker, response-SignalEvent gating, and the Go bench using
+`SendGuestCallBuffer`: **~393,000 ops/s**. Still wake-bound (~2.5 µs/call);
+the confirmed follow-up (worker spin phase + doorbell gating) is in the
+backlog.
+
 ### Streaming chunk-size sweep (1 thread, native Windows, 2026-06-26)
 
 Stream mode total bandwidth as a function of chunk size at fixed total

@@ -190,3 +190,96 @@ more inside a cache-hot IPC loop than in an isolated microbench loop.
 - Large-page (`SEC_LARGE_PAGES`) mapping for stream mode: stream plateau is
   memory-controller-bandwidth-bound (established by the maxInFlight
   experiment), not TLB-bound; plus SeLockMemoryPrivilege deployment burden.
+
+## 2026-07-04 claim-cycle / benchstats-sharding / stream-reassembly pass (multi-agent hunt, round 4)
+
+A fresh six-lens sweep (atomics-ordering budget / Go runtime / C++ codegen /
+batching-pipelining / stream deep-dive / wake-tail-latency) produced 18
+deduplicated candidates; adversarial verification confirmed 8 and refuted 10
+(notably: REQ_READY seq_cst→release downgrade, KUSER_SHARED_DATA lease clock
+— already sub-noise per the 2026-07-03 log — GOAMD64=v3/PGO, LazyProc.Call
+alloc, MSG_TYPE_BATCH as a library change). Implemented and A/B'd this
+session together with the two deferred 2026-07-03 survivors. All A/B best-of-3
+(streams best-of-2), `harness.ps1 -HighPriority`, AffinityAuto→Sibling,
+Ryzen 9 3900X, same-session baseline re-measured from v0.8.4 binaries.
+
+### Adopted — normal-mode ping-pong
+
+1. **Per-WaitStrategy benchstats sharding (Go)** + **inline small-copy fast
+   path (C++ `Platform::CopySmall`)**, measured together on the legacy claim
+   path: 1T/64B 8.77M→9.60M (+9.4%), 4T/64B 15.5M→26.5M (**+71%**), 8T/64B
+   18.7M→46.5M (**+149%**), 8T/1024B +81%. The multi-thread explosion is the
+   sharding: under `-tags shm_benchstats` every RTT fired two LOCK XADDs on
+   two globally shared (padded) counter lines across all pinned cores — the
+   v0.7.12 padding fixed false sharing *between* the counters but left the
+   counters themselves globally contended. Counters now live value-embedded
+   in each slot's `WaitStrategy` (padded to one line, tag-gated registry for
+   the aggregate getters). Production builds were already zero-cost; this
+   corrects the *instrumented* numbers, so 4T/8T cells form a new baseline.
+   CopySmall replaces the out-of-line `call memcpy` (IAT-indirect into
+   msvcrt) with an inline overlapping-window ladder for ≤256 B payload
+   copies at 9 hot-path sites.
+2. **Held-slot session API (S0)**: `SlotAllocator::SendHeld` +
+   `DirectHost::HeldSlot` RAII — claim once, re-arm per send (publish
+   REQ_READY from the parked state; consume-claim response RESP_READY→BUSY
+   before dropping activeWait, closing the pre-existing
+   RESP_READY/!activeWait steal window). Wire-compatible (guest only acts on
+   REQ_READY; the Go guest has re-armed this way since v0.6); SPEC §3.6
+   "Held-slot sessions" records the lease/reclaim obligations. Bench normal
+   mode now uses it by default (`--legacy-claim` restores the old path).
+   Isolated effect on top of #1: 1T/64B +18.1%, 1T/1024B +18.9%, 4T/1024B
+   +12.7% (4T/8T 64B ~0% — those cells are guest-side-bound after #1).
+   Regression tests: `tests/test_held_slot.cpp` (re-arm, parked-BUSY
+   not stealable, stale-lease reclaimable, msgSeq-violation release).
+
+   **Combined vs v0.8.4 baseline: 1T/64B 8.77M→11.34M (+29%), 4T/64B
+   15.5M→26.5M (+72%), 8T/64B 18.7M→46.9M (+151%), 1024B column +21–90%.**
+
+### Adopted — stream path
+
+3. **Direct-into-destination reassembly (Go)**: the final buffer is
+   preallocated at StreamStart and in-order chunks are copied straight into
+   it (previously: per-chunk allocation into [][]byte + a second full copy at
+   completion). Ahead-of-cursor chunks (pipelined senders) park in a lazily
+   allocated side map, drained as the cursor reaches them; SPEC §3.3.4
+   guards preserved (per-chunk running-length, Σ==totalSize, exactly-once;
+   regression suite `stream_reassembly_order_test.go`). At in-flight 1
+   (4 KiB chunks): 64 KiB streams +47–80%, 1 MiB +21–115%, 16 MiB 1T +75%
+   (106→186 ops/s). 8T/16MiB read -16% best-of-2 — bandwidth-saturated cell,
+   within that cell's historical spread; net strongly positive.
+
+### Adopted — guest-call path
+
+4. **Response SignalEvent gating (C++ `GuestCallWorker`)** — both signal
+   sites now check `guestState == GUEST_STATE_WAITING` first (the same
+   two-sided Dekker as the host→guest direction; the Go waiter's
+   WAITING-store-then-recheck was verified present at all three sites), and
+   **bench listener fidelity**: the hand-rolled 1 ms-poll listener actually
+   ran at the 15.6 ms Windows timer quantum, capping the cell at **~64
+   ops/s**; replaced with the library's event-driven worker
+   (`DirectHost::Start`). With the Go-side lazy acquire-deadline +
+   `SendGuestCallBuffer` bench fix: **~393K ops/s (≈6,100×)**. The cell is
+   still wake-bound (~2.5 µs/call, one WaitEvent round per call) — the
+   confirmed p1 follow-up (GuestCallWorker adaptive spin + HOST_STATE_WAITING
+   publish + Go doorbell gating) is in the backlog and should move this into
+   the multi-M regime.
+
+### Reverted after measurement
+
+- **Stream bench in-flight default 1→2** (to mirror the library
+  StreamSender/stream_sender defaults): with the new reassembler, depth 2
+  LOST to depth 1 on every stream-profile cell (1T/16MiB 186→139; 64 KiB
+  cells −18…−36%; depth 2 also doubles numHostSlots, pushing 8T past the
+  12-SMT-pair Sibling fit). Bench default restored to 1 with the measurement
+  recorded in main.cpp; the *library* default (inFlight=2) is now a backlog
+  review item — re-measure after the stream slot-affinity fix (S6) lands,
+  since the slot scramble is a confound.
+
+### Confirmed but deferred (backlog, verified this round)
+
+- **p1**: guest→host kernel-wake elimination (GuestCallWorker spin phase +
+  HOST_STATE_WAITING + Go doorbell gate; phase 2 wants a minor version bump).
+- **p2**: stream slot/affinity co-location (StreamSender fixed slot range);
+  state+gen32 single-CAS SlotHeader repack (wire-ABI, L).
+- MOVNT host chunk copy remains deferred (uncertain vs the now-dominant
+  reassembly win).

@@ -1,5 +1,80 @@
 # Changelog
 
+## [Unreleased]
+
+No wire-protocol/ABI change — `SHM_VERSION` remains `0x00070000`;
+`SlotHeader`/`ExchangeHeader` layouts untouched. Claim-cycle, benchmark
+instrumentation, stream-reassembly, and guest-call wake-path performance
+(2026-07-04 multi-agent perf hunt round 4; same-session A/B on Ryzen 9 3900X,
+see `EXPERIMENTS.md` §2026-07-04 and `BENCHMARK_RESULTS.md` §2026-07-04).
+
+### Added
+
+- **Held-slot session API (C++ host)** — `SlotAllocator::SendHeld` /
+  `ReleaseHeldSlot` and the `DirectHost::HeldSlot` RAII wrapper
+  (`AcquireHeldSlot()` / `AcquireHeldSlot(slotIdx)`): claim a slot once, then
+  re-arm it per send with no per-RTT gen-bump/CAS/FREE cycle, parking at
+  `SLOT_BUSY` between sends. Wire-compatible (the guest only acts on
+  `SLOT_REQ_READY`; the Go guest has re-armed this way since v0.6);
+  contract documented in SPECIFICATION §3.6 "Held-slot sessions". The
+  response consume-claim (RESP_READY→BUSY *before* dropping activeWait) also
+  closes the pre-existing RESP_READY/!activeWait zombie-steal window on this
+  path. Regression: `tests/test_held_slot.cpp`. Benchmark normal mode uses it
+  by default (`--legacy-claim` / harness `-LegacyClaim` restores the per-op
+  claim cycle). +18% at 1T on top of the items below; combined +29% at
+  1T/64B vs v0.8.4.
+
+### Performance
+
+- **Per-WaitStrategy benchstats sharding (Go)** — the `shm_benchstats`
+  counters moved from globally shared padded cells into each slot's
+  `WaitStrategy` (value-embedded, struct padded to one cache line,
+  compile-time size assert; aggregate getters sum a tag-gated registry, and
+  a bare `&WaitStrategy{}` still works unregistered). Under the harness's
+  `-tags shm_benchstats` build every RTT previously fired two LOCK XADDs on
+  two globally contended lines across all pinned cores; instrumented
+  multi-thread cells were throttled by their own instrumentation
+  (+71%/+149% at 4T/8T 64B once removed). Production (untagged) builds were
+  already zero-cost and are unaffected.
+- **Inline small-copy fast path (C++)** — `Platform::CopySmall` replaces the
+  out-of-line `call memcpy` (MinGW: IAT-indirect into msvcrt) at the 9
+  hot-path payload-copy sites (`SendToSlot`/`Send` request, `WaitForSlot`/
+  `SendAcquired`/`SendHeld` response) with an inline overlapping-window
+  ladder for ≤256 B; larger copies fall back to `memcpy`.
+- **Stream reassembly direct-into-destination (Go)** — the reassembler
+  preallocates the final buffer at `StreamStart` and copies in-order chunks
+  straight into it at a running offset (was: per-chunk allocation into
+  `[][]byte` + a second full-size copy at completion). Out-of-order chunks
+  (pipelined senders) park in a lazily allocated side map. SPEC §3.3.4
+  guards preserved bit-for-bit (per-chunk running-length, Σ==totalSize,
+  exactly-once dedup incl. zero-length chunks); new regression suite
+  `go/stream_reassembly_order_test.go`. Stream throughput +21…+115% on
+  sub-plateau cells, 16 MiB 1T +75%.
+- **Guest-call response signal gating (C++ `GuestCallWorker`)** — both
+  `SLOT_RESP_READY` publish sites now elide the `SetEvent` syscall when the
+  Go caller is spinning (`guestState != GUEST_STATE_WAITING`), mirroring the
+  host→guest Dekker already used by `SlotAllocator`/the Go worker.
+- **Lazy guest-call acquire deadline (Go)** — `sendGuestCallInternal` takes
+  its acquisition-timeout timestamp on the first *failed* slot pass instead
+  of every call (same rationale as the v0.8.4 C++ lazy QPC latch).
+
+### Fixed (benchmark fidelity — changes what the harness reports)
+
+- **Guest-call bench listener** — the hand-rolled 1 ms-poll listener
+  actually polled at the 15.6 ms Windows timer quantum, capping the
+  guest-call cell at ~64 ops/s and measuring the poll, not the IPC. The
+  bench now uses the library's event-driven worker (`DirectHost::Start`).
+  The Go bench also reports guest-call results reliably at shutdown (the old
+  in-goroutine print never ran) and measures `SendGuestCallBuffer` with a
+  hoisted response buffer. New cell reference: ~393K ops/s (1T/64B echo).
+  **Old guest-call numbers are not comparable.**
+- **Stream bench in-flight default stays 1** — briefly aligned to the
+  library `StreamSender` default (2), then reverted after measurement:
+  depth 2 lost to depth 1 on every stream-profile cell with the new
+  reassembler (and doubles `numHostSlots`, breaking the 8T Sibling-affinity
+  fit). Recorded in `benchmarks/main.cpp`; the *library* default is now a
+  backlog review item. Help text corrected (previously claimed "default: 4").
+
 ## [v0.8.4] - 2026-07-03
 
 No wire-protocol/ABI change — `SHM_VERSION` remains `0x00070000`;
