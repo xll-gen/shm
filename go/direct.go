@@ -774,7 +774,15 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, buffer []byte, msgType 
 	// at #GETTING_DATA forever. Polling is best-effort, NOT FIFO: whichever
 	// waiter wins the CAS takes the freed slot. The response wait below keeps
 	// its own independent `timeout` budget.
-	acquireDeadline := time.Now().Add(timeout)
+	//
+	// The deadline clock is taken lazily on the first *failed* pass: the
+	// common case claims a slot on the first sweep and never needs a
+	// timestamp, so an eager time.Now() sat on every call for nothing
+	// (same rationale as the C++ AcquireSpecificSlot lazy QPC latch,
+	// v0.8.4). The budget therefore starts at the first shortage, which is
+	// slightly more generous than clock-at-entry — acceptable for a
+	// best-effort bound.
+	var acquireDeadline time.Time
 	backoff := 100 * time.Microsecond
 
 	var slot *slotContext
@@ -826,6 +834,9 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, buffer []byte, msgType 
 		// free and rescan, until the deadline.
 		if atomic.LoadInt32(&g.closing) == 1 {
 			return nil, fmt.Errorf("guest closing")
+		}
+		if acquireDeadline.IsZero() {
+			acquireDeadline = time.Now().Add(timeout)
 		}
 		remaining := time.Until(acquireDeadline)
 		if remaining <= 0 {

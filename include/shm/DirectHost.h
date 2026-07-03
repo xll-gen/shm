@@ -266,6 +266,118 @@ public:
     };
 
     /**
+     * @brief RAII wrapper for a held-slot session (v0.8.5).
+     *
+     * Acquires a slot once (the ordinary gen-bump claim) and re-arms it on
+     * every Send via SlotAllocator::SendHeld, skipping the per-send
+     * FREE→re-claim cycle — the fast path for callers that own a dedicated
+     * slot and send repeatedly (per-thread benchmark workers, xll-gen's
+     * per-call sites once migrated off GetZeroCopySlot). Between sends the
+     * slot parks at SLOT_BUSY, which tryClaimSlot's zombie branch never
+     * steals; only the opt-in lease-based reclaim can take it, so keep any
+     * SetAutoReclaimTimeoutNs threshold above the maximum inter-send gap
+     * (SPEC §3.6 held-slot note).
+     *
+     * After a Send error other than BufferTooSmall/InvalidArgs the wrapper
+     * disowns the slot (IsValid() turns false) — re-acquire with
+     * AcquireHeldSlot. Destruction releases a still-held slot to SLOT_FREE.
+     */
+    class HeldSlot {
+        DirectHost* host;
+        int32_t slotIdx;
+        std::weak_ptr<SharedState> weakState;
+
+    public:
+        HeldSlot() : host(nullptr), slotIdx(-1) {}
+
+        HeldSlot(DirectHost* h, int32_t idx) : host(h), slotIdx(idx) {
+            if (h) weakState = h->sharedState;
+        }
+
+        ~HeldSlot() { Release(); }
+
+        HeldSlot(HeldSlot&& other) noexcept
+            : host(other.host), slotIdx(other.slotIdx), weakState(std::move(other.weakState)) {
+            other.host = nullptr;
+            other.slotIdx = -1;
+        }
+
+        HeldSlot& operator=(HeldSlot&& other) noexcept {
+            if (this != &other) {
+                Release();
+                host = other.host;
+                slotIdx = other.slotIdx;
+                weakState = std::move(other.weakState);
+                other.host = nullptr;
+                other.slotIdx = -1;
+            }
+            return *this;
+        }
+
+        HeldSlot(const HeldSlot&) = delete;
+        HeldSlot& operator=(const HeldSlot&) = delete;
+
+        /** @brief Checks if the slot is valid (still held). */
+        bool IsValid() const {
+            return !weakState.expired() && host && slotIdx >= 0;
+        }
+
+        /** @brief The underlying slot index, or -1 when not held. */
+        int32_t Index() const { return slotIdx; }
+
+        /** @brief Gets the pointer to the Request Buffer. */
+        uint8_t* GetReqBuffer() {
+            if (!IsValid()) return nullptr;
+            return host->allocator_.slots[slotIdx].reqBuffer;
+        }
+
+        /** @brief Gets the maximum size of the Request Buffer. */
+        int32_t GetMaxReqSize() {
+            if (!IsValid()) return 0;
+            return host->allocator_.slots[slotIdx].maxReqSize;
+        }
+
+        /**
+         * @brief Sends the request already written into GetReqBuffer() and
+         *        copies the response out, keeping the slot held on success.
+         *
+         * On Timeout/ProtocolViolation/InternalError the slot is disowned
+         * (see SendHeld's error semantics); BufferTooSmall/InvalidArgs leave
+         * it held.
+         */
+        Result<int> Send(int32_t size, MsgType msgType, std::vector<uint8_t>& outResp, uint32_t timeoutMs = USE_DEFAULT_TIMEOUT) {
+            if (!IsValid()) return Result<int>(Error::InvalidArgs);
+
+            auto res = host->allocator_.SendHeld(slotIdx, size, msgType, outResp, timeoutMs);
+            if (res.HasError()) {
+                switch (res.GetError()) {
+                    case Error::Timeout:
+                    case Error::ProtocolViolation:
+                    case Error::InternalError:
+                        // SendHeld freed the slot where safe (violation /
+                        // system error) or left it in-flight (timeout); in
+                        // both cases this wrapper must not touch it again.
+                        slotIdx = -1;
+                        break;
+                    default:
+                        break; // still held
+                }
+            }
+            return res;
+        }
+
+        /** @brief Releases a still-held slot back to SLOT_FREE. */
+        void Release() {
+            if (auto lock = weakState.lock()) {
+                if (host && slotIdx >= 0) {
+                    host->allocator_.ReleaseHeldSlot(slotIdx);
+                }
+            }
+            slotIdx = -1;
+        }
+    };
+
+    /**
      * @brief Default constructor.
      */
         DirectHost() : shmBase(nullptr), hMapFile(0), hLockFile(0), running(false) {
@@ -488,6 +600,24 @@ public:
     }
 
     /**
+     * @brief Acquires any free slot as a held-slot session (see HeldSlot).
+     * @return HeldSlot wrapper. Check .IsValid() before use.
+     */
+    HeldSlot AcquireHeldSlot() {
+        return HeldSlot(this, AcquireSlot());
+    }
+
+    /**
+     * @brief Acquires a specific slot as a held-slot session (see HeldSlot).
+     * @param slotIdx The slot index to acquire.
+     * @param timeoutMs Timeout in milliseconds. Default USE_DEFAULT_TIMEOUT.
+     * @return HeldSlot wrapper. Check .IsValid() before use.
+     */
+    HeldSlot AcquireHeldSlot(int32_t slotIdx, uint32_t timeoutMs = USE_DEFAULT_TIMEOUT) {
+        return HeldSlot(this, AcquireSpecificSlot(slotIdx, timeoutMs));
+    }
+
+    /**
      * @brief Acquires a specific slot.
      * @param slotIdx The index of the slot to acquire.
      * @param timeoutMs Timeout in milliseconds. Default USE_DEFAULT_TIMEOUT.
@@ -633,10 +763,10 @@ public:
             }
 
             if (size >= 0) {
-                memcpy(GetReqBuffer(idx), data, uAbsSize);
+                Platform::CopySmall(GetReqBuffer(idx), data, uAbsSize);
             } else {
                 uint32_t offset = (uint32_t)max - uAbsSize;
-                memcpy(GetReqBuffer(idx) + offset, data, uAbsSize);
+                Platform::CopySmall(GetReqBuffer(idx) + offset, data, uAbsSize);
             }
         }
         return SendAcquired(idx, size, msgType, outResp, timeoutMs);
@@ -665,10 +795,10 @@ public:
             }
 
             if (size >= 0) {
-                memcpy(GetReqBuffer(idx), data, uAbsSize);
+                Platform::CopySmall(GetReqBuffer(idx), data, uAbsSize);
             } else {
                 uint32_t offset = (uint32_t)max - uAbsSize;
-                memcpy(GetReqBuffer(idx) + offset, data, uAbsSize);
+                Platform::CopySmall(GetReqBuffer(idx) + offset, data, uAbsSize);
             }
         }
         return SendAcquired(idx, size, msgType, outResp, timeoutMs);

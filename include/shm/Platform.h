@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <cstring>
 
 typedef HANDLE EventHandle;
 typedef HANDLE ShmHandle;
@@ -192,6 +193,37 @@ public:
      */
     static void CpuRelax() {
         YieldProcessor();
+    }
+
+    /**
+     * @brief Inline small-copy fast path for per-RTT payload copies.
+     *
+     * The hot-path payload copies (request in SendToSlot/Send, response in
+     * WaitForSlot/SendAcquired/SendHeld) have runtime-variable size, so the
+     * compiler emits an out-of-line `call memcpy` — on MinGW an IAT-indirect
+     * call into msvcrt — whose dispatch overhead is comparable to the copy
+     * itself at 64-byte payloads. This ladder dispatches on size to
+     * fixed-size memcpy calls, which every supported compiler inlines to
+     * mov/vmovdqu pairs (the two windows overlap for sizes between powers of
+     * two — the classic overlapping-window trick), and falls back to the
+     * library memcpy above 256 bytes where the call cost is amortized.
+     * Overlapping dst/src ranges are NOT supported (same contract as memcpy).
+     */
+    static inline void CopySmall(void* dst, const void* src, size_t n) {
+        unsigned char* d = static_cast<unsigned char*>(dst);
+        const unsigned char* s = static_cast<const unsigned char*>(src);
+        if (n >= 16) {
+            if (n <= 32)  { memcpy(d, s, 16);  memcpy(d + n - 16,  s + n - 16,  16);  return; }
+            if (n <= 64)  { memcpy(d, s, 32);  memcpy(d + n - 32,  s + n - 32,  32);  return; }
+            if (n <= 128) { memcpy(d, s, 64);  memcpy(d + n - 64,  s + n - 64,  64);  return; }
+            if (n <= 256) { memcpy(d, s, 128); memcpy(d + n - 128, s + n - 128, 128); return; }
+            memcpy(d, s, n);
+            return;
+        }
+        if (n >= 8) { memcpy(d, s, 8); memcpy(d + n - 8, s + n - 8, 8); return; }
+        if (n >= 4) { memcpy(d, s, 4); memcpy(d + n - 4, s + n - 4, 4); return; }
+        if (n >= 2) { memcpy(d, s, 2); memcpy(d + n - 2, s + n - 2, 2); return; }
+        if (n == 1) d[0] = s[0];
     }
 
     /**

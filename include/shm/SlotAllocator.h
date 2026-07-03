@@ -626,10 +626,10 @@ public:
         outResp.resize(absResp);
         if (absResp > 0) {
             if (respSize >= 0) {
-                memcpy(outResp.data(), slot->respBuffer, absResp);
+                Platform::CopySmall(outResp.data(), slot->respBuffer, absResp);
             } else {
                 uint32_t offset = slot->maxRespSize - absResp;
-                memcpy(outResp.data(), slot->respBuffer + offset, absResp);
+                Platform::CopySmall(outResp.data(), slot->respBuffer + offset, absResp);
             }
         }
         resultSize = (int)absResp;
@@ -688,10 +688,10 @@ public:
             outResp.resize(absResp);
             if (absResp > 0) {
                 if (respSize >= 0) {
-                    memcpy(outResp.data(), slot->respBuffer, absResp);
+                    Platform::CopySmall(outResp.data(), slot->respBuffer, absResp);
                 } else {
                     uint32_t offset = slot->maxRespSize - absResp;
-                    memcpy(outResp.data(), slot->respBuffer + offset, absResp);
+                    Platform::CopySmall(outResp.data(), slot->respBuffer + offset, absResp);
                 }
             }
             resultSize = (int)absResp;
@@ -700,6 +700,138 @@ public:
         slot->header->state.store(SLOT_FREE, std::memory_order_release);
 
         return Result<int>(resultSize);
+    }
+
+    /**
+     * @brief Sends a request on a slot the caller already holds, re-arming it
+     *        without the per-send claim cycle (held-slot session, v0.8.5).
+     *
+     * Precondition: the slot is held by this caller — state == SLOT_BUSY,
+     * owned since AcquireSlot/AcquireSpecificSlot or a previous successful
+     * SendHeld. The claim-cycle costs this skips (gen bump + state CAS +
+     * acquire loads + terminal SLOT_FREE store, ~9 ns/RTT measured on Zen2)
+     * are pure overhead for a caller that statically owns its slot: the host
+     * itself parked the slot at SLOT_BUSY, so there is nobody to arbitrate
+     * against. The guest never observes SLOT_FREE — its worker waits only for
+     * SLOT_REQ_READY (go/direct.go) — so republishing REQ_READY straight from
+     * the parked state is protocol-identical to a fresh claim (the guest-side
+     * GuestSlot.Send has re-armed this way since v0.6).
+     *
+     * On success the slot is parked back at SLOT_BUSY (still held, immune to
+     * tryClaimSlot's zombie branch, which only steals REQ/RESP/GUEST_BUSY).
+     * The park happens BEFORE activeWait is dropped, so no instant exists
+     * where state==SLOT_RESP_READY with activeWait==false — this closes the
+     * steal window rather than widening it (mirrors the guest-side
+     * consume-claim ordering in go/guest_slot.go).
+     *
+     * Lease contract (SPEC §3.6): the lease is refreshed on every SendHeld,
+     * but a held slot idle between sends looks abandoned once its lease
+     * outages the opt-in auto-reclaim threshold — callers using
+     * SetAutoReclaimTimeoutNs must keep the threshold above their maximum
+     * inter-send gap, exactly as the existing long-transaction contract
+     * requires. Note that `gen` is bumped only at the initial claim, so a
+     * held session's reclaim safety rests on that threshold contract, not on
+     * the per-send gen handshake other claim paths get.
+     *
+     * Error semantics: BufferTooSmall/InvalidArgs leave the slot held (nothing
+     * was published). Timeout leaves the transaction in flight — the caller
+     * MUST disown the slot (it becomes reclaimable via the zombie/lease
+     * paths). ProtocolViolation/InternalError release the slot to SLOT_FREE;
+     * the caller must also disown it.
+     *
+     * @return Result<int> Response size on success (slot still held).
+     */
+    Result<int> SendHeld(int32_t slotIdx, int32_t size, MsgType msgType, std::vector<uint8_t>& outResp, uint32_t timeoutMs = USE_DEFAULT_TIMEOUT) {
+        if (slotIdx < 0 || slotIdx >= (int32_t)numSlots) return Result<int>(Error::InvalidArgs);
+        Slot* slot = &slots[slotIdx];
+
+        uint32_t absSize = (size < 0) ? (0u - (uint32_t)size) : (uint32_t)size;
+        if (absSize > slot->maxReqSize) {
+             return Result<int>(Error::BufferTooSmall);
+        }
+
+        slot->header->reqSize = size;
+        slot->header->msgType = msgType;
+        uint32_t currentSeq = slot->msgSeq;
+        slot->header->msgSeq = currentSeq;
+        slot->msgSeq += msgSeqStride;
+
+        // Per-send lease heartbeat: the claim-time stamp is the only lease a
+        // held slot would otherwise ever get, so a long session would look
+        // abandoned to TryReclaimAbandonedSlot without this refresh.
+        slot->header->lease.store(Platform::MonotonicNanos(), std::memory_order_release);
+
+        // Arm + publish, identical to WaitResponse — except the post-wait
+        // consume-claim below requires custom ordering, so the sequence is
+        // open-coded here rather than routed through WaitResponse.
+        slot->activeWait.store(true, std::memory_order_relaxed);
+        slot->header->hostState.store(HOST_STATE_ACTIVE, std::memory_order_relaxed);
+        slot->header->state.store(SLOT_REQ_READY, std::memory_order_seq_cst);
+        if (slot->header->guestState.load(std::memory_order_seq_cst) == GUEST_STATE_WAITING) {
+            Platform::SignalEvent(slot->hReqEvent);
+        }
+
+        uint32_t t = (timeoutMs == USE_DEFAULT_TIMEOUT) ? responseTimeoutMs : timeoutMs;
+        bool ready = WaitForRespReady(slot, t);
+
+        if (!ready) {
+             slot->activeWait.store(false, std::memory_order_release);
+             return Result<int>(Error::Timeout);
+        }
+
+        // Consume-claim: park at SLOT_BUSY BEFORE dropping activeWait. The
+        // load-bearing invariant is NOT "no observer can see RESP_READY with
+        // activeWait==false" (a racing reader that loaded state before this
+        // store can transiently see that pair) — it is that tryClaimSlot's
+        // arbitrating state CAS is sequenced after its activeWait
+        // acquire-load: an observer whose activeWait load returned false
+        // synchronizes-with the store below, therefore its state CAS sees
+        // SLOT_BUSY (not in the steal set) and fails. Dropping activeWait
+        // first would let the CAS win against a still-parked RESP_READY and
+        // double-own the slot. Mirrors go/guest_slot.go's consume-claim.
+        slot->header->state.store(SLOT_BUSY, std::memory_order_release);
+        slot->activeWait.store(false, std::memory_order_release);
+
+        if (slot->header->msgSeq != currentSeq) {
+             // Misbehaving peer: release the slot entirely (same rationale as
+             // SendAcquired) and report; the caller must disown it.
+             slot->header->state.store(SLOT_FREE, std::memory_order_release);
+             return Result<int>(Error::ProtocolViolation);
+        }
+
+        if (slot->header->msgType == MsgType::SYSTEM_ERROR) {
+             slot->header->state.store(SLOT_FREE, std::memory_order_release);
+             return Result<int>(Error::InternalError);
+        }
+
+        int32_t respSize = slot->header->respSize;
+        uint32_t absResp = (respSize < 0) ? (0u - (uint32_t)respSize) : (uint32_t)respSize;
+        if (absResp > slot->maxRespSize) absResp = slot->maxRespSize;
+
+        outResp.resize(absResp);
+        if (absResp > 0) {
+            if (respSize >= 0) {
+                Platform::CopySmall(outResp.data(), slot->respBuffer, absResp);
+            } else {
+                uint32_t offset = slot->maxRespSize - absResp;
+                Platform::CopySmall(outResp.data(), slot->respBuffer + offset, absResp);
+            }
+        }
+
+        // Slot intentionally left at SLOT_BUSY: still held for the next
+        // SendHeld. Release with ReleaseHeldSlot (or HeldSlot's destructor).
+        return Result<int>((int)absResp);
+    }
+
+    /**
+     * @brief Releases a held slot back to SLOT_FREE.
+     *
+     * Only valid on a slot currently held by the caller (parked at SLOT_BUSY
+     * by AcquireSlot/SendHeld). No-op on out-of-range indices.
+     */
+    void ReleaseHeldSlot(int32_t slotIdx) {
+        if (slotIdx < 0 || slotIdx >= (int32_t)numSlots) return;
+        slots[slotIdx].header->state.store(SLOT_FREE, std::memory_order_release);
     }
 };
 

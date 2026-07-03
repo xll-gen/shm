@@ -60,6 +60,10 @@ param(
 
     [switch]$SkipBuild,
     [switch]$VerboseRun,
+    # Normal mode: use the pre-v0.8.5 per-op claim/free cycle instead of the
+    # held-slot session (passes --legacy-claim to the C++ client). For A/B
+    # isolation of the held-slot send path.
+    [switch]$LegacyClaim,
     [int]$StartupSeconds = 2,
     [int]$TimeoutSeconds = 90,
 
@@ -323,6 +327,7 @@ function Invoke-Case {
     if ($Mode -eq 'stream')     { $clientArgs += @('--stream', '-c', $ChunkSize) }
     if ($Mode -eq 'guest-call') { $clientArgs += '--guest-call' }
     if ($InFlight -gt 0)        { $clientArgs += @('-i', $InFlight) }
+    if ($LegacyClaim)           { $clientArgs += '--legacy-claim' }
     if ($VerboseRun)            { $clientArgs += '-v' }
 
     $client = Start-Process -FilePath $CppBinaryResolved `

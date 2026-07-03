@@ -110,7 +110,13 @@ func main() {
 	client.Handle(handler)
 	client.Start()
 
-	// Guest Call Benchmark Logic
+	// Guest Call Benchmark Logic. Ops counter and start time live outside the
+	// goroutine so main() can print the results at shutdown: the old
+	// print-inside-the-goroutine never ran — the final SendGuestCall blocks in
+	// its response timeout while main() exits on client.Wait(), so the cell's
+	// numbers were silently lost from every harness log.
+	var guestCallOps uint64
+	var guestCallStartNs int64 // atomic: written by the sender goroutine, read by main at shutdown
 	if *guestCallMode {
 		go func() {
 			fmt.Println("Starting Guest Call Worker...")
@@ -122,29 +128,24 @@ func main() {
 			for i := range payload {
 				payload[i] = byte(i)
 			}
+			// Response buffer hoisted out of the loop: SendGuestCall allocates
+			// a fresh response slice per call, which is benchmark overhead of
+			// the same kind as the hoisted payload memcpy on the C++ side
+			// (v0.8.4). SendGuestCallBuffer is the API real hot-path callers
+			// should use, so the cell measures it.
+			respBuf := make([]byte, 64)
 
-			var ops uint64
-			start := time.Now()
+			atomic.StoreInt64(&guestCallStartNs, time.Now().UnixNano())
 
 			for {
 				// Send Guest Call
-				_, err := client.SendGuestCall(payload, shm.MsgTypeGuestCall)
+				_, err := client.SendGuestCallBuffer(payload, respBuf, shm.MsgTypeGuestCall)
 				if err != nil {
 					// Host shutdown or timeout
 					break
 				}
-				atomic.AddUint64(&ops, 1)
-
-				if atomic.LoadUint64(&ops)%10000 == 0 {
-					// Check if stopped?
-				}
+				atomic.AddUint64(&guestCallOps, 1)
 			}
-			elapsed := time.Since(start)
-			finalOps := atomic.LoadUint64(&ops)
-			fmt.Printf("Guest Call Results:\n")
-			fmt.Printf("  Total Ops:      %s\n", formatUint(finalOps))
-			fmt.Printf("  Duration:       %v\n", elapsed)
-			fmt.Printf("  Throughput:     %s ops/s\n", formatFloat(float64(finalOps)/elapsed.Seconds()))
 		}()
 	}
 
@@ -164,6 +165,15 @@ func main() {
 		fmt.Println("Signal received, exiting...")
 	case <-done:
 		fmt.Println("Client stopped (Host Shutdown).")
+	}
+
+	if startNs := atomic.LoadInt64(&guestCallStartNs); *guestCallMode && startNs != 0 {
+		elapsed := time.Since(time.Unix(0, startNs))
+		finalOps := atomic.LoadUint64(&guestCallOps)
+		fmt.Printf("Guest Call Results:\n")
+		fmt.Printf("  Total Ops:      %s\n", formatUint(finalOps))
+		fmt.Printf("  Duration:       %v\n", elapsed)
+		fmt.Printf("  Throughput:     %s ops/s\n", formatFloat(float64(finalOps)/elapsed.Seconds()))
 	}
 
 	gSpin := shm.WaitStatsSpinSuccess()

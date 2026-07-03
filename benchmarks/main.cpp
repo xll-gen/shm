@@ -23,7 +23,11 @@ int DURATION_SEC = 10;
 bool VERBOSE = false;
 bool GUEST_CALL_MODE = false;
 bool STREAM_MODE = false;
-int IN_FLIGHT = 0; // 0 = mode-default (stream: 4, normal: 1). Set via -i <n>.
+// Normal mode sends via a per-worker held-slot session (AcquireHeldSlot once,
+// SendHeld per op) — the claim-free fast path added in v0.8.5. --legacy-claim
+// restores the per-op AcquireSpecificSlot/SLOT_FREE cycle for A/B comparison.
+bool LEGACY_CLAIM = false;
+int IN_FLIGHT = 0; // 0 = mode-default (stream: 2 = library StreamSender default, normal: 1). Set via -i <n>.
 // AffinityMode (mirrors Go's affinity.go enum):
 //   0 = auto    (default; pin to CCX[N % numCCX] iff multi-CCX, else no-op)
 //   1 = none    (explicit off)
@@ -141,12 +145,17 @@ void WorkerThread(DirectHost* host, int id, int totalSlots) {
     // Stream-mode pipelining: each worker uses IN_FLIGHT slots from the pool,
     // so main() allocates numHostSlots = NUM_THREADS * IN_FLIGHT in stream mode.
     // Normal mode keeps the 1:1 thread-to-slot mapping (maxInFlight=1).
-    // Default IN_FLIGHT=4 for stream when not set (overlaps host memcpy
-    // of chunk N with guest memcpy of chunk N-1; the bench prior to v0.7.12
-    // hard-clamped to 1, severely under-reporting StreamSender's capability).
     int maxInFlight = STREAM_MODE ? IN_FLIGHT : 1;
 
     StreamSender streamSender(host, maxInFlight);
+
+    // Held-slot session for normal mode (default): claim this worker's
+    // dedicated slot once, re-arm per op. Reacquired inside the loop if a
+    // send error disowns it.
+    DirectHost::HeldSlot held;
+    if (!STREAM_MODE && !LEGACY_CLAIM) {
+        held = host->AcquireHeldSlot(id);
+    }
 
     int sampleCountdown = 1; // sample the 1st op, then every kLatencySampleStride-th
     std::chrono::steady_clock::time_point start;
@@ -184,7 +193,26 @@ void WorkerThread(DirectHost* host, int id, int totalSlots) {
             // Normal Mode
             memcpy(sendBuf.data(), &localReqId, 8);
 
-            auto res = host->SendToSlot(id, sendBuf.data(), (int32_t)sendBuf.size(), MsgType::NORMAL, resp);
+            Result<int> res(Error::InvalidArgs);
+            if (LEGACY_CLAIM) {
+                res = host->SendToSlot(id, sendBuf.data(), (int32_t)sendBuf.size(), MsgType::NORMAL, resp);
+            } else {
+                if (!held.IsValid()) {
+                    held = host->AcquireHeldSlot(id);
+                    if (!held.IsValid()) {
+                        // Acquire can fail when `running` flips during
+                        // shutdown; re-check the loop condition instead of
+                        // writing through a null GetReqBuffer().
+                        stats.errors++;
+                        continue;
+                    }
+                }
+                // Request copy into the shm slot, same work SendToSlot does
+                // in-library on the legacy path (inline fast path, see
+                // Platform::CopySmall).
+                Platform::CopySmall(held.GetReqBuffer(), sendBuf.data(), sendBuf.size());
+                res = held.Send((int32_t)sendBuf.size(), MsgType::NORMAL, resp);
+            }
 
             if (res.HasError()) {
                 stats.errors++;
@@ -225,22 +253,21 @@ void WorkerThread(DirectHost* host, int id, int totalSlots) {
     }
 }
 
-void GuestCallListener(DirectHost* host) {
-    while (running) {
-        host->ProcessGuestCalls([](const uint8_t* req, int32_t reqSize, uint8_t* resp, uint32_t maxRespSize, MsgType msgType) -> int32_t {
-            if (msgType == MsgType::GUEST_CALL) {
-                // Echo back
-                // Simple echo
-                int32_t copySize = reqSize;
-                if (copySize > (int32_t)maxRespSize) copySize = maxRespSize;
-                memcpy(resp, req, copySize);
-                return copySize;
-            }
-            return 0;
-        });
-        // Yield to prevent 100% CPU on listener thread
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+// Guest-call echo handler, served by the library's event-driven worker
+// (DirectHost::Start → GuestCallWorker::GuestWorkerLoop). The previous
+// hand-rolled listener polled ProcessGuestCalls with an unconditional 1 ms
+// sleep, so the cell measured the poll quantum rather than the IPC — every
+// guest call parked and per-call latency was dominated by up to 1 ms of
+// listener sleep. The production worker blocks on the shared guest-call
+// request event instead.
+int32_t GuestCallEcho(const uint8_t* req, int32_t reqSize, uint8_t* resp, uint32_t maxRespSize, MsgType msgType) {
+    if (msgType == MsgType::GUEST_CALL) {
+        int32_t copySize = reqSize;
+        if (copySize > (int32_t)maxRespSize) copySize = maxRespSize;
+        memcpy(resp, req, copySize);
+        return copySize;
     }
+    return 0;
 }
 
 int main(int argc, char** argv) {
@@ -253,7 +280,8 @@ int main(int argc, char** argv) {
             std::cout << "  -s <bytes>      Data size (default: 64). In Stream Mode, this is total stream size." << std::endl;
             std::cout << "  -c <bytes>      Chunk size for Stream Mode (default: 4096)." << std::endl;
             std::cout << "  -d <seconds>    Duration in seconds (default: 10)" << std::endl;
-            std::cout << "  -i <n>          In-flight chunks per stream worker (default: 4 in stream mode, 1 otherwise)" << std::endl;
+            std::cout << "  -i <n>          In-flight chunks per stream worker (default: 1; depth 2 measured slower on this workload, see main.cpp)" << std::endl;
+            std::cout << "  --legacy-claim  Normal mode: per-op claim/free cycle instead of the held-slot session (A/B)" << std::endl;
             std::cout << "  --affinity <m>  Worker thread CPU affinity: auto | none | local | sibling (default: auto)" << std::endl;
             std::cout << "  -v              Verbose logging" << std::endl;
             std::cout << "  --name <name>   SHM Name (default: SimpleIPC)" << std::endl;
@@ -278,15 +306,20 @@ int main(int argc, char** argv) {
         if (strcmp(argv[i], "--name") == 0 && i + 1 < argc) SHM_NAME = argv[++i];
         if (strcmp(argv[i], "--guest-call") == 0) GUEST_CALL_MODE = true;
         if (strcmp(argv[i], "--stream") == 0) STREAM_MODE = true;
+        if (strcmp(argv[i], "--legacy-claim") == 0) LEGACY_CLAIM = true;
     }
 
-    // Mode-default for IN_FLIGHT (0 sentinel = unset).
-    // Default 1 across both modes to preserve v0.7.11-baseline-comparable numbers;
-    // the bench can opt into pipelining via -i <n>. Empirical sweep on Ryzen 9
-    // 3900X (2026-06-26): inFlight 1→8 on 1T/16MiB/4MiB-chunks yielded only
-    // ~8% throughput gain (191→206 ops/s) and inFlight=4 on 1T/1MiB/256K-chunks
-    // regressed by ~31% — the host/guest memcpys share the same memory controller,
-    // so overlapping them in time does not relieve the dominant bandwidth bottleneck.
+    // Mode-default for IN_FLIGHT (0 sentinel = unset). Default 1 in both
+    // modes — measured, not assumed: a 2026-07-04 A/B on the Ryzen 9 3900X
+    // (direct-into-destination reassembler, 4KiB chunks) found depth 2 LOSES
+    // to depth 1 on every stream-profile cell, including the 16MiB cell where
+    // depth 2 had previously looked good against the old double-copy
+    // reassembler (1T/16MiB: depth1 186 ops/s vs depth2 139; 64KiB cells
+    // -18..-36%; depth 2 also doubles numHostSlots, pushing 8T past the
+    // 12-SMT-pair Sibling-affinity fit). NOTE this contradicts the shipping
+    // library defaults (C++ StreamSender inFlight=2, Go stream_sender
+    // maxInFlight=2) — recorded as a library-default review item in the
+    // backlog rather than hidden with a bench-only gate. Override with -i <n>.
     if (IN_FLIGHT <= 0) IN_FLIGHT = 1;
     if (!STREAM_MODE && IN_FLIGHT != 1) IN_FLIGHT = 1; // pipelining only applies to stream mode
 
@@ -365,10 +398,9 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Start Listener if needed
-    std::thread listenerThread;
+    // Start the library's event-driven guest-call worker if needed
     if (GUEST_CALL_MODE) {
-        listenerThread = std::thread(GuestCallListener, &host);
+        host.Start(GuestCallEcho);
     }
 
     // Start Workers
@@ -400,7 +432,7 @@ int main(int argc, char** argv) {
     // Stop
     running = false;
     for (auto& t : threads) t.join();
-    if (listenerThread.joinable()) listenerThread.join();
+    if (GUEST_CALL_MODE) host.Stop();
 
     // Send Shutdown to Guest
     std::cout << "Sending Shutdown..." << std::endl;

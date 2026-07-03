@@ -117,7 +117,9 @@ public:
                     slot->header->respSize = 0;
                     slot->header->msgType = MsgType::SYSTEM_ERROR;
                     slot->header->state.store(SLOT_RESP_READY, std::memory_order_seq_cst);
-                    Platform::SignalEvent(slot->hRespEvent);
+                    if (slot->header->guestState.load(std::memory_order_seq_cst) == GUEST_STATE_WAITING) {
+                        Platform::SignalEvent(slot->hRespEvent);
+                    }
                     processed++;
                     continue;
                 }
@@ -139,8 +141,19 @@ public:
 
                 slot->header->respSize = respSize;
 
+                // Signal elision (two-sided Dekker, same pattern as
+                // SlotAllocator's REQ_READY publish): the guest caller
+                // stores guestState=GUEST_STATE_WAITING with seq_cst and
+                // re-checks `state` before parking (go/direct.go), so a
+                // seq_cst RESP_READY publish followed by a seq_cst
+                // guestState load can never both miss — either the guest
+                // sees RESP_READY and skips the park, or we see WAITING and
+                // deliver the (kernel-priced) SetEvent. A spinning guest
+                // costs no syscall at all.
                 slot->header->state.store(SLOT_RESP_READY, std::memory_order_seq_cst);
-                Platform::SignalEvent(slot->hRespEvent);
+                if (slot->header->guestState.load(std::memory_order_seq_cst) == GUEST_STATE_WAITING) {
+                    Platform::SignalEvent(slot->hRespEvent);
+                }
 
                 processed++;
             }
