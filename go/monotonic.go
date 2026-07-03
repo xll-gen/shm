@@ -9,9 +9,11 @@ import "time"
 //
 // We deliberately use wall-clock (not Go's monotonic clock) so the value
 // is comparable across processes AND across languages: C++ side stores
-// CLOCK_REALTIME / GetSystemTimePreciseAsFileTime (see
-// Platform::MonotonicNanos in include/shm/Platform.h) and Go stores
-// time.Now().UnixNano(). Both sit in the same Unix-epoch timeline.
+// GetSystemTimeAsFileTime (coarse system tick, ~0.5-15.6 ms — see
+// Platform::MonotonicNanos in include/shm/Platform.h and the resolution
+// note in SPECIFICATION.md §3.6) and Go stores time.Now().UnixNano().
+// Both sit in the same Unix-epoch timeline; the resolution asymmetry is
+// bounded by one tick and reclaim thresholds are seconds-scale.
 //
 // NOT strictly monotonic — an NTP step can move the clock backward.
 // Acceptable for lease purposes: a backward step causes a spurious

@@ -34,13 +34,29 @@ int IN_FLIGHT = 0; // 0 = mode-default (stream: 4, normal: 1). Set via -i <n>.
 // Set via --affinity auto | none | local | sibling.
 int AFFINITY_MODE = 0;
 
-struct BenchmarkStats {
-    std::atomic<uint64_t> ops{0};
-    std::atomic<uint64_t> latencySum{0}; // Microseconds
-    std::atomic<uint64_t> errors{0};
+// Per-worker stats, one cache line each. The previous version was a single
+// global struct of three adjacent std::atomic<uint64_t> — one shared cache
+// line hammered with two RMWs per op from every worker thread, the exact
+// counterpart of the Go-side WaitStats false-sharing defect fixed 2026-06-26
+// (go/spin.go paddedU64, +4–9% at 4T/8T). Each worker is the sole writer of
+// its own entry and main() reads only after join(), so plain (non-atomic)
+// fields are sufficient and the per-op RMWs disappear entirely.
+struct alignas(64) BenchmarkStats {
+    uint64_t ops{0};
+    uint64_t latencySumNs{0}; // Nanoseconds, over sampled ops only
+    uint64_t samples{0};      // Ops that contributed to latencySumNs
+    uint64_t errors{0};
 };
+static_assert(sizeof(BenchmarkStats) == 64, "one cache line per worker");
 
-BenchmarkStats globalStats;
+// Latency is sampled (1-in-61 ops) rather than timed per-op: two
+// steady_clock::now() calls (QPC, ~2x20 ns) inside every measured op are
+// benchmark overhead of the same order as the IPC RTT itself, and the old
+// microsecond truncation reported 0 for sub-us RTTs. Prime stride avoids
+// op-index-correlated periodicity with the guest's Gosched-every-4096 cadence.
+constexpr int kLatencySampleStride = 61;
+
+std::vector<BenchmarkStats> perThreadStats; // sized in main() before workers start
 std::atomic<bool> running{true};
 
 std::string FormatNumber(uint64_t n) {
@@ -67,6 +83,7 @@ std::string FormatNumber(double n) {
 }
 
 void WorkerThread(DirectHost* host, int id, int totalSlots) {
+    BenchmarkStats& stats = perThreadStats[id];
     // CPU affinity: pin this host worker thread to the LP its matching
     // guest goroutine targets, via a deterministic slot-index round-robin
     // mapping. Mode semantics (mirror Go's affinity.go::resolveAuto):
@@ -114,6 +131,9 @@ void WorkerThread(DirectHost* host, int id, int totalSlots) {
     resp.reserve(DATA_SIZE + 8);
 
     std::vector<uint8_t> sendBuf(DATA_SIZE + 8);
+    // The payload bytes after the 8-byte reqId are invariant across ops:
+    // fill them once here so the per-op work is a single 8-byte write.
+    memcpy(sendBuf.data() + 8, req.data(), DATA_SIZE);
 
     int errorLogCount = 0;
     const int MAX_ERROR_LOGS = 5;
@@ -128,9 +148,16 @@ void WorkerThread(DirectHost* host, int id, int totalSlots) {
 
     StreamSender streamSender(host, maxInFlight);
 
+    int sampleCountdown = 1; // sample the 1st op, then every kLatencySampleStride-th
+    std::chrono::steady_clock::time_point start;
+
     while (running) {
         localReqId++;
-        auto start = std::chrono::steady_clock::now();
+        bool sampled = STREAM_MODE || (--sampleCountdown == 0);
+        if (sampled) {
+            sampleCountdown = kLatencySampleStride;
+            start = std::chrono::steady_clock::now();
+        }
 
         if (STREAM_MODE) {
              // Send Stream
@@ -142,28 +169,25 @@ void WorkerThread(DirectHost* host, int id, int totalSlots) {
              auto end = std::chrono::steady_clock::now();
 
              if (res.HasError()) {
-                 globalStats.errors++;
+                 stats.errors++;
                  if (VERBOSE && errorLogCount < MAX_ERROR_LOGS) {
                      std::cerr << "[Thread " << id << "] Stream Send failed: " << (int)res.GetError() << std::endl;
                      errorLogCount++;
                  }
              } else {
-                 globalStats.ops++;
-                 auto lat = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-                 globalStats.latencySum += lat;
+                 stats.ops++;
+                 stats.latencySumNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+                 stats.samples++;
              }
 
         } else {
             // Normal Mode
             memcpy(sendBuf.data(), &localReqId, 8);
-            memcpy(sendBuf.data() + 8, req.data(), DATA_SIZE);
 
             auto res = host->SendToSlot(id, sendBuf.data(), (int32_t)sendBuf.size(), MsgType::NORMAL, resp);
 
-            auto end = std::chrono::steady_clock::now();
-
             if (res.HasError()) {
-                globalStats.errors++;
+                stats.errors++;
                 if (VERBOSE && errorLogCount < MAX_ERROR_LOGS) {
                     std::cerr << "[Thread " << id << "] Send failed." << std::endl;
                     errorLogCount++;
@@ -177,18 +201,21 @@ void WorkerThread(DirectHost* host, int id, int totalSlots) {
                 uint64_t respId = 0;
                 memcpy(&respId, resp.data(), 8);
                 if (respId != localReqId) {
-                    globalStats.errors++;
+                    stats.errors++;
                     if (VERBOSE && errorLogCount < MAX_ERROR_LOGS) {
                         std::cerr << "[Thread " << id << "] ID Mismatch. Sent: " << localReqId << " Got: " << respId << std::endl;
                         errorLogCount++;
                     }
                     continue;
                 }
-                globalStats.ops++;
-                auto lat = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-                globalStats.latencySum += lat;
+                stats.ops++;
+                if (sampled) {
+                    auto end = std::chrono::steady_clock::now();
+                    stats.latencySumNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+                    stats.samples++;
+                }
             } else {
-                globalStats.errors++;
+                stats.errors++;
                 if (VERBOSE && errorLogCount < MAX_ERROR_LOGS) {
                     std::cerr << "[Thread " << id << "] Short response." << std::endl;
                     errorLogCount++;
@@ -345,6 +372,7 @@ int main(int argc, char** argv) {
     }
 
     // Start Workers
+    perThreadStats.assign(NUM_THREADS, BenchmarkStats{});
     std::vector<std::thread> threads;
     for (int i = 0; i < NUM_THREADS; ++i) {
         threads.emplace_back(WorkerThread, &host, i, NUM_THREADS);
@@ -379,9 +407,14 @@ int main(int argc, char** argv) {
     host.SendShutdown();
 
     // Print Results
-    uint64_t totalOps = globalStats.ops;
-    uint64_t totalErr = globalStats.errors;
-    double avgLat = totalOps > 0 ? (double)globalStats.latencySum / totalOps : 0.0;
+    uint64_t totalOps = 0, totalErr = 0, totalLatNs = 0, totalSamples = 0;
+    for (const auto& st : perThreadStats) {
+        totalOps += st.ops;
+        totalErr += st.errors;
+        totalLatNs += st.latencySumNs;
+        totalSamples += st.samples;
+    }
+    double avgLat = totalSamples > 0 ? (double)totalLatNs / totalSamples / 1000.0 : 0.0;
     double throughput = (double)totalOps / DURATION_SEC;
     double totalBytes = (double)totalOps * DATA_SIZE;
     double throughputBytes = totalBytes / DURATION_SEC;

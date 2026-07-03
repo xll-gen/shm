@@ -1,6 +1,7 @@
 package shm
 
 import (
+	"runtime"
 	"testing"
 )
 
@@ -70,6 +71,16 @@ func TestAffinityAutoChipsetAware(t *testing.T) {
 	pairs := SmtPairs()
 	masks := CcxMasks()
 
+	// This test exercises the topology decision only; keep GOMAXPROCS above
+	// every numSlots used below so the oversubscription gate (verified
+	// separately in TestAffinityAutoOversubscriptionGate) never fires here,
+	// including under `go test -cpu=1`.
+	prev := runtime.GOMAXPROCS(0)
+	if want := len(pairs) + 8; prev < want {
+		runtime.GOMAXPROCS(want)
+		defer runtime.GOMAXPROCS(prev)
+	}
+
 	if len(pairs) > 0 {
 		// Case 1: numSlots <= numPairs → Sibling. Slot 0 must equal pairs[0].Guest.
 		if got := affinityMaskForSlot(0, len(pairs), AffinityAuto); got != pairs[0].Guest {
@@ -111,6 +122,52 @@ func TestAffinityAutoChipsetAware(t *testing.T) {
 	for _, m := range []AffinityMode{AffinityNone, AffinityLocal, AffinitySibling} {
 		if got := resolveAuto(8, m); got != m {
 			t.Errorf("resolveAuto(numSlots=8, %v) = %v, want passthrough %v", m, got, m)
+		}
+	}
+}
+
+// TestAffinityAutoOversubscriptionGate verifies that AffinityAuto disables
+// pinning when GOMAXPROCS is below the worker (slot) count. A pinned worker
+// holds its P while spinning; under oversubscription that only adds P-level
+// contention without the cache-locality payoff, so Auto must degrade to
+// AffinityNone. Explicit (non-Auto) modes are the caller's responsibility and
+// are NOT gated — verified at the end.
+func TestAffinityAutoOversubscriptionGate(t *testing.T) {
+	prev := runtime.GOMAXPROCS(0)
+	defer runtime.GOMAXPROCS(prev)
+
+	pairs := SmtPairs()
+	masks := CcxMasks()
+
+	// Pick a numSlots that Auto would pin at ample GOMAXPROCS, and that is
+	// >= 2 so we can set GOMAXPROCS one below it (GOMAXPROCS(n<=0) is a no-op).
+	var numSlots int
+	switch {
+	case len(pairs) >= 2:
+		numSlots = len(pairs) // resolves to Sibling
+	case len(masks) > 1:
+		numSlots = 2 // resolves to Local (multi-CCX, numSlots > pairs)
+	default:
+		t.Skip("host offers no Auto pinning (no SMT pairs / single L3); gate is a no-op here")
+	}
+
+	// Ample Ps (GOMAXPROCS >= numSlots): Auto keeps pinning.
+	runtime.GOMAXPROCS(numSlots)
+	if got := resolveAuto(numSlots, AffinityAuto); got == AffinityNone {
+		t.Fatalf("GOMAXPROCS=%d >= numSlots=%d: Auto should still pin, got AffinityNone", numSlots, numSlots)
+	}
+
+	// Oversubscribed (GOMAXPROCS < numSlots): Auto must back off to None.
+	runtime.GOMAXPROCS(numSlots - 1)
+	if got := resolveAuto(numSlots, AffinityAuto); got != AffinityNone {
+		t.Errorf("GOMAXPROCS=%d < numSlots=%d: Auto must degrade to AffinityNone, got %v", numSlots-1, numSlots, got)
+	}
+
+	// Explicit modes are never gated — the caller owns thread placement.
+	runtime.GOMAXPROCS(1)
+	for _, m := range []AffinityMode{AffinityLocal, AffinitySibling} {
+		if got := resolveAuto(numSlots, m); got != m {
+			t.Errorf("explicit %v must pass through even when oversubscribed, got %v", m, got)
 		}
 	}
 }

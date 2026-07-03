@@ -92,6 +92,47 @@ Surplus-slot cases fall back to `AffinityLocal` (multi-CCX) or no-pin
 for the full resolution order and per-CPU-family guidance, and
 `affinity.go::resolveAuto` for the implementation.
 
+### Hot-path micro-optimizations + measurement-fidelity overhaul (2026-07-03)
+
+Same Ryzen 9 3900X host, `harness.ps1 -HighPriority`, quick matrix, 10 s
+cells, **best of 3**, AffinityAuto (→Sibling). Two orthogonal change groups
+were A/B'd back-to-back in one session (see `EXPERIMENTS.md`
+§"2026-07-03 hot-path timer/false-sharing pass" for the full method):
+
+**Library changes** (coarse lease clock ~26→5 ns/claim; lazy acquire-timeout
+QPC; `alignas(64)` host `Slot` bookkeeping), measured with the **unchanged old
+benchmark binary** so the delta is purely the library:
+
+| Cell | baseline (v0.8.3) | lib changes | Δ |
+|:---|---:|---:|---:|
+| 1T / 64 B   | 3,349,020 | 4,700,445 | **+40.4%** |
+| 4T / 64 B   | 7,442,280 | 8,379,812 | **+12.6%** |
+| 8T / 64 B   | 10,027,100 | 11,286,164 | **+12.6%** |
+| 1T / 1024 B | 2,929,962 | 3,784,744 | **+29.2%** |
+| 4T / 1024 B | 6,692,473 | 7,300,568 | **+9.1%** |
+| 8T / 1024 B | 10,400,752 | 11,349,987 | **+9.1%** |
+
+**Benchmark-fidelity changes** (per-thread padded non-atomic stats; 1-in-61
+nanosecond latency sampling; hoisted invariant payload memcpy). The old timed
+loop carried ~90 ns/op of its own overhead (2× QPC + 2 uncontended atomic
+RMWs), which the old tables above therefore include. With that removed, the
+same library (lib changes included) measures:
+
+| Cell | Throughput (ops/s) | Avg RTT (µs, sampled ns) |
+|:---|---:|---:|
+| 1T / 64 B   | 8,366,386 | 0.16 |
+| 4T / 64 B   | 14,905,702 | 0.32 |
+| 8T / 64 B   | 19,059,993 | 0.44 |
+| 1T / 1024 B | 6,109,365 | 0.21 |
+| 4T / 1024 B | 12,169,816 | 0.37 |
+| 8T / 1024 B | 17,570,169 | 0.48 |
+
+**⚠ Baseline discontinuity:** rows in this table (and every future run of the
+updated `benchmarks/main.cpp`) are **not comparable** to any table above this
+section — earlier numbers under-report throughput by the removed bench
+overhead and their sub-µs "Avg Latency" values were microsecond-truncation
+artifacts. Compare new runs only against this section onward.
+
 ### Streaming chunk-size sweep (1 thread, native Windows, 2026-06-26)
 
 Stream mode total bandwidth as a function of chunk size at fixed total

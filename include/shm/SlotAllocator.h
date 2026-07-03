@@ -22,7 +22,18 @@ namespace shm {
  * to it. Fields, default constructor, and move constructor are unchanged from
  * the original DirectHost::Slot.
  */
-struct Slot {
+// alignas(64): each Slot carries per-transaction mutable host-side state
+// (waitStrategy.currentLimit, msgSeq, activeWait) written on every RTT by the
+// worker thread that owns the slot. The 57 bytes of fields already round up to
+// sizeof 64 (8-byte struct alignment), but WITHOUT alignas the vector's backing
+// array is only 8-aligned, so consecutive 64-byte slots straddle cache-line
+// boundaries inside SlotAllocator::slots — two pinned worker threads then
+// ping-pong a line that neither shares logically. alignas(64) raises alignof
+// 8→64 so the array base is cache-line aligned and each slot occupies exactly
+// one line: process-local false sharing eliminated, invisible to the frozen
+// shared-memory ABI (SlotHeader/ExchangeHeader are untouched; this struct never
+// enters the mapping). One cache line per slot = exclusive worker ownership.
+struct alignas(64) Slot {
     SlotHeader* header;
     uint8_t* reqBuffer;
     uint8_t* respBuffer;
@@ -54,6 +65,12 @@ struct Slot {
         other.hRespEvent = nullptr;
     }
 };
+
+// One cache line per slot: catches future field growth that would silently
+// re-introduce cross-slot false sharing (grow the alignment deliberately if
+// the struct ever legitimately outgrows 64 bytes).
+static_assert(sizeof(Slot) == 64, "Slot must occupy exactly one cache line");
+static_assert(alignof(Slot) == 64, "Slot must be cache-line aligned");
 
 /**
  * @class SlotAllocator
@@ -335,7 +352,15 @@ public:
         Slot* slot = &slots[slotIdx];
 
         uint32_t effectiveTimeout = (timeoutMs == USE_DEFAULT_TIMEOUT) ? responseTimeoutMs : timeoutMs;
-        auto start = std::chrono::steady_clock::now();
+        // Timeout clock is taken lazily on the first slow-path entry: the
+        // common case claims the slot on the first tryClaimSlot and never
+        // needs a timestamp, so the eager steady_clock::now() (one QPC,
+        // ~20-25 ns) sat on every RTT for nothing. `timing` must be set at
+        // most once, OUTSIDE the retry loop — `retries` is reset to 0 after
+        // every ThreadYield, so re-taking `start` per slow-path entry would
+        // mean elapsed never accumulates and the timeout never fires.
+        std::chrono::steady_clock::time_point start;
+        bool timing = false;
         int retries = 0;
 
         while(true) {
@@ -348,6 +373,10 @@ public:
              if (retries > 1000) {
                  if (effectiveTimeout != 0xFFFFFFFF) {
                      auto now = std::chrono::steady_clock::now();
+                     if (!timing) {
+                         start = now;
+                         timing = true;
+                     }
                      auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
                      if (elapsed >= effectiveTimeout) {
                          return -1;

@@ -3,6 +3,7 @@ package shm
 import (
 	"fmt"
 	"math"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -412,6 +413,17 @@ func NewDirectGuest(name string) (*DirectGuest, error) {
 //
 //	It must return the response size (negative for end-aligned) and response message type.
 func (g *DirectGuest) Start(handler func(req []byte, resp []byte, msgType MsgType) (int32, MsgType)) {
+	// One-shot diagnostic: report the resolved affinity policy alongside the
+	// P/worker ratio. When AffinityAuto backs off to "none" because
+	// GOMAXPROCS < numSlots (see resolveAuto's oversubscription gate), this is
+	// the only place that surfaces it.
+	resolved := resolveAuto(int(g.numSlots), g.affinityMode)
+	Info("Starting DirectGuest workers",
+		"slots", g.numSlots,
+		"gomaxprocs", runtime.GOMAXPROCS(0),
+		"affinity", g.affinityMode.String(),
+		"resolved", resolved.String())
+
 	for i := 0; i < int(g.numSlots); i++ {
 		g.wg.Add(1)
 		go g.workerLoop(i, handler)

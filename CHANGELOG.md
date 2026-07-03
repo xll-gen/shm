@@ -1,5 +1,76 @@
 # Changelog
 
+## [v0.8.4] - 2026-07-03
+
+No wire-protocol/ABI change — `SHM_VERSION` remains `0x00070000`;
+`SlotHeader`/`ExchangeHeader` layouts untouched. Host hot-path
+micro-optimizations plus a benchmark measurement-fidelity overhaul
+(2026-07-03 multi-agent perf hunt; same-session A/B on Ryzen 9 3900X,
+best-of-3, `-HighPriority`), and one Go-side default-affinity policy
+change (see **Changed**).
+
+### Changed
+
+- **`AffinityAuto` oversubscription gate (Go)** — `resolveAuto` now returns
+  `AffinityNone` when `GOMAXPROCS(0) < numSlots`, *before* consulting chipset
+  topology. A pinned worker holds its P across each spin burst; with fewer Ps
+  than slot workers, pinning yields no cache-locality benefit and instead
+  deepens P-contention (runnable workers queue behind spinners for a P). This
+  changes the resolved policy only for the default (`AffinityAuto`) on
+  oversubscribed configs — explicit `AffinityLocal`/`AffinitySibling` are
+  passed through untouched (caller owns that trade-off). `DirectGuest.Start`
+  now emits a one-shot diagnostic (`slots`/`gomaxprocs`/`affinity`/`resolved`)
+  so the back-off is observable. Go-side heuristic only; wire ABI unaffected.
+
+### Performance
+
+- **Coarse lease clock (C++ host)** — `Platform::MonotonicNanos` now reads
+  `GetSystemTimeAsFileTime` (KUSER_SHARED_DATA tick, ~5 ns) instead of the
+  QPC-backed `GetSystemTimePreciseAsFileTime` (~26 ns). The call sits on every
+  slot claim (lease stamp, SPECIFICATION §3.6). Same Unix-epoch timeline;
+  0.5–15.6 ms tick granularity is irrelevant to second-scale reclaim
+  thresholds, and the §3.6.1 `gen`-CAS handshake — not lease equality — is the
+  ABA guard. Go side unchanged (`time.Now()` already reads the shared page,
+  ~6 ns). Note: `lease` is a cross-boundary value (host writes, Go reads) — its
+  *resolution* coarsens (≤ one tick skew) though its type/units/offset do not;
+  this only makes reclamation more conservative and cannot induce a collision
+  against seconds-scale thresholds.
+- **Lazy acquire-timeout clock** — `SlotAllocator::AcquireSpecificSlot` no
+  longer takes a `steady_clock::now()` (one QPC) on the claim fast path; the
+  timeout clock starts on first slow-path entry, latched once so the timeout
+  still accumulates across retry sweeps.
+- **`Slot` cache-line isolation** — host-process-local `shm::Slot` bookkeeping
+  (waitStrategy limit, msgSeq, activeWait — all written per RTT) is now
+  `alignas(64)` with size/alignment static_asserts. The 57 field-bytes already
+  round to sizeof 64, but without alignas the `std::vector<Slot>` base is only
+  8-aligned so consecutive slots straddle cache lines, false-sharing between
+  pinned worker threads; alignas raises alignof 8→64 so each slot owns one line.
+  Never enters the shared mapping — ABI unaffected.
+- Combined library effect (identical old benchmark binary, best-of-3):
+  1T/64B **+40.4%**, 4T/64B **+12.6%**, 8T/64B **+12.6%**, 1T/1024B
+  **+29.2%**, 4T/8T 1024B **+9.1%**.
+
+### Benchmark
+
+- **Measurement-fidelity overhaul of `benchmarks/main.cpp`** — the timed loop
+  was paying ~90 ns/op of its own overhead: two `steady_clock::now()` (QPC)
+  calls per op plus two atomic RMWs on one globally shared stats cache line
+  (the C++ analog of the Go `WaitStats` false-sharing fixed in v0.7.12).
+  Stats are now per-thread, cache-line-aligned, non-atomic (aggregated after
+  join); latency is sampled 1-in-61 in nanoseconds (the old per-op
+  microsecond truncation reported ~0 for sub-µs RTTs); the invariant request
+  payload is copied once per thread instead of per op. **Numbers from the new
+  benchmark are NOT comparable to any previously published table** — with
+  bench overhead removed the same library measures 1T/64B ≈ 8.3M ops/s
+  (~0.16 µs RTT) and 8T/64B ≈ 19M ops/s on the 3900X. See
+  BENCHMARK_RESULTS.md §2026-07-03.
+
+### Fixed
+
+- `tests/test_stream_integration.cpp` — adapted the `DirectHost::Start` lambda
+  to the current `StreamReassembler::Handle(..., size_t&, MsgType&)` signature
+  (pre-existing build drift; the test still requires repo-root CWD to run).
+
 ## [v0.8.3] - 2026-07-02
 
 No wire-protocol/ABI change — `SHM_VERSION` remains `0x00070000`. Slot-claim

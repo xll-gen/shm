@@ -39,6 +39,11 @@ type AffinityMode int
 const (
 	// AffinityAuto — default (zero value). Chipset-aware policy:
 	//
+	//  0. Oversubscription gate: if GOMAXPROCS < numSlots, do NOT pin. A
+	//     pinned worker holds its P across each spin burst; with fewer Ps
+	//     than workers, pinning adds P-contention without a locality payoff
+	//     (runnable workers queue behind spinners for a P). Auto declines.
+	//     This gate is Auto-only — explicit Local/Sibling are never gated.
 	//  1. If the host reports SMT pairs (LTP_PC_SMT) AND numSlots fits
 	//     within len(SmtPairs()), apply AffinitySibling-equivalent
 	//     pinning (slot N → one SMT LP of physical core N % numPairs;
@@ -156,6 +161,15 @@ func SmtPairs() []SmtPair {
 func resolveAuto(numSlots int, mode AffinityMode) AffinityMode {
 	if mode != AffinityAuto {
 		return mode
+	}
+	// Oversubscription gate. A pinned worker holds its P for each spin burst
+	// (waitStrategyAsmChunk iterations between Gosched calls). When there are
+	// fewer Ps than slot workers, pinning yields no cache-locality benefit and
+	// instead deepens P-level contention — runnable workers wait behind
+	// spinners for a P. Below the worker count, Auto declines to pin. Explicit
+	// AffinityLocal/Sibling already returned above (caller owns that trade-off).
+	if numSlots > 0 && runtime.GOMAXPROCS(0) < numSlots {
+		return AffinityNone
 	}
 	pairs := SmtPairs()
 	if numSlots > 0 && len(pairs) > 0 && numSlots <= len(pairs) {

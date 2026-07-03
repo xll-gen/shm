@@ -44,8 +44,14 @@ int main() {
         cv.notify_one();
     });
 
-    host.Start([&](const uint8_t* req, int32_t reqSize, uint8_t* resp, uint32_t maxResp, MsgType type) {
-        return reassembler.Handle(req, reqSize, resp, maxResp, type);
+    host.Start([&](const uint8_t* req, int32_t reqSize, uint8_t* resp, uint32_t maxResp, MsgType type) -> int32_t {
+        (void)maxResp;
+        size_t respSize = 0;
+        MsgType mutableType = type;
+        if (reassembler.Handle(req, (size_t)reqSize, resp, respSize, mutableType)) {
+            return (int32_t)respSize;
+        }
+        return 0;
     });
 
     // Spawn Go process

@@ -262,12 +262,14 @@ In v0.7.0 nothing yet *read* `lease` to make decisions — the field was observa
 
 **Clock contract**: `lease` is **wall-clock nanoseconds since the Unix epoch**, not a monotonic counter. Both sides use it:
 
-| Side | Source |
-| :--- | :--- |
-| C++ Host | `Platform::MonotonicNanos()` — `GetSystemTimePreciseAsFileTime`, normalised to ns-since-Unix-epoch. |
-| Go Guest | `shm.MonotonicNanos()` — `time.Now().UnixNano()`. |
+| Side | Source | Resolution |
+| :--- | :--- | :--- |
+| C++ Host | `Platform::MonotonicNanos()` — `GetSystemTimeAsFileTime`, normalised to ns-since-Unix-epoch. | System timer tick (0.5–15.6 ms). |
+| Go Guest | `shm.MonotonicNanos()` — `time.Now().UnixNano()`. | ~µs or better. |
 
 The name "MonotonicNanos" predates the wall-clock choice; it stays for API stability. Wall-clock was selected so the values are comparable across processes AND across languages without coordinating clock epochs. NTP steps can move the clock backward; a backward step causes at most a spurious reclamation candidate (guarded by the CAS check against `state`), never data corruption.
+
+**Resolution note (2026-07-03)**: the C++ side deliberately uses the *coarse* system time (KUSER_SHARED_DATA tick, ~5 ns/read) rather than `GetSystemTimePreciseAsFileTime` (~26 ns, QPC-backed) because the lease stamp sits on every slot claim. Millisecond granularity is sufficient by construction: reclaim thresholds are seconds-scale, and the §3.6.1 claim-generation handshake — not lease value comparison — is the airtight ABA guard. The lease equality re-check in the reclaim paths only ever compares a fresh stamp against one already stale by the multi-second threshold, so tick granularity can never make those values collide. Two invariants make the asymmetric resolution safe: (a) a coarse `now` on the reclaiming side understates `now - lease`, so C++-side reclamation only becomes *more* conservative, never spurious; (b) cross-language skew (precise Go `now` vs coarse C++-written lease) overstates age by at most one tick (~15.6 ms), so reclaim thresholds MUST stay well above ~16 ms — the standing "5 × `responseTimeoutMs`" guidance (≥ tens of seconds) already guarantees this. Implementations MAY use any wall-clock source in the Unix-epoch timeline with resolution no coarser than ~1/10 of the smallest supported reclaim threshold.
 
 **v0.7.2 — reclamation**:
 

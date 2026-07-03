@@ -212,10 +212,21 @@ public:
      * Despite the name "MonotonicNanos" we are NOT using a monotonic
      * clock; kept this way so v0.7.2's `TryReclaimAbandonedSlot` API
      * has a stable identifier.
+     *
+     * Resolution: `GetSystemTimeAsFileTime` reads the KUSER_SHARED_DATA
+     * tick (0.5–15.6 ms granularity) instead of the QPC-backed precise
+     * variant. This sits on the slot-claim hot path (one lease stamp per
+     * claim, see SPECIFICATION.md §3.6), where the precise call costs
+     * ~26 ns vs ~5 ns for the coarse read (measured 2026-07-02, Ryzen 9
+     * 3900X). Millisecond granularity is sufficient for every consumer:
+     * reclaim thresholds are seconds, and the §3.6.1 ABA guard is the
+     * `gen` CAS handshake — the lease equality re-check only compares a
+     * fresh stamp against one that is already seconds stale, so tick
+     * granularity can never make them collide.
      */
     static uint64_t MonotonicNanos() {
         FILETIME ft;
-        GetSystemTimePreciseAsFileTime(&ft);
+        GetSystemTimeAsFileTime(&ft);
         // FILETIME is 100-ns ticks since 1601-01-01; Unix epoch is
         // 1970-01-01, so subtract the 11644473600-second offset.
         ULARGE_INTEGER ull;

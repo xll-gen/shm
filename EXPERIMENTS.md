@@ -121,3 +121,72 @@ The pre-experiment analysis attributed the expected gain solely to L1d/L2 cache 
 ### Disposition
 
 `AffinitySibling` shipped as **opt-in in v0.8.2**, and the same release made `AffinityAuto` **chipset-aware**: when `len(SmtPairs()) > 0 && numSlots <= len(SmtPairs())`, Auto resolves to Sibling automatically. The fallback chain (Local on multi-CCX, None on monolithic / no-SMT / VM) preserves the v0.8.1 behaviour wherever Sibling is not safe — no host that pinned successfully under v0.8.1 loses its mask under v0.8.2. See `affinity.go::resolveAuto`, `AGENTS.md` §"Affinity Recommendations", and `BENCHMARK_RESULTS.md` §"SMT-sibling A/B" for the wiring and operator guidance.
+
+## 2026-07-03 hot-path timer/false-sharing pass (multi-agent hunt)
+
+A five-lens multi-agent sweep (Go guest hot path / C++ host hot path /
+benchmark fidelity / cache layout / stream path) with adversarial
+verification produced 11 deduplicated candidates, 9 surviving. The four
+smallest/highest-confidence ones were implemented and A/B'd in one session
+(`harness.ps1 -HighPriority`, quick matrix, 10 s cells, best-of-3,
+AffinityAuto→Sibling, Ryzen 9 3900X). Two groups were isolated by building
+three binaries: baseline (v0.8.3), lib (library changes + old bench), full
+(library + bench changes).
+
+### Adopted — library (measured with the unchanged old bench)
+
+1. **Coarse lease clock** (`Platform::MonotonicNanos`):
+   `GetSystemTimePreciseAsFileTime` → `GetSystemTimeAsFileTime`. Microbench
+   on this host: 26.3 → 5.3 ns/call; the call sits on every slot claim
+   (§3.6 lease stamp). Same Unix-epoch timeline (coarse lags precise by at
+   most one timer tick); §3.6.1 gen-CAS, not lease equality, is the ABA
+   guard, so tick granularity is safe. Go side left on `time.Now()`
+   (already ~6 ns via the same shared page; a direct KUSER_SHARED_DATA read
+   measured 0.9 ns but the ~5 ns delta is sub-noise per RTT — not taken).
+2. **Lazy acquire-timeout clock** (`AcquireSpecificSlot`): the eager
+   `steady_clock::now()` (one QPC) ran on every RTT but is only needed on
+   the slow path. Now latched once on first slow-path entry (latch is
+   load-bearing: `retries` resets each sweep, so re-taking `start` would
+   disable the timeout entirely).
+3. **`alignas(64)` on host `Slot`**: sizeof was 57 — adjacent slots' per-RTT
+   mutable bookkeeping (waitStrategy limit, msgSeq, activeWait) shared
+   cache lines across pinned worker threads. Process-local only; ABI
+   untouched.
+
+Result (best-of-3, ops/s): 1T/64B 3.35M→4.70M (**+40.4%**), 4T/64B +12.6%,
+8T/64B +12.6%, 1T/1024B +29.2%, 4T/8T/1024B +9.1%. Iteration spread ≤8%,
+so all deltas are far above noise. The 1T win exceeding the ~15% static
+estimate is consistent with serializing timer calls (QPC/rdtsc) costing
+more inside a cache-hot IPC loop than in an isolated microbench loop.
+
+### Adopted — benchmark fidelity (changes what the harness reports)
+
+4. **Per-thread padded non-atomic stats + 1-in-61 ns latency sampling +
+   hoisted invariant payload memcpy** (`benchmarks/main.cpp`). The old
+   timed loop paid ~90 ns/op of its own overhead: 2× `steady_clock::now()`
+   (QPC) + 2 atomic RMWs on one shared stats line (C++ analog of the Go
+   WaitStats padding fix, v0.7.12). With it removed the same library
+   measures 1T/64B 8.37M ops/s (~0.12 µs/op) and 8T/64B 19.06M ops/s —
+   +78% over the lib binary at 1T/64B purely from bench overhead removal.
+   Latency is now sampled in ns (stride 61); the old per-op µs cast
+   truncated sub-µs RTTs to ~0. **All future numbers form a new baseline —
+   do not compare against pre-2026-07-03 tables.**
+
+### Deferred (verified survivors, not yet implemented)
+
+- Per-WaitStrategy sharding of the Go `shm_benchstats` counters (guest-side
+  analog of #4; global padded counters still take 2 LOCK XADDs/RTT across
+  CCXs in harness builds).
+- Stream reassembly direct-into-destination (drop per-chunk allocs + second
+  copy on the Go side).
+- Non-temporal (MOVNT+SFENCE) host chunk copy for stream mode.
+- Go lease publish seq_cst→release downgrade (sub-noise; asm; low value).
+
+### Refuted this round (do not re-propose on this host)
+
+- `reqOffset=64` slot geometry to split header/data lines: ~0% on default
+  cells because Sibling affinity already co-locates the endpoints on one
+  physical core (shared L1d — no cross-core line transfer to save).
+- Large-page (`SEC_LARGE_PAGES`) mapping for stream mode: stream plateau is
+  memory-controller-bandwidth-bound (established by the maxInFlight
+  experiment), not TLB-bound; plus SeLockMemoryPrivilege deployment burden.
