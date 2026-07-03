@@ -3,6 +3,7 @@ package shm
 import (
 	"runtime"
 	"sync/atomic"
+	"unsafe"
 )
 
 // waitStrategyAsmChunk bounds the iteration count handed to spinUntilEq32 in
@@ -38,60 +39,67 @@ const (
 	waitStrategyYieldMask int   = 0xFFF // runtime.Gosched() every 4096 spin iterations
 )
 
-// Benchmark instrumentation: package-global counters measuring how often
+// Benchmark instrumentation: per-WaitStrategy counters measuring how often
 // Wait/WaitState resolve within the spin window vs. fall through to the
-// OS-wait path. Consumed by benchmarks/go/main.go to report spin efficiency
-// when tuning the adaptive constants above.
+// OS-wait path. Consumed by benchmarks/go/main.go (via the aggregate
+// WaitStats* getters) to report spin efficiency when tuning the adaptive
+// constants above.
 //
-// The counters are always declared (so the benchmark module compiles without
-// build tags), but the post-wait recordSpinSuccess/recordSleepFallback/
-// recordIters writes are no-ops unless the package is built with
-// `-tags shm_benchstats` (see spin_stats_on.go / spin_stats_off.go). The
-// production Direct-Exchange hot path therefore performs zero atomic adds on
-// these counters; the benchmark harness passes the tag to get real numbers.
+// The counter fields are always declared on WaitStrategy (so the benchmark
+// module compiles without build tags and a bare `&WaitStrategy{}` literal
+// works with zero registration), but the post-wait recordSpinSuccess/
+// recordSleepFallback/recordIters writes — and the registry feeding the
+// aggregate getters — exist only under `-tags shm_benchstats` (see
+// spin_stats_on.go / spin_stats_off.go). The production Direct-Exchange hot
+// path therefore performs zero atomic adds on these counters.
 //
-// 2026-06-26 cache-line isolation: previously the three counters were declared
-// as adjacent `uint64` vars, which the linker packs into one 64-byte cache
-// line. Under `-tags shm_benchstats` with N>=4 guest goroutines, every RTT
-// fired `atomic.AddUint64` on two of them (recordSpinSuccess + recordIters),
-// ping-ponging the shared line across all participating cores. The
-// instrumentation itself was the bottleneck the bench tried to characterise.
-// The counters now live in `paddedU64` structs, each exactly one cache line,
-// so the three hot atomic adds touch three distinct lines.
-type paddedU64 struct {
-	v   uint64
-	_   [56]byte // pad to 64-byte cache line (uint64 = 8B + 56B tail = 64B)
-}
-
-var (
-	waitStatsSpinSuccess   paddedU64
-	waitStatsSleepFallback paddedU64
-	waitStatsIterCount     paddedU64
-)
-
-// WaitStatsSpinSuccess returns the count of spin loops that resolved within
-// the adaptive limit (i.e. the condition became true before the OS-wait
-// fallback fired). Atomic-safe; returns 0 in builds without `-tags shm_benchstats`.
-func WaitStatsSpinSuccess() uint64 { return atomic.LoadUint64(&waitStatsSpinSuccess.v) }
-
-// WaitStatsSleepFallback returns the count of waits that exhausted the spin
-// window and fell through to the OS-wait sleepAction.
-func WaitStatsSleepFallback() uint64 { return atomic.LoadUint64(&waitStatsSleepFallback.v) }
-
-// WaitStatsIterCount returns the total spin iterations accumulated across all
-// resolved waits. Combined with WaitStatsSpinSuccess gives AvgItersPerSpin.
-func WaitStatsIterCount() uint64 { return atomic.LoadUint64(&waitStatsIterCount.v) }
+// 2026-07-03 per-strategy sharding: previously the counters were three
+// package-global cache-line-padded cells (v0.7.12 layout). Under
+// `-tags shm_benchstats` every RTT still fired two LOCK XADDs that all
+// worker goroutines funnelled onto the same two global lines — with pinned
+// workers spread across CCXs that is a cross-CCX line ping-pong on every
+// round trip, the guest-side analog of the 2026-07-03 C++ bench stats fix.
+// Each slot owns exactly one WaitStrategy with at most one active waiter
+// (ActiveWait gate), so per-strategy fields keep the incremented line local
+// to the pinned core; the aggregate getters sum over a tag-gated registry
+// populated by NewWaitStrategy.
 
 // WaitStrategy is the single adaptive spin/sleep strategy used by Direct
 // Exchange slots. It exposes only CurrentLimit for diagnostics; do not poke at
 // it from outside the wait loop.
+//
+// The struct is padded to exactly one 64-byte cache line so each
+// heap-allocated strategy (Go size class 64, 64-byte aligned) owns its line —
+// adjacent strategies must not share a line or the benchstats sharding above
+// degrades back into false sharing.
 type WaitStrategy struct {
 	CurrentLimit int32
+	_            [4]byte
+
+	// Benchmark-only spin counters, value-embedded (never pointers) so an
+	// unregistered zero-value strategy still works. Written only under
+	// `-tags shm_benchstats`; always zero otherwise.
+	statSpinSuccess   uint64
+	statSleepFallback uint64
+	statIterCount     uint64
+
+	_ [32]byte // pad struct to 64 bytes (one cache line)
 }
 
+// Compile-time assertion: WaitStrategy is exactly one 64-byte cache line.
+var (
+	_ [unsafe.Sizeof(WaitStrategy{}) - 64]byte
+	_ [64 - unsafe.Sizeof(WaitStrategy{})]byte
+)
+
 // NewWaitStrategy returns a freshly-initialised strategy ready for Wait calls.
+// Under `-tags shm_benchstats` it also registers the strategy so the aggregate
+// WaitStats* getters can sum its counters (registered strategies are retained
+// for process lifetime — benchmark builds only).
 func NewWaitStrategy() *WaitStrategy {
-	return &WaitStrategy{CurrentLimit: waitStrategyMaxSpin}
+	w := &WaitStrategy{CurrentLimit: waitStrategyMaxSpin}
+	registerWaitStats(w)
+	return w
 }
 
 // Wait spins on condition up to the current adaptive limit, periodically yielding
@@ -120,7 +128,7 @@ func (w *WaitStrategy) Wait(condition func() bool, sleepAction func()) bool {
 			runtime.Gosched()
 		}
 	}
-	recordIters(uint64(iters))
+	w.recordIters(uint64(iters))
 
 	if ready {
 		w.recordOutcome(true, int32(limit))
@@ -144,7 +152,7 @@ func (w *WaitStrategy) Wait(condition func() bool, sleepAction func()) bool {
 // the counter/limit update is published before the (blocking) OS wait.
 func (w *WaitStrategy) recordOutcome(hit bool, limit int32) {
 	if hit {
-		recordSpinSuccess()
+		w.recordSpinSuccess()
 		if limit < waitStrategyMaxSpin {
 			newLimit := limit + waitStrategyIncStep
 			if newLimit > waitStrategyMaxSpin {
@@ -154,7 +162,7 @@ func (w *WaitStrategy) recordOutcome(hit bool, limit int32) {
 		}
 		return
 	}
-	recordSleepFallback()
+	w.recordSleepFallback()
 	if limit > waitStrategyMinSpin {
 		newLimit := limit - waitStrategyDecStep
 		if newLimit < waitStrategyMinSpin {
@@ -196,7 +204,7 @@ func (w *WaitStrategy) WaitState(addr *uint32, want uint32, sleepAction func()) 
 			runtime.Gosched()
 		}
 	}
-	recordIters(uint64(totalIters))
+	w.recordIters(uint64(totalIters))
 
 	if ready {
 		w.recordOutcome(true, int32(limit))
