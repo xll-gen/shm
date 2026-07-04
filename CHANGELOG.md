@@ -1,5 +1,46 @@
 # Changelog
 
+## [v0.8.8] - 2026-07-04
+
+No wire-protocol/ABI change — `SHM_VERSION` remains `0x00070000`;
+`SlotHeader`/stream headers untouched, `ExchangeHeader` stays 64 bytes (the new
+field is carved from `reserved`). Guest responder no-reclaim fast path
+(2026-07-04 round-7 perf pass; same-session A/B on Ryzen 9 3900X, see
+`EXPERIMENTS.md`/`BENCHMARK_RESULTS.md` §2026-07-04 round 7). Pre-implementation
+design reviewed by shm-protocol-guardian (SAFE-TO-IMPLEMENT).
+
+### Added
+
+- **`ExchangeHeader.fastPathAllowed`** (offset 28, carved from `reserved`) — a
+  host-published, safe-by-default permission flag: `1` iff the host's
+  auto-reclaim is disabled, else `0` (also the zeroed default a pre-v0.8.8 host
+  never writes). The host sets it at `Init` and in `SetAutoReclaimTimeoutNs`.
+
+### Performance
+
+- **Guest responder no-reclaim fast path** — the Go guest responder
+  (`workerLoopInternal`) ran a full consume-claim on every Direct-Exchange
+  request: `claimSlotGen` (LOCK XADD) + `CAS(REQ_READY→GUEST_BUSY)` (LOCK
+  CMPXCHG) + `Store(Lease)` (XCHGQ) — three locked ops that exist solely for the
+  crash-recovery reclaimer / §3.6.1 ABA guard. On a host slot serviced 1:1 by
+  one worker, with the host waiting only on `RESP_READY` (never observing
+  `GUEST_BUSY`) and the reclaimer off (default), that machinery has no
+  counterparty. When the host publishes `fastPathAllowed==1`, the guest now
+  skips all three and processes while `State` stays `REQ_READY`, publishing
+  `RESP_READY` as before — the acquire/seq_cst data-visibility handshake is
+  unchanged. **Normal-mode ping-pong: 1T/64B +41.5% (9.88M→13.98M ops/s),
+  4T +34.3%, 8T +29.2%, 1024B +8…26%.** The guest-side mirror of the v0.8.5
+  host held-slot win — together they drop the per-RTT claim from both ends of
+  Direct Exchange when auto-reclaim is off. Safe-by-default polarity: a version
+  or config mismatch degrades to the full-claim slow path, never to an unsafe
+  fast path, so no SHM_VERSION bump. Reclaim policy is startup-time (SPEC §3.4).
+
+### Tests
+
+- **`go/fastpath_test.go`** — drives the responder end-to-end with
+  `fastPathAllowed==1` across two round-trips (the rest of the Go suite builds
+  the flag as 0, covering the slow path); run under `-race`.
+
 ## [v0.8.7] - 2026-07-04
 
 No wire-protocol/ABI change — `SHM_VERSION` remains `0x00070000`;

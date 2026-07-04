@@ -39,7 +39,8 @@ The first 64 bytes of the shared memory are reserved for the `ExchangeHeader`. T
 | `slotSize` | `uint32` | 16 | Total size of a single slot in bytes. |
 | `reqOffset` | `uint32` | 20 | Offset of the Request Buffer within a slot (relative to Slot start). |
 | `respOffset` | `uint32` | 24 | Offset of the Response Buffer within a slot (relative to Slot start). |
-| `reserved` | `uint8[36]`| 28 | Reserved to ensure 64-byte alignment. |
+| `fastPathAllowed` | `uint32` | 28 | **v0.8.8+**: `1` = Host guarantees auto-reclaim is off, so the Guest responder may take the no-claim fast path (§3.4); `0` (default / reclaim-on Host / pre-v0.8.8 Host) = Guest must use the full-claim path. Safe-by-default polarity — a version mismatch degrades to the slow path, never to an unsafe fast path. Carved from `reserved`; version stays `0x00070000`. |
+| `reserved` | `uint8[32]`| 32 | Reserved to ensure 64-byte alignment. |
 
 **Total Size:** 64 Bytes.
 
@@ -182,6 +183,10 @@ If all chunks have arrived but `Σ payloadSize != totalSize`, the stream is **dr
 4.  **Process:** Guest wakes up, reads the Request, processes it, and writes to the Response Buffer.
 5.  **Reply:** Guest sets `respSize`, updates state to `SLOT_RESP_READY` and signals the Host.
 6.  **Complete:** Host wakes up, reads the Response, and sets state back to `SLOT_FREE`.
+
+*Guest responder consume-claim (steps 4–5).* By default the Guest, on observing `SLOT_REQ_READY`, advances `gen` (§3.6.1) and CAS's `SLOT_REQ_READY → SLOT_GUEST_BUSY` and refreshes `lease` before processing, so a Host-side crash-recovery reclaimer cannot free the slot mid-processing. This machinery has exactly one counterparty — the Host reclaimer — and each host slot is serviced by exactly one Guest worker, with the Host requester waiting only on `SLOT_RESP_READY` (it never observes `SLOT_GUEST_BUSY`).
+
+*No-reclaim fast path (v0.8.8+).* When the Host publishes `ExchangeHeader.fastPathAllowed == 1` (it does so iff auto-reclaim is disabled, §3.6), the reclaimer never runs, so the Guest responder MAY skip the `gen` bump, the `SLOT_REQ_READY → SLOT_GUEST_BUSY` CAS, and the `lease` refresh entirely — processing while state stays `SLOT_REQ_READY` and publishing `SLOT_RESP_READY` as usual. This is wire-identical to the slow path from the Host's perspective (it only ever waits on `SLOT_RESP_READY`), and removes three atomic RMWs per round-trip on the Guest side. The **data-visibility handshake is unchanged**: the acquire-load that observes `SLOT_REQ_READY` and the `seq_cst` `SLOT_RESP_READY` release still bracket every request read and response write. The flag is safe-by-default: `0` (a pre-v0.8.8 Host, or any Host with auto-reclaim enabled) forces the slow path, so no mismatch can select the fast path while a reclaimer is armed. The reclaim policy is a **startup-time** setting — set `SetAutoReclaimTimeoutNs` before traffic; the Guest reads `fastPathAllowed` once at attach (a runtime flip after attach is not honored until re-attach). This mirrors the held-slot lease contract in §3.6.
 
 ### 3.5. Guest-to-Host Flow (Guest Call)
 

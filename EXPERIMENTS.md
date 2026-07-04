@@ -399,3 +399,61 @@ was capping the multi-controller bandwidth).
   lifecycle + a §20 (DllMain unload) crash surface to the XLL. `TryAcquireSlot`
   /`TryAcquireHeldSlot` (v0.8.6) remain for a future tight-loop low-RTT
   host-send use case.
+
+## 2026-07-04 guest responder no-reclaim fast path (round 7, S7)
+
+The host held-slot API (v0.8.5) removed the per-RTT claim from the Host side of
+Direct Exchange, but the Go **guest responder** (`workerLoopInternal`) still ran
+a full consume-claim on every request: `claimSlotGen` (LOCK XADD on `Gen`) +
+`CAS(State REQ_READY→GUEST_BUSY)` (LOCK CMPXCHG) + `Store(Lease)` (XCHGQ) — three
+locked ops whose sole purpose is the crash-recovery reclaim / §3.6.1 ABA guard.
+
+### Key observation
+
+On a host slot serviced 1:1 by one guest worker, with the Host requester
+waiting only on `RESP_READY` (never observing `GUEST_BUSY`), the only actor that
+machinery protects against is the **Host-side reclaimer** — which is opt-in and
+off by default (`autoReclaimTimeoutNs==0`). When reclaim is off, all three
+locked ops guard a disabled feature.
+
+### Adopted
+
+The Host publishes a safe-by-default permission flag
+`ExchangeHeader.fastPathAllowed` (offset 28, carved from `reserved`, no
+SHM_VERSION bump): `1` iff auto-reclaim is off, `0` otherwise (and `0` is the
+zeroed default a pre-v0.8.8 host never writes). The guest reads it once at
+attach; when set, `workerLoopInternal` skips the gen bump + consume-claim CAS +
+lease refresh, processing while `State` stays `REQ_READY` and publishing
+`RESP_READY` exactly as before. The **data-visibility handshake is unchanged**
+(acquire-load of `REQ_READY`, seq_cst `RESP_READY` publish bracket all buffer
+access). A version/config mismatch degrades to the slow path — never to an
+unsafe fast path (polarity), so no wire-version bump is needed. Reclaim policy
+is startup-time (SPEC §3.4 / §3.6 contract). shm-protocol-guardian gave a
+pre-implementation SAFE-TO-IMPLEMENT design verdict; the enumerated constraints
+(safe polarity, preserved acquire/seq_cst handshake, atomic flag, startup-only)
+are all honored.
+
+Result (normal-mode ping-pong, best of 3, matched host+guest pairs):
+
+| Cell | v0.8.7 (slow) | v0.8.8 (fast) | Δ |
+|:---|---:|---:|---:|
+| 1T / 64 B   | 9,883,265 | 13,982,028 | **+41.5%** |
+| 4T / 64 B   | 26,318,606 | 35,354,132 | **+34.3%** |
+| 8T / 64 B   | 45,180,314 | 58,425,966 | **+29.2%** |
+| 1T / 1024 B | 7,690,383 | 9,669,146 | **+25.7%** |
+| 4T / 1024 B | 19,119,674 | 21,908,798 | **+14.6%** |
+| 8T / 1024 B | 36,408,030 | 39,284,621 | **+7.9%** |
+
+Errors 0. The gain exceeded the ~15-25% estimate (1T/64B +41.5%), confirming
+the three guest-side locked ops were a large fraction of the guest responder
+RTT — the mirror of the host-side held-slot win. Coverage: the existing Go
+suite builds `fastPathAllowed==0` so it exercises the slow path; new
+`go/fastpath_test.go` sets the flag and drives the responder end-to-end (2
+round-trips, run under -race).
+
+### Note
+
+Together with held-slot (host) this removes the per-RTT claim from BOTH ends of
+Direct Exchange when auto-reclaim is off (the common case). With reclaim on,
+both ends keep the full gen/claim/lease dance (correctness over speed), gated
+by the same startup contract.

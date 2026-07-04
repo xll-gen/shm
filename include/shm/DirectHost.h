@@ -493,6 +493,14 @@ public:
         exHeader->slotSize = slotSize;
         exHeader->reqOffset = reqOffset;
         exHeader->respOffset = respOffset;
+        // Guest responder fast-path permission (v0.8.8): allowed only when
+        // auto-reclaim is off (the reclaimer is the sole actor the guest's
+        // per-RTT gen/claim/lease dance protects against on a host slot). See
+        // IPCUtils.h fastPathAllowed and SPECIFICATION.md §3.4. Reclaim policy
+        // is startup-time; if it changes, SetAutoReclaimTimeoutNs republishes.
+        exHeader->fastPathAllowed.store(
+            allocator_.autoReclaimTimeoutNs.load(std::memory_order_relaxed) == 0 ? 1u : 0u,
+            std::memory_order_release);
 
         allocator_.slots.resize(totalSlots);
         uint8_t* ptr = (uint8_t*)shmBase + exchangeHeaderSize;
@@ -671,6 +679,17 @@ public:
      */
     void SetAutoReclaimTimeoutNs(uint64_t timeoutNs) {
         allocator_.SetAutoReclaimTimeoutNs(timeoutNs);
+        // Republish the guest fast-path permission: enabling reclaim (nonzero)
+        // MUST revoke the guest's no-claim fast path (0) so its per-RTT
+        // gen/claim/lease dance resumes before any reclaim can fire. Reclaim
+        // policy is startup-time (set before traffic), so the guest — which
+        // reads this once at attach — sees the final value; a runtime flip
+        // after the guest has attached is not honored until re-attach (SPEC
+        // §3.4 / §3.6 held-slot lease contract).
+        if (shmBase) {
+            ((ExchangeHeader*)shmBase)->fastPathAllowed.store(
+                timeoutNs == 0 ? 1u : 0u, std::memory_order_release);
+        }
     }
 
     /**

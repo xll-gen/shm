@@ -133,6 +133,28 @@ section — earlier numbers under-report throughput by the removed bench
 overhead and their sub-µs "Avg Latency" values were microsecond-truncation
 artifacts. Compare new runs only against this section onward.
 
+### Guest responder no-reclaim fast path (2026-07-04, round 7, S7)
+
+Same host/method, normal-mode ping-pong, best of 3, matched host+guest pairs.
+The Go guest responder now skips the per-RTT gen bump + REQ_READY→GUEST_BUSY
+consume-claim + lease refresh (3 locked ops) when the host publishes
+`ExchangeHeader.fastPathAllowed==1` (auto-reclaim off, the default). Wire ABI
+unchanged (flag carved from reserved; SHM_VERSION 0x00070000). See
+`EXPERIMENTS.md` §2026-07-04 round 7.
+
+| Cell | v0.8.7 (slow) | v0.8.8 (fast) | Δ |
+|:---|---:|---:|---:|
+| 1T / 64 B   | 9,883,265 | 13,982,028 | **+41.5%** |
+| 4T / 64 B   | 26,318,606 | 35,354,132 | **+34.3%** |
+| 8T / 64 B   | 45,180,314 | 58,425,966 | **+29.2%** |
+| 1T / 1024 B | 7,690,383 | 9,669,146 | **+25.7%** |
+| 4T / 1024 B | 19,119,674 | 21,908,798 | **+14.6%** |
+| 8T / 1024 B | 36,408,030 | 39,284,621 | **+7.9%** |
+
+Errors 0. This is the guest-side mirror of the host held-slot win — together
+they remove the per-RTT claim from both ends of Direct Exchange when
+auto-reclaim is off. The **new headline 1T/64B is ~14.0M ops/s**.
+
 ### Stream slot co-location (2026-07-04, round 6, S6)
 
 Same host/method, stream profile (4 KiB chunks, in-flight 1, best of 2).

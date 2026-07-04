@@ -260,8 +260,25 @@ struct ExchangeHeader {
     uint32_t reqOffset;
     /** @brief Offset of the Response buffer within a slot. */
     uint32_t respOffset;
+    /**
+     * @brief Guest responder fast-path permission (v0.8.8). Offset 28.
+     *
+     * SAFE-BY-DEFAULT polarity: 1 = "Host guarantees auto-reclaim is disabled,
+     * so the Guest responder MAY skip the per-RTT gen bump + REQ_READY→BUSY
+     * consume-claim + lease refresh (all reclaim/ABA machinery) on host slots".
+     * 0 (the zero-initialised default a pre-v0.8.8 host never writes, AND any
+     * host with auto-reclaim enabled) = "Guest MUST take the full-claim slow
+     * path". A mismatch therefore degrades to the slow path (correct, slower),
+     * never to an unsafe fast path — see SPECIFICATION.md §3.4.
+     *
+     * Written by the Host at Init and in SetAutoReclaimTimeoutNs; the reclaim
+     * policy is a startup-time setting (set before traffic), so the Guest reads
+     * this once at attach. atomic for release/acquire visibility. Carved from
+     * `reserved[36]`; layout stays 64 bytes, no SHM_VERSION bump.
+     */
+    std::atomic<uint32_t> fastPathAllowed;
     /** @brief Reserved for future use. */
-    uint8_t reserved[36];
+    uint8_t reserved[32];
 };
 
 // ABI safety: ExchangeHeader must remain exactly 64 bytes. Layout is frozen.
@@ -275,7 +292,8 @@ static_assert(offsetof(ExchangeHeader, numSlots)      == 8,  "ExchangeHeader.num
 static_assert(offsetof(ExchangeHeader, numGuestSlots) == 12, "ExchangeHeader.numGuestSlots @12");
 static_assert(offsetof(ExchangeHeader, slotSize)      == 16, "ExchangeHeader.slotSize @16");
 static_assert(offsetof(ExchangeHeader, reqOffset)     == 20, "ExchangeHeader.reqOffset @20");
-static_assert(offsetof(ExchangeHeader, respOffset)    == 24, "ExchangeHeader.respOffset @24");
-static_assert(offsetof(ExchangeHeader, reserved)      == 28, "ExchangeHeader.reserved @28");
+static_assert(offsetof(ExchangeHeader, respOffset)     == 24, "ExchangeHeader.respOffset @24");
+static_assert(offsetof(ExchangeHeader, fastPathAllowed) == 28, "ExchangeHeader.fastPathAllowed @28");
+static_assert(offsetof(ExchangeHeader, reserved)       == 32, "ExchangeHeader.reserved @32");
 
 }

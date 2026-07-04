@@ -126,7 +126,13 @@ type ExchangeHeader struct {
 	SlotSize      uint32
 	ReqOffset     uint32
 	RespOffset    uint32
-	_             [36]byte // Reserved
+	// FastPathAllowed (v0.8.8, offset 28): 1 = Host guarantees auto-reclaim is
+	// off, so the guest responder may skip the per-RTT gen/claim/lease dance on
+	// host slots (see workerLoopInternal). 0 (zero default / reclaim-on host)
+	// = full-claim slow path. Safe-by-default polarity — a version mismatch
+	// degrades to the slow path, never to an unsafe fast path. See §3.4.
+	FastPathAllowed uint32
+	_               [32]byte // Reserved
 }
 
 // Compile-time size assertions: any layout drift versus the C++ ABI causes a
@@ -183,6 +189,8 @@ var (
 	_ [unsafe.Offsetof(ExchangeHeader{}.ReqOffset) - 20]byte
 	_ [24 - unsafe.Offsetof(ExchangeHeader{}.RespOffset)]byte
 	_ [unsafe.Offsetof(ExchangeHeader{}.RespOffset) - 24]byte
+	_ [28 - unsafe.Offsetof(ExchangeHeader{}.FastPathAllowed)]byte
+	_ [unsafe.Offsetof(ExchangeHeader{}.FastPathAllowed) - 28]byte
 )
 
 // slotContext holds local runtime state for a slot.
@@ -234,6 +242,16 @@ type DirectGuest struct {
 	// each slot's worker goroutine to the CCX (shared-L3 LP set) at
 	// index `idx % numCCX`. See affinity.go.
 	affinityMode AffinityMode
+
+	// v0.8.8: guest responder no-reclaim fast path, read once from the host's
+	// ExchangeHeader.FastPathAllowed at attach (reclaim policy is startup-time).
+	// When true, workerLoopInternal skips the per-RTT gen bump +
+	// REQ_READY→GUEST_BUSY consume-claim + lease refresh: the host guarantees
+	// auto-reclaim is off, so on a host slot (serviced 1:1 by this worker, with
+	// the host waiting only on RESP_READY) that reclaim/ABA machinery has no
+	// counterparty. The data-visibility handshake (acquire on REQ_READY,
+	// seq_cst RESP_READY publish) is unchanged. See SPECIFICATION.md §3.4.
+	fastPathAllowed bool
 }
 
 // NewDirectGuest initializes the DirectGuest by attaching to an existing shared memory region.
@@ -311,6 +329,11 @@ func NewDirectGuest(name string) (*DirectGuest, error) {
 		return nil, fmt.Errorf("shm: invalid ExchangeHeader: respOffset (%d) >= slotSize (%d)", respOffset, slotSize)
 	}
 
+	// v0.8.8 guest-responder fast-path permission. Read once here (reclaim
+	// policy is a startup-time setting); safe-by-default polarity means a
+	// pre-v0.8.8 host (or one with auto-reclaim on) leaves this 0 → slow path.
+	fastPathAllowed := atomic.LoadUint32(&header.FastPathAllowed) == 1
+
 	CloseShm(h, addr, HeaderMapSize)
 
 	headerSize := uint64(unsafe.Sizeof(ExchangeHeader{}))
@@ -342,6 +365,7 @@ func NewDirectGuest(name string) (*DirectGuest, error) {
 		slotSize:          slotSize,
 		reqOffset:         reqOffset,
 		respOffset:        respOffset,
+		fastPathAllowed:   fastPathAllowed,
 		responseTimeoutNs: int64(10 * time.Second),
 		slots:             make([]slotContext, totalSlots),
 	}
@@ -1103,11 +1127,34 @@ func (g *DirectGuest) workerLoopInternal(idx int, handler func([]byte, []byte, M
 		ready := slot.waitStrategy.WaitState(&header.State, SlotReqReady, sleepAction)
 
 		if ready {
-			claimSlotGen(header)
-			if !atomic.CompareAndSwapUint32(&header.State, SlotReqReady, SlotGuestBusy) {
-				continue
+			if g.fastPathAllowed {
+				// No-reclaim fast path (v0.8.8): the host published
+				// FastPathAllowed==1, guaranteeing auto-reclaim is off. On a
+				// host slot this worker owns 1:1, with the host waiting only on
+				// RESP_READY and no reclaimer running, the per-RTT gen bump +
+				// REQ_READY→GUEST_BUSY consume-claim + lease refresh have no
+				// counterparty — skip all three (3 locked ops/RTT). State stays
+				// REQ_READY through processing (the host never observes
+				// GUEST_BUSY) and is published to RESP_READY below exactly as
+				// the slow path does. WaitState already acquire-observed
+				// REQ_READY, and this worker is the only writer until the
+				// RESP_READY publish, so no re-confirm CAS is needed. See
+				// SPECIFICATION.md §3.4 and shm-protocol-guardian review.
+				//
+				// PLATFORM NOTE: the slow path's REQ_READY→GUEST_BUSY CAS also
+				// acted as the acquire fence guarding the request-buffer reads
+				// below. The fast path drops it, so correctness rests on
+				// WaitState's load being acquire — true on x86/x64 TSO (the only
+				// supported runtime; spinUntilEq32 is an opaque asm call the
+				// compiler cannot hoist past). If ever ported to a weak-memory
+				// target (ARM), add an explicit acquire fence here.
+			} else {
+				claimSlotGen(header)
+				if !atomic.CompareAndSwapUint32(&header.State, SlotReqReady, SlotGuestBusy) {
+					continue
+				}
+				atomic.StoreUint64(&header.Lease, MonotonicNanos())
 			}
-			atomic.StoreUint64(&header.Lease, MonotonicNanos())
 
 			msgType := header.MsgType
 			if msgType == MsgTypeShutdown {
