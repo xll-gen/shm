@@ -22,15 +22,15 @@ SimpleIPC is a high-performance, low-latency shared-memory IPC library connectin
 
 The project's "Direct Exchange" IPC mode significantly outperforms traditional methods, showcasing sub-microsecond latency and high throughput. This is achieved through a 1:1 thread-to-slot mapping, zero-copy operations, adaptive hybrid waiting, SMT-sibling thread affinity, and a held-slot session path that re-arms without a per-round-trip claim.
 
-Measured on an **AMD Ryzen 9 3900X (12C/24T, native Windows 11)**, `benchmarks/harness.ps1 -HighPriority`, `AffinityAuto`→Sibling, best-of-3, current benchmark (`v0.8.7`). Numbers are round-trips per second (higher is better) with the average RTT in parentheses.
+Measured on an **AMD Ryzen 9 3900X (12C/24T, native Windows 11)**, `benchmarks/harness.ps1 -HighPriority`, `AffinityAuto`→Sibling, best-of-3, current benchmark (`v0.8.8`). Numbers are round-trips per second (higher is better); single-thread RTT is ~70 ns (sub-100 ns).
 
 **Direct Exchange — request/response ping-pong:**
 
 | Threads | 64 B payload | 1024 B payload |
 | :--- | :--- | :--- |
-| 1  | **11.3 M ops/s** (0.16 µs) | 8.3 M ops/s (0.20 µs) |
-| 4  | **26.5 M ops/s** (0.31 µs) | 19.5 M ops/s (0.38 µs) |
-| 8  | **46.9 M ops/s** (0.46 µs) | 33.7 M ops/s (0.48 µs) |
+| 1  | **14.0 M ops/s** | 9.7 M ops/s |
+| 4  | **35.4 M ops/s** | 21.9 M ops/s |
+| 8  | **58.4 M ops/s** | 39.3 M ops/s |
 
 **Guest Call — Go→C++ push (e.g. RTD updates), 64 B echo:** **~2.1 M ops/s** at 1 thread (adaptive-spin worker with doorbell elision, v0.8.6).
 
