@@ -20,25 +20,25 @@ SimpleIPC is a high-performance, low-latency shared-memory IPC library connectin
 
 ## Performance Highlights
 
-The project's "Direct Exchange" IPC mode significantly outperforms traditional methods, showcasing sub-microsecond latency and high throughput. This is achieved through a 1:1 thread-to-slot mapping, zero-copy operations, and adaptive hybrid waiting.
+The project's "Direct Exchange" IPC mode significantly outperforms traditional methods, showcasing sub-microsecond latency and high throughput. This is achieved through a 1:1 thread-to-slot mapping, zero-copy operations, adaptive hybrid waiting, SMT-sibling thread affinity, and a held-slot session path that re-arms without a per-round-trip claim.
 
-**Sandbox Environment (Containerized):**
-*   **1 Thread**:
-    *   **Throughput**: ~1.48M ops/s
-    *   **Avg Latency (RTT)**: 0.67 us
-*   **4 Threads**:
-    *   **Throughput**: ~1.87M ops/s
-    *   **Avg Latency (RTT)**: 2.14 us
-*   **8 Threads**:
-    *   **Throughput**: ~1.92M ops/s
-    *   **Avg Latency (RTT)**: 4.17 us
+Measured on an **AMD Ryzen 9 3900X (12C/24T, native Windows 11)**, `benchmarks/harness.ps1 -HighPriority`, `AffinityAuto`→Sibling, best-of-3, current benchmark (`v0.8.7`). Numbers are round-trips per second (higher is better) with the average RTT in parentheses.
 
-**AMD Ryzen 9 3900x (Bare-metal):**
-*   **1 Thread**: 1.74M ops/s (0.58 us)
-*   **4 Threads**: 1.93M ops/s (0.52 us)
-*   **8 Threads**: 1.32M ops/s (0.76 us)
+**Direct Exchange — request/response ping-pong:**
 
-For detailed benchmark results, methodology, and Guest Call scenarios, please refer to [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md).
+| Threads | 64 B payload | 1024 B payload |
+| :--- | :--- | :--- |
+| 1  | **11.3 M ops/s** (0.16 µs) | 8.3 M ops/s (0.20 µs) |
+| 4  | **26.5 M ops/s** (0.31 µs) | 19.5 M ops/s (0.38 µs) |
+| 8  | **46.9 M ops/s** (0.46 µs) | 33.7 M ops/s (0.48 µs) |
+
+**Guest Call — Go→C++ push (e.g. RTD updates), 64 B echo:** **~2.1 M ops/s** at 1 thread (adaptive-spin worker with doorbell elision, v0.8.6).
+
+**Streaming — bulk transfer:** plateaus at **~3.6 GB/s** with 4–8 MiB chunks; small/medium streams gain **+28…+70% at 4T/8T** from per-worker slot co-location (v0.8.7).
+
+> **Note on older figures:** results before shm v0.7.12 are not comparable — the benchmark harness itself was overhauled in 2026-07 (it previously added ~90 ns/op of QPC + shared-counter overhead to every measurement), and the guest-call cell had a timer-quantized listener. See the baseline-discontinuity notes in [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md).
+
+For the full matrix, methodology, per-release A/B deltas, and Guest Call / streaming scenarios, see [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md) and [EXPERIMENTS.md](EXPERIMENTS.md).
 
 ## Architecture
 
@@ -353,12 +353,24 @@ go build
 
 ## Benchmarks
 
-The `benchmarks` folder contains a latency/throughput test.
+The `benchmarks` folder contains the C++↔Go latency/throughput harness. On
+Windows, `benchmarks/harness.ps1` sweeps a threads × payloads matrix and writes
+`results/<timestamp>/summary.md`; pass `-HighPriority` for stable native
+numbers, `-Profile stream` for streaming, and `-Mode guest-call` for the
+Go→C++ push path.
+
+```powershell
+# Windows (native): quick matrix, best of 3, high priority
+pwsh -File ./benchmarks/harness.ps1 -Profile quick -Repeats 3 -HighPriority
+```
 
 ```bash
-# Run benchmark (Helper script)
+# Portable helper script
 ./benchmarks/run.sh
 ```
+
+See the [Performance Highlights](#performance-highlights) above for headline
+numbers and [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md) for the full history.
 
 ## Experiments
 
