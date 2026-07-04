@@ -41,6 +41,14 @@ struct HostConfig {
 
     /** @brief Number of slots to allocate for Guest-to-Host calls. Default: 0. */
     uint32_t numGuestSlots = 0;
+
+    /** @brief v0.8.6: whether the guest-call worker runs an adaptive spin phase
+     * and publishes HOST_STATE_WAITING before parking (letting the Go sender
+     * elide its request-doorbell syscall while the worker is hot). Default true.
+     * Set false on hosts that must not dedicate a briefly-spinning background
+     * thread to guest-call latency; the worker then uses the sleep-only loop and
+     * the sender always signals. No effect when numGuestSlots == 0. */
+    bool guestWorkerSpin = true;
 };
 
 /**
@@ -439,6 +447,7 @@ public:
         this->slotSize = config.payloadSize;
         allocator_.numSlots = numSlots;
         allocator_.numGuestSlots = numGuestSlots;
+        worker_.spin = config.guestWorkerSpin;
 
         allocator_.msgSeqStride = numSlots + numGuestSlots;
 
@@ -586,6 +595,22 @@ public:
      */
     int32_t AcquireSlot() {
         return allocator_.AcquireSlot();
+    }
+
+    /**
+     * @brief Non-blocking slot acquisition (one sweep, no wait/reclaim).
+     * @return A claimed slot index, or -1 if the pool was momentarily full.
+     */
+    int32_t TryAcquireSlot() {
+        return allocator_.TryAcquireSlot();
+    }
+
+    /**
+     * @brief Acquires any free slot as a held-slot session, non-blocking.
+     * @return HeldSlot wrapper; check .IsValid() (false when the pool is full).
+     */
+    HeldSlot TryAcquireHeldSlot() {
+        return HeldSlot(this, TryAcquireSlot());
     }
 
     /**

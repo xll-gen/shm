@@ -283,3 +283,62 @@ Ryzen 9 3900X, same-session baseline re-measured from v0.8.4 binaries.
   state+gen32 single-CAS SlotHeader repack (wire-ABI, L).
 - MOVNT host chunk copy remains deferred (uncertain vs the now-dominant
   reassembly win).
+
+## 2026-07-04 guest→host kernel-wake elimination (round 5)
+
+The 2026-07-04 round-4 hunt confirmed (p1) that the guest-call cell was
+kernel-wake-bound: the C++ GuestCallWorker only ever parked on the shared
+request event (WaitEvent), and the Go sender always fired a request-doorbell
+SetEvent syscall. This round implements the two halves of the fix and A/B's
+the guest-call cell (Ryzen 9 3900X, `harness.ps1 -HighPriority`, 1T/64B echo,
+best of 3, same-session v0.8.5 baseline re-measured).
+
+### Adopted
+
+1. **GuestCallWorker adaptive spin + `HOST_STATE_WAITING` publish**
+   (`include/shm/GuestCallWorker.h`). The worker now runs the shared
+   `WaitStrategy` spin over the "any guest slot `SLOT_REQ_READY`" predicate
+   before parking; before it parks it publishes `hostState = HOST_STATE_WAITING`
+   (seq_cst) on every guest slot and rechecks the predicate (Dekker), restoring
+   `HOST_STATE_ACTIVE` on wake. Gated by `HostConfig::guestWorkerSpin` (default
+   on); the sleep-only fallback maintains the identical publish so the sender
+   gate stays correct when spin is disabled.
+2. **Go request-doorbell gate** (`go/direct.go` `sendGuestCallInternal`,
+   `go/guest_slot.go` `SendWithTimeout`). After the seq_cst `SLOT_REQ_READY`
+   store the sender loads `hostState` (seq_cst) and signals the request event
+   only when it reads `HOST_STATE_WAITING` — the guest→host mirror of the
+   response-side `guestState` gate. Two-sided seq_cst Dekker: no lost wakeup
+   (proven per-slot over the total order; verified by shm-protocol-guardian).
+
+Both halves ship together (v0.8.6); host+guest must be same-tag-pinned. Wire
+ABI unchanged (`SHM_VERSION` 0x00070000, no layout change — `hostState` is an
+existing field, previously unused on guest slots).
+
+Result (guest-call 1T/64B echo, ops/s, best of 3):
+
+| | v0.8.5 baseline | v0.8.6 (spin + doorbell gate) | Δ |
+|:---|---:|---:|---:|
+| throughput | 226,819 | 2,122,249 | **+836% (≈9.4×)** |
+
+Even the slowest new run (1,581,782) is ~7× the fastest baseline. The cell
+moved from wake-bound (one WaitEvent round + one SetEvent syscall per call)
+into the spin ping-pong regime. Errors 0. This is the guest→host RTD-update
+path in xll-gen (Go backend → XLL), so it is a production win, not only a
+benchmark cell. Normal-mode ping-pong is unaffected (1T/64B 10.4M, 8T/64B
+50.3M — within v0.8.5 run-to-run spread; the guest-call worker is a separate
+thread and the shared files gained only additive methods).
+
+### Also added
+
+- **`TryAcquireSlot` / `TryAcquireHeldSlot`** (non-blocking, one round-robin
+  sweep via the same `tryClaimSlot` handshake, `-1` when the pool is full).
+  Prerequisite for a future xll-gen held-slot hybrid that falls back to a
+  per-call claim instead of blocking (backlog). Guards `numSlots == 0`.
+
+### Deferred / follow-up
+
+- Sleep-only (`guestWorkerSpin=false`) cross-process Dekker test: the spin
+  default is covered end-to-end by the benchmark (0 errors, 2.1M ops/s) and
+  the guest_call_* ctest suite; the sleep-only branch shares the identical
+  publish/Dekker logic. A dedicated fake-guest-peer test is recommended but
+  needs new harness scaffolding (backlog).

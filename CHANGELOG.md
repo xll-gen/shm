@@ -1,5 +1,45 @@
 # Changelog
 
+## [v0.8.6] - 2026-07-04
+
+No wire-protocol/ABI change — `SHM_VERSION` remains `0x00070000`;
+`SlotHeader`/`ExchangeHeader` layouts untouched. Guest→host kernel-wake
+elimination for the guest-call path (2026-07-04 round-5 perf pass; same-session
+A/B on Ryzen 9 3900X, see `EXPERIMENTS.md`/`BENCHMARK_RESULTS.md` §2026-07-04
+round 5). **Host and Guest must ship from the same shm release** (the Go sender
+reads a `hostState` flag the host worker now publishes; guaranteed by same-tag
+pinning — a mismatch degrades to ≤1s request latency, never a lost wakeup).
+
+### Added
+
+- **`DirectHost::TryAcquireSlot()` / `TryAcquireHeldSlot()`** — non-blocking
+  slot acquisition (one round-robin sweep via the same gen-CAS+lease
+  `tryClaimSlot` handshake, no wait/reclaim, returns `-1` / an invalid
+  `HeldSlot` when the pool is momentarily full; guards `numSlots == 0`).
+  Enables a held-slot session that falls back to a per-call claim instead of
+  blocking (the prerequisite for the deferred xll-gen UDF-path adoption).
+- **`HostConfig::guestWorkerSpin`** (default `true`) — whether the guest-call
+  worker runs the adaptive spin phase and publishes `HOST_STATE_WAITING`
+  before parking. Set `false` on hosts that must not dedicate a
+  briefly-spinning background thread to guest-call latency.
+
+### Performance
+
+- **Guest→host doorbell elision** — the guest-call path was kernel-wake-bound:
+  the C++ `GuestCallWorker` only parked on the shared request event and the Go
+  sender always fired a request-doorbell `SetEvent` syscall. Now the worker
+  runs the shared `WaitStrategy` spin over the guest-slot `SLOT_REQ_READY`
+  predicate before parking, and publishes `HOST_STATE_WAITING` (seq_cst) on
+  every guest slot before it parks (rechecking the predicate first — Dekker,
+  no lost wakeup), restoring `HOST_STATE_ACTIVE` while it spins/processes. The
+  Go sender (`sendGuestCallInternal` and the zero-copy `GuestSlot.Send`) gates
+  its request doorbell on `hostState == HOST_STATE_WAITING` — the guest→host
+  mirror of the v0.8.5 response-side `guestState` gate. A spinning worker costs
+  the sender no doorbell syscall. **Guest-call 1T/64B echo: +836% (≈9.4×),
+  226,819 → 2,122,249 ops/s** best-of-3 (this is xll-gen's Go→XLL RTD-update
+  path). Normal-mode ping-pong unaffected. SPECIFICATION §3.5 documents the
+  gate and the same-release requirement.
+
 ## [v0.8.5] - 2026-07-04
 
 No wire-protocol/ABI change — `SHM_VERSION` remains `0x00070000`;

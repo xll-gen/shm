@@ -133,6 +133,26 @@ section — earlier numbers under-report throughput by the removed bench
 overhead and their sub-µs "Avg Latency" values were microsecond-truncation
 artifacts. Compare new runs only against this section onward.
 
+### Guest→host kernel-wake elimination (2026-07-04, round 5)
+
+Same host/method, guest-call cell (1T/64B echo, best of 3), v0.8.5 baseline
+re-measured in the same session. The C++ GuestCallWorker gained an adaptive
+spin phase + `HOST_STATE_WAITING` publish, and the Go request doorbell is now
+gated on it (see `EXPERIMENTS.md` §2026-07-04 round 5). Wire ABI unchanged.
+
+| Guest-call 1T/64B | v0.8.5 | v0.8.6 | Δ |
+|:---|---:|---:|---:|
+| Throughput (ops/s) | 226,819 | 2,122,249 | **+836% (≈9.4×)** |
+
+The cell moved from wake-bound (a WaitEvent round + a SetEvent syscall per
+call) into the spin ping-pong regime; slowest new run (1.58M) still ~7× the
+fastest baseline, 0 errors. This is xll-gen's Go→XLL RTD-update path.
+Normal-mode ping-pong is unaffected (spot-check 1T/64B 10.4M, 8T/64B 50.3M).
+**⚠ Guest-call baseline discontinuity:** the guest-call cell's absolute number
+swings widely with host state between sessions (this session's v0.8.5 baseline
+was 227K; the 2026-07-04 round-4 session measured ~393K for the same binary) —
+compare only within a session's own A/B, never guest-call rows across sessions.
+
 ### Claim-cycle + benchstats-sharding + stream-reassembly pass (2026-07-04)
 
 Same host and method (`harness.ps1 -HighPriority`, 10 s cells, best of 3,

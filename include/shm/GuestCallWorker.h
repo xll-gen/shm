@@ -6,6 +6,7 @@
 #include "Platform.h"
 #include "IPCUtils.h"
 #include "SlotAllocator.h"
+#include "WaitStrategy.h"
 
 namespace shm {
 
@@ -32,6 +33,19 @@ public:
     SlotAllocator* alloc = nullptr;
     const bool* running = nullptr;
 
+    // v0.8.6: when true (default), the worker runs an adaptive spin phase over
+    // the guest-slot request predicate before parking on the shared request
+    // event, and publishes HOST_STATE_WAITING on every guest slot before it
+    // parks so the Go sender can elide its request-doorbell SetEvent while the
+    // worker is hot (the guest→host analog of the response-side signal gate).
+    // Set false via HostConfig::guestWorkerSpin on hosts that cannot spare a
+    // briefly-spinning background thread; the sleep-only legacy loop is then
+    // used and the sender always signals. The adaptive limit self-throttles to
+    // kMinSpin when idle, so the steady-state idle cost is a short spin then a
+    // park, not a busy-loop.
+    bool spin = true;
+    WaitStrategy waitStrategy;
+
     std::thread guestWorker;
     std::atomic<bool> guestWorkerRunning{false};
 
@@ -50,17 +64,71 @@ public:
              waitEvent = alloc->slots[alloc->numSlots].hReqEvent;
         }
 
-        while (guestWorkerRunning.load(std::memory_order_relaxed)) {
-            // Wait for signal (timeout 1s to check for shutdown)
-            if (waitEvent) {
-                 Platform::WaitEvent(waitEvent, 1000);
-            } else {
-                 // Should not happen if Start checks numGuestSlots
-                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            }
+        const uint32_t base = alloc->numSlots;
+        const uint32_t count = alloc->numGuestSlots;
 
-            int processed = ProcessGuestCalls(handler, maxBatchSize);
-            (void)processed;
+        // Any guest slot with a published request. This is the spin predicate
+        // and the pre-park recheck; the seq_cst load pairs with the Go sender's
+        // seq_cst REQ_READY store (Dekker, see sleepAction below).
+        auto anyRequestReady = [&]() -> bool {
+            for (uint32_t i = base; i < base + count; ++i) {
+                if (alloc->slots[i].header->state.load(std::memory_order_seq_cst) == SLOT_REQ_READY) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        auto setHostState = [&](uint32_t v, std::memory_order order) {
+            for (uint32_t i = base; i < base + count; ++i) {
+                alloc->slots[i].header->hostState.store(v, order);
+            }
+        };
+
+        if (!spin || !waitEvent) {
+            // Sleep-only loop (also the fallback when there is no shared request
+            // event). Still maintains the HOST_STATE_WAITING/ACTIVE contract
+            // around the park so the Go sender's doorbell gate stays correct
+            // when spin is disabled — the only thing dropped here is the spin
+            // phase, so the sender always signals a parked worker and the loss
+            // is just the spin-catch fast path, never a wakeup.
+            while (guestWorkerRunning.load(std::memory_order_relaxed)) {
+                if (waitEvent) {
+                    setHostState(HOST_STATE_WAITING, std::memory_order_seq_cst);
+                    if (!anyRequestReady()) {
+                        Platform::WaitEvent(waitEvent, 1000);
+                    }
+                    setHostState(HOST_STATE_ACTIVE, std::memory_order_relaxed);
+                } else {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+                ProcessGuestCalls(handler, maxBatchSize);
+            }
+            return;
+        }
+
+        // Runs only when the spin window is exhausted. Publish WAITING on every
+        // guest slot (seq_cst) so a concurrently-sending guest gates its
+        // doorbell on it, then recheck once (Dekker: sender does
+        // store REQ_READY(seq_cst) → load hostState(seq_cst); we do
+        // store hostState=WAITING(seq_cst) → load state(seq_cst) — the seq_cst
+        // total order forbids both loads from missing, so no lost wakeup). Only
+        // park if the recheck is still empty. On wake, restore ACTIVE so the
+        // spin/process phase runs doorbell-free.
+        auto sleepAction = [&]() {
+            setHostState(HOST_STATE_WAITING, std::memory_order_seq_cst);
+            if (anyRequestReady()) {
+                setHostState(HOST_STATE_ACTIVE, std::memory_order_relaxed);
+                return;
+            }
+            // 1s cap bounds shutdown latency (Stop() flips guestWorkerRunning).
+            Platform::WaitEvent(waitEvent, 1000);
+            setHostState(HOST_STATE_ACTIVE, std::memory_order_relaxed);
+        };
+
+        while (guestWorkerRunning.load(std::memory_order_relaxed)) {
+            waitStrategy.Wait(anyRequestReady, sleepAction);
+            ProcessGuestCalls(handler, maxBatchSize);
         }
     }
 

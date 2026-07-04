@@ -250,6 +250,32 @@ public:
     }
 
     /**
+     * @brief Non-blocking slot acquisition: one round-robin sweep, no wait
+     *        and no auto-reclaim. Returns -1 immediately if every slot is busy.
+     *
+     * AcquireSlot spins forever until a slot frees (correct for a caller that
+     * must send). TryAcquireSlot is for callers that want a fast path over a
+     * held/dedicated slot and a cheap fallback when the pool is momentarily
+     * saturated — e.g. a held-slot session that reverts to a per-call claim
+     * rather than blocking. Uses the same tryClaimSlot handshake (gen bump +
+     * state CAS + lease), so a returned slot is claimed at SLOT_BUSY exactly as
+     * AcquireSlot leaves it.
+     *
+     * @return The index of a newly claimed slot, or -1 if none was free.
+     */
+    int32_t TryAcquireSlot() {
+        if (!*running || numSlots == 0) return -1;
+        uint32_t start = nextSlot.fetch_add(1, std::memory_order_relaxed) % numSlots;
+        for (uint32_t n = 0; n < numSlots; ++n) {
+            uint32_t idx = (start + n) % numSlots;
+            if (tryClaimSlot(slots[idx])) {
+                return (int32_t)idx;
+            }
+        }
+        return -1;
+    }
+
+    /**
      * @brief Acquires a free slot for Zero-Copy usage.
      * @return The index of the acquired slot, or -1 if not running.
      */

@@ -879,8 +879,23 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, buffer []byte, msgType 
 	// still owned, or the Case-2 reclaim above could steal it.
 	atomic.StoreInt32(&slot.ActiveWait, 1)
 
+	// Publish the request, then gate the doorbell on the host worker's park
+	// state (v0.8.6). The C++ GuestCallWorker publishes HostState=WAITING on
+	// every guest slot before it parks and ACTIVE while it spins/processes, so
+	// a WAITING read means the worker needs the kernel wake and an ACTIVE read
+	// means it will spin-catch this request. This is the guest→host analog of
+	// the response-side signal gate and a two-sided Dekker: our seq_cst store
+	// of State=REQ_READY precedes our seq_cst load of HostState, while the
+	// worker's seq_cst store of HostState=WAITING precedes its seq_cst load of
+	// State — the total order forbids both loads from missing, so the worker
+	// never sleeps through a request. Requires host+guest from the same
+	// shm >= v0.8.6 (guaranteed by same-tag pinning); an older host that never
+	// publishes HostState would leave it ACTIVE and this would under-signal, so
+	// the layout/version contract is that both peers ship together.
 	atomic.StoreUint32(&slot.header.State, SlotReqReady)
-	SignalEvent(slot.reqEvent)
+	if atomic.LoadUint32(&slot.header.HostState) == HostStateWaiting {
+		SignalEvent(slot.reqEvent)
+	}
 
 	checkReady := func() bool {
 		return atomic.LoadUint32(&slot.header.State) == SlotRespReady

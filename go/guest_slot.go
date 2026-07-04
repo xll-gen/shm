@@ -83,9 +83,16 @@ func (s *GuestSlot) SendWithTimeout(size int32, msgType MsgType, timeout time.Du
 	// still owned, or AcquireGuestSlot's Case-2 reclaim could steal it.
 	atomic.StoreInt32(&s.slot.ActiveWait, 1)
 
-	// Signal Ready
+	// Signal Ready, gating the doorbell on the host worker's park state
+	// (v0.8.6) — identical to sendGuestCallInternal's gate: the C++
+	// GuestCallWorker publishes HostState=WAITING before parking and ACTIVE
+	// while spinning/processing, so an ACTIVE read means it will spin-catch
+	// this request without a kernel wake. Two-sided seq_cst Dekker; requires
+	// host+guest from the same shm >= v0.8.6.
 	atomic.StoreUint32(&header.State, SlotReqReady)
-	SignalEvent(s.slot.reqEvent)
+	if atomic.LoadUint32(&header.HostState) == HostStateWaiting {
+		SignalEvent(s.slot.reqEvent)
+	}
 
 	// Wait for Response
 	sleepAction := func() {
