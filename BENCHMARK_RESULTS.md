@@ -133,6 +133,23 @@ section — earlier numbers under-report throughput by the removed bench
 overhead and their sub-µs "Avg Latency" values were microsecond-truncation
 artifacts. Compare new runs only against this section onward.
 
+### Stream slot co-location (2026-07-04, round 6, S6)
+
+Same host/method, stream profile (4 KiB chunks, in-flight 1, best of 2).
+`StreamSender` now draws its slots from a fixed per-worker range
+(`baseSlot = id*inFlight`) instead of the shared pool, so a pinned host sender
+and its Go guest worker land on sibling LPs of one physical core (the win
+Direct-Exchange already gets). Wire ABI unchanged.
+
+| Stream (ops/s) | 1T pool→fixed | 4T | 8T |
+|:---|---:|---:|---:|
+| 64 KiB  | 58,249 → 61,498 (+5.6%) | 32,706 → 50,192 (**+53%**) | 26,712 → 45,324 (**+70%**) |
+| 1 MiB   | 4,130 → 3,945 (−4.5%, noise) | 2,350 → 3,746 (**+59%**) | 2,448 → 3,610 (**+47%**) |
+| 16 MiB  | 178 → 184 (+3%) | 149 → 191 (**+28%**) | 125 → 167 (**+34%**) |
+
+The multi-thread gain is the co-location effect (1T has a single sender so
+pool≈fixed; the 1MiB 1T −4.5% is within best-of-2 spread). Errors 0.
+
 ### Guest→host kernel-wake elimination (2026-07-04, round 5)
 
 Same host/method, guest-call cell (1T/64B echo, best of 3), v0.8.5 baseline

@@ -342,3 +342,60 @@ thread and the shared files gained only additive methods).
   the guest_call_* ctest suite; the sleep-only branch shares the identical
   publish/Dekker logic. A dedicated fake-guest-peer test is recommended but
   needs new harness scaffolding (backlog).
+
+## 2026-07-04 stream slot co-location (round 6, S6)
+
+The 2026-07-04 round-4 hunt flagged (S6) that stream mode scrambles the
+sibling/CCX affinity that Direct-Exchange enjoys: `StreamSender` draws chunk
+slots from the shared pool (`AcquireSlot`), so a pinned host sender thread's
+chunks land in slots whose Go guest workers are pinned to *other* physical
+cores, adding cross-core coherence traffic on every chunk. Direct-Exchange
+avoids this because host worker `id` always uses slot `id`, co-located with Go
+worker `id` on the two SMT LPs of one physical core (AffinitySibling).
+
+### Adopted
+
+`StreamSender(host, inFlight, baseSlot=-1)` gained an optional fixed slot
+range: when `baseSlot >= 0` it draws slots round-robin from
+`[baseSlot, baseSlot+inFlight)` via `AcquireSpecificSlot` instead of the pool.
+The benchmark constructs `StreamSender(host, maxInFlight, id*maxInFlight)`, so
+with the in-flight-1 default each worker uses slot `id` — restoring the sibling
+co-location. Guest side unchanged; ABI unchanged (host-local policy only,
+`baseSlot < 0` keeps the pool path).
+
+Result (stream profile, 4 KiB chunks, in-flight 1, best of 2, ops/s):
+
+| Stream | 1T (pool→fixed) | 4T | 8T |
+|:---|---:|---:|---:|
+| 64 KiB  | 58,249 → 61,498 (+5.6%) | 32,706 → 50,192 (**+53%**) | 26,712 → 45,324 (**+70%**) |
+| 1 MiB   | 4,130 → 3,945 (−4.5%, noise) | 2,350 → 3,746 (**+59%**) | 2,448 → 3,610 (**+47%**) |
+| 16 MiB  | 178 → 184 (+3%) | 149 → 191 (**+28%**) | 125 → 167 (**+34%**) |
+
+The multi-thread win (+28…+70% across all stream sizes) is the co-location
+effect: at 1T there is a single sender so pool vs fixed barely differ (the 1MiB
+1T −4.5% is within best-of-2 spread); at 4T/8T the pool scrambles slots across
+cores and the fix restores sibling placement. Errors 0. Even the 16 MiB
+plateau cell improves at 4T/8T (co-location relieves cross-core traffic that
+was capping the multi-controller bandwidth).
+
+### Also this round
+
+- **`test_guest_worker_sleep_only.cpp`** — covers the v0.8.6 guest-call
+  doorbell gate on the `guestWorkerSpin=false` (sleep-only) worker path with a
+  fake in-process guest peer: request published while the worker is parked
+  (hostState=WAITING) must be serviced within the 1s park cap (a lost wakeup
+  would hang). Closes the coverage gap both reviewers flagged for v0.8.6.
+
+### Not pursued this round (documented in IMPROVEMENT_BACKLOG.md)
+
+- **S3 (state+gen32 single-CAS repack)** — deferred: after the held-slot API
+  (v0.8.5) removed the per-RTT claim from the dominant hot path and guest-call
+  went spin-bound (v0.8.6), the remaining benefit is <2% on any cell, against a
+  wire-ABI break and a formally-UB mixed-size-atomic (32-bit state store vs
+  64-bit CAS on the same word) in the most safety-critical structure.
+- **xll-gen held-slot adoption** — deferred: real UDF round-trips are µs-to-
+  tens-of-µs (flatbuffer serialization + the Go handler's actual compute), so
+  the ~9 ns claim saving is <1%, not worth adding a per-thread held-slot
+  lifecycle + a §20 (DllMain unload) crash surface to the XLL. `TryAcquireSlot`
+  /`TryAcquireHeldSlot` (v0.8.6) remain for a future tight-loop low-RTT
+  host-send use case.

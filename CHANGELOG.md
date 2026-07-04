@@ -1,5 +1,38 @@
 # Changelog
 
+## [v0.8.7] - 2026-07-04
+
+No wire-protocol/ABI change — `SHM_VERSION` remains `0x00070000`;
+`SlotHeader`/`ExchangeHeader`/stream headers untouched. Stream slot
+co-location (2026-07-04 round-6 perf pass; same-session A/B on Ryzen 9 3900X,
+see `EXPERIMENTS.md`/`BENCHMARK_RESULTS.md` §2026-07-04 round 6).
+
+### Added
+
+- **`StreamSender(host, inFlight, baseSlot = -1)`** — an optional fixed slot
+  range. When `baseSlot >= 0` the sender draws its slots round-robin from
+  `[baseSlot, baseSlot+inFlight)` via `AcquireSpecificSlot` instead of the
+  shared pool (`AcquireSlot`). `baseSlot < 0` (default) keeps the pool path, so
+  this is source- and ABI-compatible.
+
+### Performance
+
+- **Stream slot co-location** — the pool path hands `StreamSender` arbitrary
+  slots whose Go guest workers are pinned to other physical cores, adding
+  cross-core coherence traffic on every chunk (Direct-Exchange avoids this by
+  using slot `id` for worker `id`, co-located on sibling SMT LPs). With one
+  sender per pinned worker and `baseSlot = id*inFlight`, the stream path
+  regains that co-location. **Stream profile (4 KiB chunks, in-flight 1):
+  4T/8T +28…+70% across 64 KiB / 1 MiB / 16 MiB streams** (1T neutral — single
+  sender). Host-local policy only; guest unchanged.
+
+### Tests
+
+- **`test_guest_worker_sleep_only.cpp`** — covers the v0.8.6 guest-call
+  doorbell gate on the `guestWorkerSpin=false` (sleep-only) worker path via a
+  fake in-process guest peer (request published while the worker is parked must
+  be serviced). Closes the coverage gap both v0.8.6 reviewers flagged.
+
 ## [v0.8.6] - 2026-07-04
 
 No wire-protocol/ABI change — `SHM_VERSION` remains `0x00070000`;

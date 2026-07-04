@@ -57,14 +57,28 @@ static_assert(sizeof(ChunkHeader) == 24,
 class StreamSender {
     DirectHost* host;
     int maxInFlight;
+    int32_t baseSlot;
 
 public:
     /**
      * @brief Constructs a StreamSender.
      * @param h Pointer to the initialized DirectHost.
      * @param inFlight Max number of slots to use concurrently (default 2 for double buffering).
+     * @param base Optional fixed slot range (v0.8.7). When >= 0 the sender draws
+     *        its slots round-robin from [base, base+inFlight) via
+     *        AcquireSpecificSlot instead of the shared pool (AcquireSlot). With
+     *        one sender per pinned worker and inFlight==1, base == the worker's
+     *        slot index co-locates the host sender thread and the Go guest
+     *        worker that services the slot on the two SMT LPs of one physical
+     *        core (shared L1d), the same win Direct-Exchange gets from
+     *        AffinitySibling — the pool path instead hands out arbitrary slots
+     *        whose Go workers are pinned to other cores, adding cross-core
+     *        coherence traffic on every chunk. Default -1 keeps the pool path.
+     *        For inFlight>1 co-location is only partial (the range spans several
+     *        Go workers on different cores).
      */
-    StreamSender(DirectHost* h, int inFlight = 2) : host(h), maxInFlight(inFlight) {}
+    StreamSender(DirectHost* h, int inFlight = 2, int32_t base = -1)
+        : host(h), maxInFlight(inFlight), baseSlot(base) {}
 
     /**
      * @brief Sends a large buffer as a stream.
@@ -79,9 +93,28 @@ public:
     Result<void> Send(const void* data, size_t size, uint64_t streamId) {
         if (!host || !data) return Result<void>::Failure(Error::InvalidArgs);
 
+        // Slot acquisition: shared pool (baseSlot < 0) or a fixed round-robin
+        // range [baseSlot, baseSlot+maxInFlight) for endpoint co-location. The
+        // pool path blocks in AcquireSlot until a slot frees; AcquireSpecificSlot
+        // likewise waits for its specific slot, which the FIFO drain below keeps
+        // free by the time the rotation returns to it.
+        uint32_t rr = 0;
+        auto acquireSlot = [&]() -> int32_t {
+            if (baseSlot < 0) return host->AcquireSlot();
+            int32_t idx = baseSlot + (int32_t)(rr % (uint32_t)maxInFlight);
+            int32_t got = host->AcquireSpecificSlot(idx);
+            // Advance the rotation only on success so a timeout (which cannot
+            // occur in the shipped single-sender/disjoint-range config, but
+            // could under misuse or a stalled guest) leaves the next retry
+            // targeting the same slot — keeping the rotation phase-locked to
+            // the FIFO drain instead of skipping to a still-in-flight slot.
+            if (got >= 0) rr++;
+            return got;
+        };
+
         // 1. Send Stream Start (Synchronous)
         {
-            int slotIdx = host->AcquireSlot();
+            int slotIdx = acquireSlot();
             if (slotIdx < 0) return Result<void>::Failure(Error::ResourceExhausted);
 
             int32_t maxReq = host->GetMaxReqSize(slotIdx);
@@ -120,7 +153,7 @@ public:
         while (remaining > 0 || !pendingSlots.empty()) {
              // Fill pipeline
              while (remaining > 0 && (int)pendingSlots.size() < maxInFlight) {
-                 int32_t slotIdx = host->AcquireSlot();
+                 int32_t slotIdx = acquireSlot();
                  if (slotIdx < 0) {
                      // No slots free, break to drain
                      break;

@@ -147,7 +147,13 @@ void WorkerThread(DirectHost* host, int id, int totalSlots) {
     // Normal mode keeps the 1:1 thread-to-slot mapping (maxInFlight=1).
     int maxInFlight = STREAM_MODE ? IN_FLIGHT : 1;
 
-    StreamSender streamSender(host, maxInFlight);
+    // Fixed slot range per worker (v0.8.7): worker `id` draws its stream slots
+    // from [id*maxInFlight, id*maxInFlight+maxInFlight). With maxInFlight==1
+    // this is slot==id, co-locating this pinned host thread with the Go guest
+    // worker that services slot id on the sibling LP (matches numHostSlots =
+    // NUM_THREADS*IN_FLIGHT allocated in main). Restores the sibling-affinity
+    // win the shared pool scrambles.
+    StreamSender streamSender(host, maxInFlight, STREAM_MODE ? id * maxInFlight : -1);
 
     // Held-slot session for normal mode (default): claim this worker's
     // dedicated slot once, re-arm per op. Reacquired inside the loop if a
