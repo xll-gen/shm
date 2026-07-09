@@ -22,7 +22,7 @@ SimpleIPC is a high-performance, low-latency shared-memory IPC library connectin
 
 The project's "Direct Exchange" IPC mode significantly outperforms traditional methods, showcasing sub-microsecond latency and high throughput. This is achieved through a 1:1 thread-to-slot mapping, zero-copy operations, adaptive hybrid waiting, SMT-sibling thread affinity, and a held-slot session path that re-arms without a per-round-trip claim.
 
-Measured on an **AMD Ryzen 9 3900X (12C/24T, native Windows 11)**, `benchmarks/harness.ps1 -HighPriority`, `AffinityAuto`→Sibling, best-of-3, current benchmark (`v0.8.8`). Numbers are round-trips per second (higher is better); single-thread RTT is ~70 ns (sub-100 ns).
+Measured on an **AMD Ryzen 9 3900X (12C/24T, native Windows 11)**, `benchmarks/harness.ps1 -HighPriority`, `AffinityAuto`→Sibling, best-of-3, current benchmark (`v0.8.9`; the Direct-Exchange table is the v0.8.8-round measurement — v0.8.9 changed the guest-call and streaming defaults only). Numbers are round-trips per second (higher is better); single-thread RTT is ~70 ns (sub-100 ns).
 
 **Direct Exchange — request/response ping-pong:**
 
@@ -32,11 +32,47 @@ Measured on an **AMD Ryzen 9 3900X (12C/24T, native Windows 11)**, `benchmarks/h
 | 4  | **35.4 M ops/s** | 21.9 M ops/s |
 | 8  | **58.4 M ops/s** | 39.3 M ops/s |
 
+(Absolute peak observed: **77.7 M ops/s at 12 threads**, 2026-07-09 scaling-curve session.)
+
 **Guest Call — Go→C++ push (e.g. RTD updates), 64 B echo:** **~5.2 M ops/s** (193 ns RTT) at 1 thread with the worker and a dedicated sender co-located on one physical core's SMT pair (`HostConfig::guestWorkerAffinity` + Go `PinCurrentGoroutine`, v0.8.9); ~2.1–2.7 M unpinned (and far noisier — scheduler placement lottery).
 
 **Streaming — bulk transfer:** plateaus at **~3.6 GB/s** with 4–8 MiB chunks; small/medium streams gain **+28…+70% at 4T/8T** from per-worker slot co-location (v0.8.7).
 
-> **Note on older figures:** results before shm v0.7.12 are not comparable — the benchmark harness itself was overhauled in 2026-07 (it previously added ~90 ns/op of QPC + shared-counter overhead to every measurement), and the guest-call cell had a timer-quantized listener. See the baseline-discontinuity notes in [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md).
+### What actually makes it fast — the three biggest measured factors
+
+1. **Never touch the kernel on the hot path.** Every request/response doorbell
+   is elided via a two-sided Dekker handshake (peer publishes a
+   `WAITING` flag before parking; the sender fires the `SetEvent` syscall only
+   when it reads that flag), so two spinning peers exchange messages entirely
+   in user space. Applying this to the guest-call path was the single largest
+   measured jump in the project's history: **+836% (≈9.4×)** in one release
+   (v0.8.6). A single stray syscall (~µs) dominates any number of
+   nanosecond-scale optimizations.
+2. **Placement is a first-class optimization.** Pinning the two endpoints of a
+   slot to the two SMT siblings of one physical core (shared L1d) — instead of
+   letting the scheduler place them — won **+24…74%** on Direct Exchange
+   (v0.8.2, the `AffinityAuto` default), **+28…70%** on streaming (v0.8.7),
+   and **+88.8%** on guest calls (v0.8.9). Unpinned runs also scatter by up to
+   86% between runs; co-location buys determinism as much as speed.
+3. **No per-round-trip claim machinery when it has no counterparty.** The slot
+   claim's gen-bump / CAS / lease-heartbeat exist for crash-recovery
+   reclamation, which is opt-in and off by default. The held-slot session API
+   (host, v0.8.5) and the `fastPathAllowed`-gated fast paths (guest, v0.8.8/9)
+   skip them when the host attests reclaim is off — **+18%…+41.5%** per side
+   on the 64 B cell, with a safe-by-default flag polarity so any
+   version/config mismatch degrades to the slow path, never to corruption.
+
+Honorable mention: several of the largest raw deltas in the history
+(+149% @8T among them) came from **fixing the benchmark itself** — the old
+harness added ~90 ns/op of its own timer/counter overhead, its instrumented
+counters were globally contended, and the old guest-call listener polled at
+the 15.6 ms Windows timer quantum. Numbers before those fixes measure the
+harness, not the library.
+
+> **Note on older figures:** results before shm v0.7.12 are not comparable —
+> the benchmark harness itself was overhauled in 2026-07 (see above), and
+> baseline discontinuities are marked in
+> [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md).
 
 For the full matrix, methodology, per-release A/B deltas, and Guest Call / streaming scenarios, see [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md) and [EXPERIMENTS.md](EXPERIMENTS.md).
 
