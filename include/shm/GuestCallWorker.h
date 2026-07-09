@@ -46,6 +46,16 @@ public:
     bool spin = true;
     WaitStrategy waitStrategy;
 
+    // v0.8.9: optional CPU affinity mask for the worker thread (0 = no pin).
+    // The guest-call path historically ran both endpoints unpinned — the
+    // Direct-Exchange sibling co-location (host worker N + Go worker N on one
+    // physical core's two SMT LPs) never applied to it, so every guest call
+    // paid cross-core cache-line transfers. Pinning the worker to one LP of a
+    // free SMT pair (and the Go sender to the other, see Go
+    // PinCurrentGoroutine) restores the same locality. Wired from
+    // HostConfig::guestWorkerAffinity.
+    uint64_t pinMask = 0;
+
     std::thread guestWorker;
     std::atomic<bool> guestWorkerRunning{false};
 
@@ -57,6 +67,9 @@ public:
     ~GuestCallWorker() { Stop(); }
 
     void GuestWorkerLoop(GuestCallHandler handler, int32_t maxBatchSize) {
+        if (pinMask != 0) {
+            Platform::PinCurrentThreadAffinity(pinMask);
+        }
         EventHandle waitEvent = nullptr;
         // Since all guest slots share the same reqEvent (shmName + "_guest_call"),
         // we can wait on the first one.
@@ -164,6 +177,21 @@ public:
         if (!*running) return 0;
         int processed = 0;
 
+        // v0.8.9 no-reclaim fast claim: the gen bump and lease refresh on this
+        // claim exist solely for the reclaim machinery — the gen bump fences
+        // §3.6.1 ABA for reclaimers (guest-sender transaction cycles are
+        // already fenced by the SENDER's own bump on every claim), and the
+        // lease heartbeat extends the sender's claim-time stamp for lease-
+        // based reclaimers. With host-side auto-reclaim off (the default),
+        // skip both. The claiming CAS itself is KEPT: the public
+        // ProcessGuestCalls API permits concurrent callers, and the CAS is
+        // what arbitrates two processors racing for one request. A Go-side
+        // reclaimer (guest's own opt-in) is covered by the existing lease
+        // contract — the sender's claim stamp is fresh within any threshold
+        // that exceeds the max call duration, which the contract requires.
+        const bool fastClaim =
+            alloc->autoReclaimTimeoutNs.load(std::memory_order_relaxed) == 0;
+
         const uint32_t numSlots = alloc->numSlots;
         const uint32_t numGuestSlots = alloc->numGuestSlots;
         for (uint32_t i = numSlots; i < numSlots + numGuestSlots; ++i) {
@@ -173,10 +201,15 @@ public:
             uint32_t current = slot->header->state.load(std::memory_order_acquire);
             if (current != SLOT_REQ_READY) continue;
 
-            // §3.6.1: bump generation before the claiming CAS.
-            slot->header->gen.fetch_add(1, std::memory_order_acq_rel);
+            // §3.6.1: bump generation before the claiming CAS (skipped when
+            // fastClaim — see above).
+            if (!fastClaim) {
+                slot->header->gen.fetch_add(1, std::memory_order_acq_rel);
+            }
             if (slot->header->state.compare_exchange_strong(current, SLOT_BUSY, std::memory_order_acq_rel)) {
-                slot->header->lease.store(Platform::MonotonicNanos(), std::memory_order_release);
+                if (!fastClaim) {
+                    slot->header->lease.store(Platform::MonotonicNanos(), std::memory_order_release);
+                }
                 int32_t reqSize = slot->header->reqSize;
                 const uint8_t* reqData = nullptr;
                 uint32_t absReqSize = (reqSize < 0) ? (0u - (uint32_t)reqSize) : (uint32_t)reqSize;

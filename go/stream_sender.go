@@ -16,10 +16,14 @@ type StreamSender struct {
 
 // NewStreamSender creates a new StreamSender.
 // c: The Client instance.
-// maxInFlight: Max number of concurrent chunks (pipelining). Default 2.
+// maxInFlight: Max number of concurrent chunks (pipelining). Default 1
+// (v0.8.9, was 2) — depth 2 measured strictly slower than depth 1 on every
+// stream cell on the reference host (memory-controller-bound plateau; overlap
+// buys nothing and the extra slot doubles the working set). Pass 2+ explicitly
+// for topologies where overlap helps. Mirrors the C++ StreamSender default.
 func NewStreamSender(c *Client, maxInFlight int) *StreamSender {
 	if maxInFlight <= 0 {
-		maxInFlight = 2
+		maxInFlight = 1
 	}
 	return &StreamSender{
 		client:      c,

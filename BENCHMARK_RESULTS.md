@@ -133,6 +133,34 @@ section — earlier numbers under-report throughput by the removed bench
 overhead and their sub-µs "Avg Latency" values were microsecond-truncation
 artifacts. Compare new runs only against this section onward.
 
+### Guest-call co-location + fast-claim/consume; stream default; scaling curve (2026-07-09, round 8)
+
+Same host/method. Guest-call 1T/64B echo, matched pairs, best of 3 — the
+worker thread and a dedicated sender goroutine are now co-located on one
+physical core's SMT pair (`HostConfig::guestWorkerAffinity` + Go
+`PinCurrentGoroutine`), with the S8 reclaim-machinery diet bundled:
+
+| Guest-call 1T/64B | v0.8.8 | v0.8.9 (pin + S8) | Δ |
+|:---|---:|---:|---:|
+| Throughput (ops/s) | 2,750,631 | **5,192,284** | **+88.8%** |
+| RTT | 364 ns | **193 ns** | |
+| best-of-3 spread | ~8% | 2.2% | |
+
+An unpinned control of the same binaries scattered 1.70M–3.16M (86% spread) —
+the scheduler-placement lottery pinning eliminates.
+
+**Stream in-flight library default 2→1**: re-measured with co-located slots
+(the S6 confound removed), depth 2 loses to depth 1 on every cell (−56…−80%);
+the plateau is memory-bound and the second slot both doubles the working set
+and breaks co-location. Explicit `inFlight>=2` callers unaffected.
+
+**Normal-mode scaling curve** (64B, per-pair ops/s): 1T 15.5M → 2T 10.8M →
+4T 8.9M → 8T 8.4M → 12T 6.5M (absolute: 8T 66.8M, 12T **77.7M** peak). Shape
+= boost-residency step + flat middle + runtime-core exhaustion at 12T, not a
+software serialization point; closed as hardware-characteristic. Sibling vs
+local re-measured: +69% @1T, +114% @8T. (This session ran ~10% hot vs round 7
+— compare only within a session.)
+
 ### Guest responder no-reclaim fast path (2026-07-04, round 7, S7)
 
 Same host/method, normal-mode ping-pong, best of 3, matched host+guest pairs.

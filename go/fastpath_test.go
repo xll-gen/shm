@@ -122,3 +122,110 @@ func TestGuestResponderFastPath(t *testing.T) {
 		atomic.StoreUint32(&hdr.State, SlotFree)
 	}
 }
+
+// TestGuestCallFastConsume exercises the v0.8.9 sender-side fast consume:
+// with FastPathAllowed==1 (host reclaim off) and the guest's own reclaim off,
+// sendGuestCallInternal retains ownership of the responded slot via
+// ActiveWait alone (no gen bump / consume CAS / lease refresh) and releases it
+// straight from SlotRespReady. Two back-to-back calls verify the slot recycles
+// cleanly through the fast release; run under -race in CI.
+func TestGuestCallFastConsume(t *testing.T) {
+	shmName := "GuestCallFastConsumeSHM"
+	UnlinkShm(shmName)
+	UnlinkEvent(fmt.Sprintf("%s_slot_0", shmName))
+	UnlinkEvent(fmt.Sprintf("%s_slot_0_resp", shmName))
+	UnlinkEvent(fmt.Sprintf("%s_guest_call", shmName))
+	UnlinkEvent(fmt.Sprintf("%s_slot_1_resp", shmName))
+
+	totalSize := uint64(64 + 2*(128+1024)) // 1 host + 1 guest slot
+	if totalSize < 4096 {
+		totalSize = 4096
+	}
+	hShm, addr, err := CreateShm(shmName, totalSize)
+	if err != nil {
+		t.Fatalf("CreateShm: %v", err)
+	}
+	defer func() {
+		CloseShm(hShm, addr, totalSize)
+		UnlinkShm(shmName)
+	}()
+
+	ex := (*ExchangeHeader)(unsafe.Pointer(addr))
+	ex.Magic = Magic
+	ex.Version = Version
+	ex.NumSlots = 1
+	ex.NumGuestSlots = 1
+	ex.SlotSize = 1024
+	ex.ReqOffset = 0
+	ex.RespOffset = 512
+	atomic.StoreUint32(&ex.FastPathAllowed, 1) // <-- enable fast consume
+
+	for _, n := range []string{"_slot_0", "_slot_0_resp", "_guest_call", "_slot_1_resp"} {
+		ev, err := CreateEvent(shmName + n)
+		if err != nil {
+			t.Fatalf("CreateEvent %s: %v", n, err)
+		}
+		name := shmName + n
+		defer func() { CloseEvent(ev); UnlinkEvent(name) }()
+	}
+	hResp, _ := OpenEvent(shmName + "_slot_1_resp")
+	defer CloseEvent(hResp)
+
+	// Mock host: echo two guest calls on guest slot (index 1).
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		gh := (*SlotHeader)(unsafe.Pointer(addr + uintptr(64+1*(128+1024))))
+		for served := 0; served < 2; {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if atomic.LoadUint32(&gh.State) == SlotReqReady {
+				// mimic ProcessGuestCalls: claim, echo, publish
+				if atomic.CompareAndSwapUint32(&gh.State, SlotReqReady, SlotBusy) {
+					gh.RespSize = gh.ReqSize
+					reqB := unsafe.Slice((*byte)(unsafe.Pointer(addr+uintptr(64+1*(128+1024))+128)), 512)
+					respB := unsafe.Slice((*byte)(unsafe.Pointer(addr+uintptr(64+1*(128+1024))+128+512)), 512)
+					copy(respB, reqB[:gh.ReqSize])
+					atomic.StoreUint32(&gh.State, SlotRespReady)
+					SignalEvent(hResp)
+					served++
+				}
+			}
+			time.Sleep(100 * time.Microsecond)
+		}
+	}()
+	defer func() { close(stop); <-done }()
+
+	guest, err := NewDirectGuest(shmName)
+	if err != nil {
+		t.Fatalf("NewDirectGuest: %v", err)
+	}
+	defer guest.Close()
+
+	if !guest.fastPathAllowed {
+		t.Fatalf("guest did not read FastPathAllowed==1")
+	}
+
+	for round := 0; round < 2; round++ {
+		payload := []byte(fmt.Sprintf("fast-%d", round))
+		resp, err := guest.SendGuestCall(payload, MsgTypeGuestCall)
+		if err != nil {
+			t.Fatalf("round %d: SendGuestCall: %v", round, err)
+		}
+		if string(resp) != string(payload) {
+			t.Fatalf("round %d: echo mismatch: got %q want %q", round, resp, payload)
+		}
+		// Fast release must leave the slot claimable again (SlotFree).
+		gh := (*SlotHeader)(unsafe.Pointer(addr + uintptr(64+1*(128+1024))))
+		if st := atomic.LoadUint32(&gh.State); st != SlotFree {
+			t.Fatalf("round %d: slot not released, state=%d", round, st)
+		}
+		if aw := atomic.LoadInt32(&guest.slots[1].ActiveWait); aw != 0 {
+			t.Fatalf("round %d: ActiveWait leaked: %d", round, aw)
+		}
+	}
+}

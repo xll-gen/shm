@@ -1,5 +1,57 @@
 # Changelog
 
+## [v0.8.9] - 2026-07-09
+
+No wire-protocol/ABI change — `SHM_VERSION` remains `0x00070000`; no
+shared-memory layout change this round (all additions are host/guest-local).
+Guest-call endpoint co-location + reclaim-machinery diet, and a measured
+stream pipelining default change (2026-07-09 round-8 pass; same-session A/B on
+Ryzen 9 3900X, see `EXPERIMENTS.md`/`BENCHMARK_RESULTS.md` §2026-07-09).
+
+### Changed
+
+- **Stream pipelining default `inFlight` 2 → 1** (C++ `StreamSender`, Go
+  `NewStreamSender`). Re-measured with the S6 slot-scramble confound removed
+  (co-located fixed slot ranges on both runs): depth 2 loses to depth 1 on
+  every stream cell (−56…−80%) — the stream plateau is memory-controller-bound
+  so overlapping host/guest memcpys buys nothing, the second slot doubles the
+  working set, and with a fixed range it spans a second physical core,
+  breaking endpoint co-location. Callers passing an explicit `inFlight >= 2`
+  are unaffected.
+
+### Added
+
+- **`HostConfig::guestWorkerAffinity`** (mask, default 0 = no pin) — pins the
+  guest-call worker thread. **Go `PinCurrentGoroutine(mask)`** — pins a
+  dedicated guest-call sender goroutine (LockOSThread + affinity mask). The
+  guest-call path had no sibling co-location (both endpoints floated on the
+  scheduler, paying cross-core line transfers per call plus placement
+  variance); pinning worker and sender to one physical core's two SMT LPs
+  restores the Direct-Exchange placement. **Guest-call 1T/64B: +88.8%
+  (2.75M → 5.19M ops/s, RTT 364→193 ns), best-of-3 spread 8%→2.2%**; an
+  unpinned control scattered 1.70–3.16M (86% spread).
+
+### Performance
+
+- **Guest-call reclaim-machinery diet (S8)** — the S7 reasoning applied to the
+  guest-call path, no ABI change: the worker's claim skips the gen bump +
+  lease refresh when host auto-reclaim is off (the claim CAS is kept — it
+  arbitrates concurrent `ProcessGuestCalls` callers); the Go sender's consume
+  skips the gen + CAS + lease entirely under
+  `fastPathAllowed && guest reclaim off`, retaining ownership via
+  `ActiveWait==1` until a release that drops ActiveWait then CAS's
+  `RESP_READY→FREE`; `GuestSlot.Send` keeps its consume CAS (zero-copy caller
+  holds the slot) but skips gen + lease. Bundled into the number above.
+  New regression: `go/fastpath_test.go::TestGuestCallFastConsume` (-race).
+
+### Documented
+
+- Normal-mode multi-thread per-pair scaling (1T 15.5M/pair → 8T 8.4M/pair)
+  investigated and closed as hardware-characteristic (boost residency +
+  uncore sharing; single 2T step then flat, not progressive) — no software
+  serialization point; absolute peak 12T 77.7M ops/s. Details in
+  EXPERIMENTS.md §2026-07-09.
+
 ## [v0.8.8] - 2026-07-04
 
 No wire-protocol/ABI change — `SHM_VERSION` remains `0x00070000`;

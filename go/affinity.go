@@ -244,3 +244,26 @@ func pinSlotWorker(slotIdx, numSlots int, mode AffinityMode) {
 	runtime.LockOSThread()
 	pinCurrentThreadAffinity(mask)
 }
+
+// PinCurrentGoroutine locks the calling goroutine to its OS thread and pins
+// that thread to the given CPU affinity mask (v0.8.9). No-op when mask is 0.
+//
+// Intended for dedicated guest-call sender goroutines: the guest-call path has
+// no automatic sibling co-location (unlike Direct-Exchange slot workers), so a
+// hot sender should pin itself to the guest LP of an SMT pair whose host LP
+// runs the C++ guest-call worker (HostConfig::guestWorkerAffinity) — putting
+// both endpoints on one physical core's shared L1d, the same placement that
+// makes Direct Exchange fast. Pick a pair not used by the Direct-Exchange
+// workers (they occupy pairs [0, numSlots) under AffinitySibling/Auto), e.g.
+// SmtPairs()[numSlots % len(SmtPairs())].
+//
+// The goroutine must NOT call runtime.UnlockOSThread afterwards — it would
+// migrate off the pinned thread and silently lose the locality. Do not pin
+// short-lived or pooled goroutines; this is for long-lived dedicated senders.
+func PinCurrentGoroutine(mask uint64) {
+	if mask == 0 {
+		return
+	}
+	runtime.LockOSThread()
+	pinCurrentThreadAffinity(mask)
+}

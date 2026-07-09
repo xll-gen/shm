@@ -367,6 +367,18 @@ int main(int argc, char** argv) {
 
     HostConfig config;
     config.shmName = SHM_NAME;
+    // Guest-call worker co-location (v0.8.9): pin the worker thread to the
+    // host LP of the first SMT pair NOT used by the normal-mode workers
+    // (they occupy pairs [0, NUM_THREADS) under sibling/auto). The Go bench
+    // sender pins itself to the same pair's guest LP (mirrored index), giving
+    // the guest-call ping-pong the same shared-L1d placement Direct Exchange
+    // gets. Skipped under --affinity none.
+    if (GUEST_CALL_MODE && AFFINITY_MODE != 1) {
+        auto pairs = shm::Platform::EnumerateSmtPairs();
+        if (!pairs.empty()) {
+            config.guestWorkerAffinity = pairs[NUM_THREADS % pairs.size()].host;
+        }
+    }
     // Stream mode: each worker can have IN_FLIGHT chunks outstanding, each
     // sitting in its own slot. Normal mode keeps the 1:1 thread-to-slot
     // mapping that the Direct Exchange model is built around.

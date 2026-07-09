@@ -133,12 +133,19 @@ func (s *GuestSlot) SendWithTimeout(size int32, msgType MsgType, timeout time.Du
 	if ready {
 		// Consume-claim: take the slot back to SlotGuestBusy BEFORE
 		// clearing ActiveWait, so it never looks like a zombie while the
-		// caller still reads ResponseBuffer(). Refresh the lease per
-		// SPECIFICATION.md §3.6 (every claiming CAS heartbeats) and bump
-		// Gen per §3.6.1 before re-claiming.
-		claimSlotGen(header)
+		// caller still reads ResponseBuffer(). Unlike sendGuestCallInternal's
+		// fast consume, the CAS itself is KEPT even under v0.8.9 fast-path
+		// conditions: the caller holds the slot after Send returns (zero-copy
+		// ResponseBuffer reads until Release), so the slot must park in a
+		// non-stealable state — SlotGuestBusy — not SlotRespReady. Only the
+		// gen bump and lease refresh (reclaim/ABA machinery, SPEC §3.6/§3.6.1)
+		// are skipped when both reclaimers are off.
+		fast := s.guest.fastPathAllowed && atomic.LoadUint64(&s.guest.autoReclaimTimeoutNs) == 0
+		if !fast {
+			claimSlotGen(header)
+		}
 		claimed = atomic.CompareAndSwapUint32(&header.State, SlotRespReady, SlotGuestBusy)
-		if claimed {
+		if claimed && !fast {
 			atomic.StoreUint64(&header.Lease, MonotonicNanos())
 		}
 	}

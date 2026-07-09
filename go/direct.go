@@ -958,20 +958,58 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, buffer []byte, msgType 
 	}
 
 	ready := slot.waitStrategy.WaitState(&slot.header.State, SlotRespReady, sleepAction)
+
+	// v0.8.9 fast consume: with the host's reclaim off (fastPathAllowed, S7
+	// flag) AND our own guest-side reclaim off, the consume-claim's
+	// counterparties (host/Go lease reclaimers) never run, and the only other
+	// threat — a sibling sender's zombie-steal of SlotRespReady — is gated on
+	// ActiveWait==0, which we keep at 1 until the final release. Ownership is
+	// therefore retained without the gen bump + CAS + lease refresh (3 locked
+	// ops); the slot is released straight from SlotRespReady.
+	fastConsume := ready && g.fastPathAllowed && atomic.LoadUint64(&g.autoReclaimTimeoutNs) == 0
+
 	claimed := false
 	if ready {
-		// Consume-claim: take the slot back to SlotGuestBusy BEFORE
-		// clearing ActiveWait, so it never looks like a zombie
-		// (SlotRespReady && ActiveWait==0) while we read the response.
-		// Refresh the lease per SPECIFICATION.md §3.6 and bump Gen per
-		// §3.6.1 before re-claiming.
-		claimSlotGen(slot.header)
-		claimed = atomic.CompareAndSwapUint32(&slot.header.State, SlotRespReady, SlotGuestBusy)
-		if claimed {
-			atomic.StoreUint64(&slot.header.Lease, MonotonicNanos())
+		if fastConsume {
+			claimed = true
+		} else {
+			// Consume-claim: take the slot back to SlotGuestBusy BEFORE
+			// clearing ActiveWait, so it never looks like a zombie
+			// (SlotRespReady && ActiveWait==0) while we read the response.
+			// Refresh the lease per SPECIFICATION.md §3.6 and bump Gen per
+			// §3.6.1 before re-claiming.
+			claimSlotGen(slot.header)
+			claimed = atomic.CompareAndSwapUint32(&slot.header.State, SlotRespReady, SlotGuestBusy)
+			if claimed {
+				atomic.StoreUint64(&slot.header.Lease, MonotonicNanos())
+			}
 		}
 	}
-	atomic.StoreInt32(&slot.ActiveWait, 0)
+	if !fastConsume {
+		// Slow path (and timeout): the slot is either owned at SlotGuestBusy
+		// (not stealable) or forfeited, so ActiveWait can drop now. The fast
+		// path must NOT drop it yet — state is still SlotRespReady and
+		// ActiveWait==1 is what blocks the zombie-steal until releaseOwned.
+		atomic.StoreInt32(&slot.ActiveWait, 0)
+	}
+
+	// releaseOwned frees the slot from whichever state we own it in. Fast
+	// path ordering is load-bearing: drop ActiveWait FIRST, then CAS the
+	// state — the reverse (CAS to SlotFree, then clear ActiveWait) could
+	// clobber a new owner's ActiveWait=1 after it claims the freed slot. The
+	// brief SlotRespReady+ActiveWait==0 window before our CAS is benign: a
+	// stealer that recycles the slot in that instant makes our CAS fail
+	// harmlessly (the response bytes were already copied out).
+	ownedState := uint32(SlotGuestBusy)
+	if fastConsume {
+		ownedState = SlotRespReady
+	}
+	releaseOwned := func() {
+		if fastConsume {
+			atomic.StoreInt32(&slot.ActiveWait, 0)
+		}
+		atomic.CompareAndSwapUint32(&slot.header.State, ownedState, SlotFree)
+	}
 
 	if !ready {
 		// Timeout: the host may still own the slot (SlotReqReady/SlotBusy).
@@ -988,12 +1026,12 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, buffer []byte, msgType 
 	}
 
 	if slot.header.MsgSeq != currentSeq {
-		atomic.CompareAndSwapUint32(&slot.header.State, SlotGuestBusy, SlotFree)
+		releaseOwned()
 		return nil, fmt.Errorf("msgSeq mismatch: expected %d, got %d", currentSeq, slot.header.MsgSeq)
 	}
 
 	if slot.header.MsgType == MsgTypeSystemError {
-		atomic.CompareAndSwapUint32(&slot.header.State, SlotGuestBusy, SlotFree)
+		releaseOwned()
 		return nil, fmt.Errorf("system error: host rejected request (likely buffer overflow)")
 	}
 
@@ -1002,7 +1040,7 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, buffer []byte, msgType 
 
 	if respSize >= 0 {
 		if int(respSize) > len(slot.respBuffer) {
-			atomic.CompareAndSwapUint32(&slot.header.State, SlotGuestBusy, SlotFree)
+			releaseOwned()
 			return nil, fmt.Errorf("response size %d exceeds buffer size %d", respSize, len(slot.respBuffer))
 		}
 		if buffer != nil && cap(buffer) >= int(respSize) {
@@ -1014,11 +1052,11 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, buffer []byte, msgType 
 	} else {
 		rLen := -respSize
 		if rLen < 0 {
-			atomic.CompareAndSwapUint32(&slot.header.State, SlotGuestBusy, SlotFree)
+			releaseOwned()
 			return nil, fmt.Errorf("invalid response size: %d", respSize)
 		}
 		if int(rLen) > len(slot.respBuffer) {
-			atomic.CompareAndSwapUint32(&slot.header.State, SlotGuestBusy, SlotFree)
+			releaseOwned()
 			return nil, fmt.Errorf("response size %d exceeds buffer size %d", rLen, len(slot.respBuffer))
 		}
 		offset := int32(len(slot.respBuffer)) - rLen
@@ -1030,7 +1068,7 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, buffer []byte, msgType 
 		copy(respData, slot.respBuffer[offset:])
 	}
 
-	atomic.CompareAndSwapUint32(&slot.header.State, SlotGuestBusy, SlotFree)
+	releaseOwned()
 
 	return respData, nil
 }

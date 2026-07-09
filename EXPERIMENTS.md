@@ -457,3 +457,80 @@ Together with held-slot (host) this removes the per-RTT claim from BOTH ends of
 Direct Exchange when auto-reclaim is off (the common case). With reclaim on,
 both ends keep the full gen/claim/lease dance (correctness over speed), gated
 by the same startup contract.
+
+## 2026-07-09 guest-call co-location + S8 fast-claim/consume + inFlight default + scaling-gap closure (round 8)
+
+Four items from the post-v0.8.8 improvement review, all measured same-session
+(Ryzen 9 3900X, `harness.ps1 -HighPriority`, best-of-3 unless noted).
+
+### 1. Guest-call endpoint co-location (adopted — the round's headline)
+
+Diagnosis: guest-call RTT was ~6.5× the Direct-Exchange RTT (471 ns vs 72 ns)
+with both sides spin-bound after v0.8.6. Root cause: **both guest-call
+endpoints ran unpinned** — the C++ `GuestCallWorker` thread and the Go sender
+goroutine float on the OS scheduler, so every call pays cross-core cache-line
+transfers (and placement luck), while Direct-Exchange has enjoyed SMT-sibling
+co-location since v0.8.2.
+
+Fix: `HostConfig::guestWorkerAffinity` (mask, 0 = no pin) pins the worker
+thread; new exported Go `PinCurrentGoroutine(mask)` lets a dedicated sender
+goroutine pin itself. The bench wires both to the first SMT pair not used by
+the Direct-Exchange workers (`pairs[NUM_THREADS % pairs]`, host LP ↔ guest LP).
+
+Result (guest-call 1T/64B echo, with S8 below included):
+
+| | v0.8.8 | pinned (+S8) | Δ |
+|:---|---:|---:|---:|
+| best of 3 | 2,750,631 | 5,192,284 | **+88.8% (≈1.9×)** |
+| spread | ~8% | **2.2%** | |
+| RTT | 364 ns | **193 ns** | |
+
+A no-pin control run of the same new binaries scattered 1.70M–3.16M (86%
+spread) — the placement lottery in one picture. Pinning buys both the
+throughput and the determinism. S8's individual contribution is not separable
+from that lottery noise; it is bundled here.
+
+### 2. S8: guest-call reclaim-machinery diet (adopted, bundled above)
+
+The S7 reasoning applied to the guest-call path, no new ABI:
+- **Worker claim** (`ProcessGuestCalls`): the gen bump + lease refresh around
+  the REQ_READY→BUSY claim exist for reclaimers only → skipped when the host's
+  `autoReclaimTimeoutNs == 0`. The claim **CAS is kept** — the public API
+  permits concurrent ProcessGuestCalls callers and the CAS arbitrates them.
+- **Sender consume** (`sendGuestCallInternal`): under
+  `fastPathAllowed && guest reclaim off`, the consume-claim (gen + CAS + lease)
+  is skipped entirely; ownership is retained by holding `ActiveWait==1` (the
+  zombie-steal gate) until release, which drops ActiveWait first and then
+  CAS's `RESP_READY→FREE` (that order — the reverse could clobber a new
+  owner's ActiveWait; the brief RESP_READY+AW==0 window is benign since the
+  response was already copied out).
+- **GuestSlot.Send**: keeps the consume CAS (the zero-copy caller holds the
+  slot until Release) but skips gen + lease under the same condition.
+New regression: `TestGuestCallFastConsume` (-race).
+
+### 3. Library stream in-flight default 2 → 1 (adopted; behavior default change)
+
+The deferred re-measure after S6: with the slot-scramble confound removed
+(both runs co-located via baseSlot), depth 2 still loses to depth 1 on EVERY
+stream cell — and by more than the old pool-path comparison suggested
+(64 KiB 1T 67.5K→26.5K, −61%; 16 MiB 4T 210→93, −56%): the stream plateau is
+memory-controller-bound so overlapping host/guest memcpys buys nothing, the
+second slot doubles the working set, and with a fixed range it spans a second
+physical core, breaking the very co-location S6 added. **C++ `StreamSender`
+and Go `NewStreamSender` defaults changed 2 → 1**; explicit `inFlight>=2`
+callers are unaffected.
+
+### 4. Normal-mode multi-thread scaling gap (investigated — closed as hardware)
+
+Per-pair throughput: 1T 15.5M → 2T 10.8M (−30%) → 4T 8.9M → 8T 8.4M →
+12T 6.5M. The shape rules out a software serialization point (that degrades
+progressively per thread, like the pre-sharding benchstats collapse): here a
+single step lands at 2T, 4–8T is flat, and only 12T (no idle cores left for
+the Go runtime) drops again. Consistent with single-core boost residency +
+shared uncore/IF effects. Absolute throughput rises monotonically (8T 66.8M,
+12T 77.7M — a new peak), and sibling-vs-local re-measured at +69% (1T) /
++114% (8T). Closed; reopen only with HW-counter profiling (uProf).
+
+**Session-freshness note:** this session's absolute normal-mode numbers ran
+~10% above the round-7 session (1T 15.5M vs 14.0M) with identical binaries on
+the baseline side — reaffirming the within-session-A/B-only comparison rule.

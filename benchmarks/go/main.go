@@ -120,6 +120,16 @@ func main() {
 	if *guestCallMode {
 		go func() {
 			fmt.Println("Starting Guest Call Worker...")
+			// Co-locate with the C++ guest-call worker (v0.8.9): it pins to
+			// the host LP of SMT pair [numWorkers % pairs] (see main.cpp), so
+			// pin this dedicated sender to the same pair's guest LP — the
+			// shared-L1d placement Direct Exchange gets from AffinitySibling.
+			// Skipped under -affinity none (mirrors the C++ gate).
+			if affinityMode != shm.AffinityNone {
+				if pairs := shm.SmtPairs(); len(pairs) > 0 {
+					shm.PinCurrentGoroutine(pairs[*numWorkers%len(pairs)].Guest)
+				}
+			}
 			// Wait a bit for Host to be ready
 			time.Sleep(2 * time.Second)
 

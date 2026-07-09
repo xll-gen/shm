@@ -63,7 +63,16 @@ public:
     /**
      * @brief Constructs a StreamSender.
      * @param h Pointer to the initialized DirectHost.
-     * @param inFlight Max number of slots to use concurrently (default 2 for double buffering).
+     * @param inFlight Max number of slots to use concurrently. Default 1
+     *        (v0.8.9, was 2): pipelining depth 2 measured strictly slower than
+     *        depth 1 on every stream cell on the reference host, both with the
+     *        shared pool AND with a co-located fixed slot range — the stream
+     *        plateau is memory-controller-bound, so overlapping host/guest
+     *        memcpys buys nothing, while a second slot doubles the working set
+     *        and (with baseSlot) spans a second physical core, breaking the
+     *        endpoint co-location. See BENCHMARK_RESULTS.md §2026-07-04 and
+     *        the 2026-07-09 re-measure. Callers with topologies where overlap
+     *        does help can still pass 2+ explicitly.
      * @param base Optional fixed slot range (v0.8.7). When >= 0 the sender draws
      *        its slots round-robin from [base, base+inFlight) via
      *        AcquireSpecificSlot instead of the shared pool (AcquireSlot). With
@@ -77,7 +86,7 @@ public:
      *        For inFlight>1 co-location is only partial (the range spans several
      *        Go workers on different cores).
      */
-    StreamSender(DirectHost* h, int inFlight = 2, int32_t base = -1)
+    StreamSender(DirectHost* h, int inFlight = 1, int32_t base = -1)
         : host(h), maxInFlight(inFlight), baseSlot(base) {}
 
     /**

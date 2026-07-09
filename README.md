@@ -32,7 +32,7 @@ Measured on an **AMD Ryzen 9 3900X (12C/24T, native Windows 11)**, `benchmarks/h
 | 4  | **35.4 M ops/s** | 21.9 M ops/s |
 | 8  | **58.4 M ops/s** | 39.3 M ops/s |
 
-**Guest Call — Go→C++ push (e.g. RTD updates), 64 B echo:** **~2.1 M ops/s** at 1 thread (adaptive-spin worker with doorbell elision, v0.8.6).
+**Guest Call — Go→C++ push (e.g. RTD updates), 64 B echo:** **~5.2 M ops/s** (193 ns RTT) at 1 thread with the worker and a dedicated sender co-located on one physical core's SMT pair (`HostConfig::guestWorkerAffinity` + Go `PinCurrentGoroutine`, v0.8.9); ~2.1–2.7 M unpinned (and far noisier — scheduler placement lottery).
 
 **Streaming — bulk transfer:** plateaus at **~3.6 GB/s** with 4–8 MiB chunks; small/medium streams gain **+28…+70% at 4T/8T** from per-worker slot co-location (v0.8.7).
 

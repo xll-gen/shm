@@ -42,6 +42,14 @@ struct HostConfig {
     /** @brief Number of slots to allocate for Guest-to-Host calls. Default: 0. */
     uint32_t numGuestSlots = 0;
 
+    /** @brief v0.8.9: CPU affinity mask for the guest-call worker thread
+     * (0 = no pin, the default). The guest-call path has no automatic sibling
+     * co-location (unlike Direct-Exchange workers), so both endpoints float on
+     * the OS scheduler; pinning the worker to one LP of an SMT pair whose
+     * other LP hosts the (LockOSThread-pinned) Go sender restores shared-L1d
+     * locality. See Go-side shm.PinCurrentGoroutine. */
+    uint64_t guestWorkerAffinity = 0;
+
     /** @brief v0.8.6: whether the guest-call worker runs an adaptive spin phase
      * and publishes HOST_STATE_WAITING before parking (letting the Go sender
      * elide its request-doorbell syscall while the worker is hot). Default true.
@@ -448,6 +456,7 @@ public:
         allocator_.numSlots = numSlots;
         allocator_.numGuestSlots = numGuestSlots;
         worker_.spin = config.guestWorkerSpin;
+        worker_.pinMask = config.guestWorkerAffinity;
 
         allocator_.msgSeqStride = numSlots + numGuestSlots;
 
