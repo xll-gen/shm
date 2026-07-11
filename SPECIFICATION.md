@@ -1,8 +1,9 @@
 # Shared Memory IPC Specification (wire protocol `SHM_VERSION 0x00070000`)
 
 > Document tracks the `shm` release line (see `VERSION`). The **wire** protocol version
-> (`SHM_VERSION 0x00070000`) is intentionally pinned across the ABI-compatible v0.7.x series;
-> patch releases add fields carved from reserved space without bumping it.
+> (`SHM_VERSION 0x00070000`) is intentionally pinned across the ABI-compatible v0.7.x–v0.8.x line;
+> minor and patch releases add fields carved from reserved space without bumping it
+> (e.g. `fastPathAllowed` in v0.8.8 — see §2.1).
 
 This document defines the specification for the `xll-gen/shm` Shared Memory IPC system. It serves as the authoritative reference for implementing the protocol in any language (C++, Go, Python, Rust, etc.).
 

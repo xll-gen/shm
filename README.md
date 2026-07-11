@@ -2,18 +2,15 @@
 
 SimpleIPC is a high-performance, low-latency shared-memory IPC library connecting C++ (Host) and Go (Guest). It uses a lock-free, direct slot exchange model to achieve sub-microsecond latency.
 
-> **⚠️ WARNING: EXPERIMENTAL STATUS**
->
-> This project is currently in an **experimental stage** (v0.6.0) and is under active development.
-> It is **NOT** recommended for use in production environments at this time.
-> APIs and memory layouts are subject to change without notice.
+> This project is currently in **beta** (v0.8.9) and under active development.
+> APIs and memory layouts may still change between minor versions.
 
 ## Features
 
 *   **Low Latency**: Uses atomic spin-loops with adaptive backoff (Spin -> Yield -> Sleep) to minimize OS scheduler overhead.
 *   **Direct Mode**: 1:1 Thread-to-Slot mapping eliminates contention and queuing delays.
 *   **Zero Copy**: Data is written directly to shared memory slots.
-*   **Cross-Platform**: Supports Linux (shm_open/sem_open) and Windows (CreateFileMapping/CreateEvent).
+*   **Windows-Native**: Built directly on Win32 primitives (`CreateFileMapping` / `CreateEvent`); compiles with MSVC and MinGW.
 *   **Protocol Agnostic**: Transmits raw bytes with a minimal 8-byte Transport Header for request matching.
 *   **Guest-to-Host Calls**: Supports async notifications from Go to C++.
 *   **Header-Only C++**: Easy integration via `include/shm`.
@@ -340,8 +337,7 @@ For complex recursion, it is recommended to **double the slot count** to provide
 ## Building
 
 ### Requirements
-*   **Linux**: Kernel 4.x+, GCC 8+/Clang 10+
-*   **Windows**: MSVC 2019+
+*   **Windows**: MSVC 2019+ or MinGW (GCC)
 *   **Go**: 1.18+
 *   **CMake**: 3.10+
 
@@ -352,19 +348,6 @@ The project uses `Taskfile` for automation (requires [Task](https://taskfile.dev
 ```bash
 # Run all benchmarks (Builds C++ and Go, runs tests)
 task run:benchmark
-```
-
-#### Linux (Manual)
-
-```bash
-# Build C++ Benchmarks
-mkdir build && cd build
-cmake .. -DSHM_BUILD_BENCHMARKS=ON -DCMAKE_BUILD_TYPE=Release
-make
-
-# Build Go Benchmark Server
-cd ../benchmarks/go
-go build
 ```
 
 #### Windows (Manual with MSVC)
