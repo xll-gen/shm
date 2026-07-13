@@ -237,10 +237,11 @@ type DirectGuest struct {
 	// (default) disables auto-reclaim — opt-in for safety.
 	autoReclaimTimeoutNs uint64
 
-	// v0.8.0-alpha: opt-in CPU affinity for worker goroutines. Default
-	// AffinityNone preserves OS-scheduler behaviour. AffinityLocal pins
-	// each slot's worker goroutine to the CCX (shared-L3 LP set) at
-	// index `idx % numCCX`. See affinity.go.
+	// CPU affinity policy for worker goroutines. The zero value
+	// AffinityAuto (default since v0.8.1, chipset-aware since v0.8.2)
+	// resolves at Start via affinity.go::resolveAuto — Sibling when SMT
+	// pairs fit numSlots, Local on multi-CCX hosts, none otherwise or
+	// when GOMAXPROCS < numSlots. AffinityNone is the explicit opt-out.
 	affinityMode AffinityMode
 
 	// v0.8.8: guest responder no-reclaim fast path, read once from the host's

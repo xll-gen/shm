@@ -169,7 +169,10 @@ func NewStreamReassembler(onStream StreamHandler, fallback func(req []byte, resp
 			payloadSize := binary.LittleEndian.Uint32(req[12:16])
 
 			headerLen := int(unsafe.Sizeof(ChunkHeader{}))
-			if len(req) < headerLen+int(payloadSize) {
+			// Unsigned arithmetic: on 32-bit builds int(payloadSize) of a
+			// hostile value >= 2^31 would go negative and slip past a signed
+			// comparison, panicking at the slice expression below.
+			if uint64(len(req)) < uint64(headerLen)+uint64(payloadSize) {
 				return 0, MsgTypeSystemError
 			}
 

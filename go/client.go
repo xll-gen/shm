@@ -17,12 +17,14 @@ type ClientConfig struct {
 	// Default: 100 milliseconds.
 	RetryInterval time.Duration
 	// AffinityMode controls per-slot worker goroutine CPU placement.
-	// Default AffinityNone preserves backward-compatible OS-scheduler
-	// behaviour. AffinityLocal pins each worker to the CCX (shared-L3
-	// LP set) at index `slotIdx % numCCX` — see affinity.go. Opt-in
-	// because the underlying GetLogicalProcessorInformationEx /
-	// SetThreadAffinityMask coupling is best validated on the actual
-	// production host before being relied on.
+	// The zero value AffinityAuto is chipset-aware (v0.8.2): it applies
+	// SMT-sibling pinning when the topology reports SMT pairs and the
+	// slot count fits, falls back to CCX-wide masks on multi-L3 hosts,
+	// and declines to pin on monolithic-L3 hosts, no-SMT VMs, or when
+	// GOMAXPROCS < numSlots (oversubscription gate). Avoiding pinning
+	// therefore requires an explicit opt-out: set AffinityNone. See
+	// affinity.go (AffinityMode constants and resolveAuto) for the full
+	// resolution order.
 	AffinityMode AffinityMode
 }
 

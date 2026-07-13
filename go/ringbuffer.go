@@ -64,6 +64,11 @@ func (rb *RingBufferReceiver) Read(out []byte) int {
 	if available == 0 {
 		return 0
 	}
+	// Wire-boundary guard: WriteOffset comes from the peer. A corrupt header
+	// with available > capacity would drive the wrap copy past len(rb.data).
+	if available > uint64(rb.capacity) {
+		return 0
+	}
 
 	toRead := uint64(len(out))
 	if available < toRead {
