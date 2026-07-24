@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"sync"
+	"time"
 	"unsafe"
 )
 
@@ -52,6 +53,17 @@ const (
 	MaxConcurrentStreams = 1024
 )
 
+// DefaultStreamTimeout bounds how long a partially-reassembled stream may sit
+// in memory before it is pruned regardless of the concurrent-stream count.
+// It matches the C++ StreamReassembler default (StreamReassemblerConfig::
+// streamTimeoutMs = 10000; see include/shm/StreamReassembler.h) so both peers
+// reclaim abandoned stream memory on the same timescale. The count-LRU bound
+// (MaxConcurrentStreams) only reclaims once 1024 streams pile up; the timeout
+// reclaims a lone stalled stream — and the ooo bytes it parks — on its own.
+// SPEC §3.3.4 leaves the reclaim mechanism implementation-defined, so adding
+// time-prune alongside LRU stays within the wire contract.
+const DefaultStreamTimeout = 10 * time.Second
+
 // StreamHandler is a function type for processing assembled streams.
 type StreamHandler func(streamID uint64, data []byte)
 
@@ -79,6 +91,12 @@ type streamContext struct {
 	// StreamStart/StreamChunk for this stream. It defines least-recently-active
 	// order for eviction; it is read/written only under the reassembler mutex.
 	lastSeq uint64
+	// started is the wall/monotonic time the stream's StreamStart was accepted.
+	// It drives the C++-parity age-based timeout prune and, mirroring the C++
+	// StreamContext::startTime, is set once at StreamStart and NOT refreshed on
+	// chunk arrival — expiry is measured from stream start, not last activity.
+	// Read/written only under the reassembler mutex.
+	started time.Time
 }
 
 // consume appends data at the in-order cursor, enforcing the SPEC §3.3.4
@@ -102,6 +120,17 @@ func (c *streamContext) consume(data []byte) bool {
 // onStream: Called when a stream is fully reassembled.
 // fallback: Called for non-stream messages. Can be nil.
 func NewStreamReassembler(onStream StreamHandler, fallback func(req []byte, resp []byte, msgType MsgType) (int32, MsgType)) func(req []byte, resp []byte, msgType MsgType) (int32, MsgType) {
+	return newStreamReassembler(onStream, fallback, DefaultStreamTimeout, time.Now)
+}
+
+// newStreamReassembler is the clock- and timeout-injectable core of
+// NewStreamReassembler. timeout <= 0 disables the age-based prune (LRU only).
+// now supplies the current time; production passes time.Now, tests pass a
+// controllable clock so the timeout can be driven deterministically without
+// real sleeps. now() is expected to be monotonic within a process — time.Time
+// subtraction uses Go's monotonic reading, so an NTP wall-clock step does not
+// perturb elapsed measurement.
+func newStreamReassembler(onStream StreamHandler, fallback func(req []byte, resp []byte, msgType MsgType) (int32, MsgType), timeout time.Duration, now func() time.Time) func(req []byte, resp []byte, msgType MsgType) (int32, MsgType) {
 	// Map to store partial streams
 	streams := make(map[uint64]*streamContext)
 	var mu sync.Mutex
@@ -133,6 +162,25 @@ func NewStreamReassembler(onStream StreamHandler, fallback func(req []byte, resp
 
 			mu.Lock()
 			seq++
+			tnow := now()
+
+			// Age-based prune (C++ StreamReassembler::PruneInternal parity):
+			// drop every in-flight stream older than the timeout, freeing its
+			// preallocated buf and any parked ooo bytes. Unlike the count-LRU
+			// bound below, this reclaims a lone stalled stream without waiting
+			// for MaxConcurrentStreams distinct streams to pile up. Runs at
+			// StreamStart — the point new memory is about to be committed.
+			// A repeated StreamStart for the same ID resets the start time
+			// via the fresh streamContext overwrite below (C++ does the
+			// same: streams[id] is replaced with a fresh startTime).
+			if timeout > 0 {
+				for id, c := range streams {
+					if tnow.Sub(c.started) > timeout {
+						delete(streams, id)
+					}
+				}
+			}
+
 			// Bound the number of in-flight reassemblies. Adding a genuinely
 			// new stream beyond the cap evicts the least-recently-active one,
 			// so a peer that starts streams but never finishes them cannot grow
@@ -154,6 +202,7 @@ func NewStreamReassembler(onStream StreamHandler, fallback func(req []byte, resp
 				totalChunks: header.TotalChunks,
 				buf:         make([]byte, header.TotalSize),
 				lastSeq:     seq,
+				started:     tnow,
 			}
 			mu.Unlock()
 			return 0, MsgTypeNormal // ACK

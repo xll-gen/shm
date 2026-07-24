@@ -153,22 +153,42 @@ func (w *WaitStrategy) Wait(condition func() bool, sleepAction func()) bool {
 func (w *WaitStrategy) recordOutcome(hit bool, limit int32) {
 	if hit {
 		w.recordSpinSuccess()
-		if limit < waitStrategyMaxSpin {
-			newLimit := limit + waitStrategyIncStep
+	} else {
+		w.recordSleepFallback()
+	}
+
+	// Adapt CurrentLimit with a CompareAndSwap RMW loop instead of a bare
+	// Load(in the wait loop)→compute→Store. With the single-waiter ActiveWait
+	// gate there is never a concurrent writer, so `limit` — the snapshot the
+	// wait loop already loaded — equals CurrentLimit and the first CAS succeeds:
+	// identical behaviour and the same ±step/clamp value formula as before.
+	// The loop is purely defensive: were a second writer to ever touch the
+	// field, a lost CAS re-snapshots the live value and recomputes rather than
+	// blindly clobbering it. Not a hot path (fires once per Wait/WaitState).
+	cur := limit
+	for {
+		var newLimit int32
+		if hit {
+			if cur >= waitStrategyMaxSpin {
+				return
+			}
+			newLimit = cur + waitStrategyIncStep
 			if newLimit > waitStrategyMaxSpin {
 				newLimit = waitStrategyMaxSpin
 			}
-			atomic.StoreInt32(&w.CurrentLimit, newLimit)
+		} else {
+			if cur <= waitStrategyMinSpin {
+				return
+			}
+			newLimit = cur - waitStrategyDecStep
+			if newLimit < waitStrategyMinSpin {
+				newLimit = waitStrategyMinSpin
+			}
 		}
-		return
-	}
-	w.recordSleepFallback()
-	if limit > waitStrategyMinSpin {
-		newLimit := limit - waitStrategyDecStep
-		if newLimit < waitStrategyMinSpin {
-			newLimit = waitStrategyMinSpin
+		if atomic.CompareAndSwapInt32(&w.CurrentLimit, cur, newLimit) {
+			return
 		}
-		atomic.StoreInt32(&w.CurrentLimit, newLimit)
+		cur = atomic.LoadInt32(&w.CurrentLimit)
 	}
 }
 

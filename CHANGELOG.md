@@ -1,5 +1,33 @@
 # Changelog
 
+## [v0.8.11] - 2026-07-24
+
+No wire-protocol/ABI change — `SHM_VERSION` remains `0x00070000`. Go-side
+hardening + C++ parity, all host/guest-local.
+
+### Added
+
+- **Partial-stream time-based expiry in the Go reassembler** (C++ parity —
+  `StreamReassembler`'s 10 s `streamTimeoutMs` had no Go counterpart, so a
+  lone stalled stream held its parked out-of-order bytes indefinitely until
+  1024 other streams forced the count-LRU bound). Same semantics as C++:
+  age measured from stream start, `DefaultStreamTimeout = 10s`, expired
+  streams pruned at StreamStart admission; `timeout <= 0` disables. Public
+  API unchanged (clock/timeout injection is an unexported core).
+  SPECIFICATION.md §3.3.4 updated. Tests: `stream_timeout_test.go`.
+- **Fast-path zombie-steal contract pinned by tests** (`fastpath_test.go`):
+  a slow handler under `FastPathAllowed==1` completes its original
+  transaction safely because the fast path requires host auto-reclaim OFF
+  (§3.4); a contract-violating host that reclaims mid-handler reproduces
+  the documented blind RESP_READY hazard. No code change — the guarding
+  invariant is the no-reclaim contract, not the msgSeq guard.
+
+### Changed
+
+- `recordOutcome` adaptive spin-limit update is now a CAS loop instead of a
+  Load→Store RMW (defensive: lost-update-proof if a WaitStrategy is ever
+  shared; value formula unchanged, not a hot path).
+
 ## [v0.8.10] - 2026-07-24
 
 No wire-protocol/ABI change — `SHM_VERSION` remains `0x00070000`. Platform

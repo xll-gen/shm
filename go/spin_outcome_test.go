@@ -1,6 +1,62 @@
 package shm
 
-import "testing"
+import (
+	"sync"
+	"sync/atomic"
+	"testing"
+)
+
+// TestRecordOutcomeCASNoLostUpdate pins the defensive property of the
+// CompareAndSwap RMW loop in recordOutcome: concurrent calls that share the
+// same starting snapshot must each apply their ±step (up to the clamp), never
+// collapse to a single write the way the prior Load→compute→Store RMW did.
+// Production never drives this — one waiter per slot via the ActiveWait gate —
+// but the loop must be lost-update-safe regardless. Fails on the pre-CAS
+// implementation (all racing Stores write the same value → one net step).
+func TestRecordOutcomeCASNoLostUpdate(t *testing.T) {
+	const start int32 = 1000
+	const goroutines = 8
+
+	w := &WaitStrategy{CurrentLimit: start}
+	var wg sync.WaitGroup
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			w.recordOutcome(true, start) // every caller passes the same snapshot
+		}()
+	}
+	wg.Wait()
+
+	want := start + goroutines*waitStrategyIncStep
+	if want > waitStrategyMaxSpin {
+		want = waitStrategyMaxSpin
+	}
+	if got := atomic.LoadInt32(&w.CurrentLimit); got != want {
+		t.Fatalf("concurrent recordOutcome hits: CurrentLimit=%d want %d (lost update?)", got, want)
+	}
+
+	// Symmetric check on the miss/shrink direction, clamped at min.
+	const startHi int32 = 40000
+	w = &WaitStrategy{CurrentLimit: startHi}
+	wg = sync.WaitGroup{}
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			w.recordOutcome(false, startHi)
+		}()
+	}
+	wg.Wait()
+
+	wantLo := startHi - goroutines*waitStrategyDecStep
+	if wantLo < waitStrategyMinSpin {
+		wantLo = waitStrategyMinSpin
+	}
+	if got := atomic.LoadInt32(&w.CurrentLimit); got != wantLo {
+		t.Fatalf("concurrent recordOutcome misses: CurrentLimit=%d want %d (lost update?)", got, wantLo)
+	}
+}
 
 // TestWaitLimitAdaptation pins the adaptive-limit bookkeeping that Wait and
 // WaitState share through recordOutcome: a spin-resolved wait widens the window
