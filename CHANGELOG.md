@@ -1,5 +1,36 @@
 # Changelog
 
+## [v0.8.10] - 2026-07-24
+
+No wire-protocol/ABI change — `SHM_VERSION` remains `0x00070000`. Platform
+contract clarification + wire-boundary hardening (bundles the three
+post-v0.8.9 hardening/docs commits).
+
+### Breaking (build-time only)
+
+- **GOARCH=386 builds now fail at compile time.** The Go guest was never
+  functional on 386 — `memoryBasicInformation` mirrors the 64-bit
+  `MEMORY_BASIC_INFORMATION`, so a 386 build misreads `RegionSize` and every
+  `openShm` attach is rejected with a misleading error (verified on WOW64).
+  A `windows && !amd64` guard file makes the amd64-only contract explicit
+  with a single clear error. AGENTS.md / SPECIFICATION.md §4.4 now state
+  windows/amd64-only; 32-bit x86 is unsupported.
+
+### Fixed
+
+- **Wire-boundary reads hardened** (from `02fd409`): `RingBufferReceiver.Read`
+  clamps a corrupt `WriteOffset` (available > capacity) and the stream chunk
+  path rejects hostile `PayloadSize >= 2^31` — both could previously drive a
+  copy/slice past the backing array. Pinned by `wire_guard_test.go`.
+- Stale reclaim-API version comments in `direct.go` (v0.7.1 → v0.7.2; spec
+  §3.6 is authoritative).
+
+### Docs
+
+- Platform claims corrected across README/AGENTS (Windows-only, Linux backend
+  removed), AffinityMode doc comments describe the `AffinityAuto` zero-value
+  default, README documents the three biggest measured performance factors.
+
 ## [v0.8.9] - 2026-07-09
 
 No wire-protocol/ABI change — `SHM_VERSION` remains `0x00070000`; no
