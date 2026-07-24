@@ -98,7 +98,7 @@ const (
 // Lease (offset 96, added in v0.7.0): the side that last CAS's State to a
 // non-FREE value writes the current monotonic-ns timestamp here, marking
 // the slot as actively owned. v0.7.0 only writes the lease; the
-// reclamation logic that consumes it ships in v0.7.1 alongside a
+// reclamation logic that consumes it ships in v0.7.2 alongside a
 // property-based crash-injection test. Until then external readers may
 // poll Lease for liveness detection but no automatic action is taken.
 type SlotHeader struct {
@@ -574,7 +574,7 @@ var reclaimPreCASHook func(slotIdx int)
 // reads) is now caught by the re-load: a refreshed lease differs from the
 // observed lease, so we refuse and let the normal flow retry.
 //
-// v0.7.1 ships this as an opt-in API only. Auto-reclamation inside
+// v0.7.2 ships this as an opt-in API only. Auto-reclamation inside
 // WaitStrategy and an end-to-end crash-process test will follow.
 //
 // Returns true if the slot was reclaimed. Returns false if: the slot is

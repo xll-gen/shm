@@ -26,6 +26,13 @@ var (
 // memoryBasicInformation mirrors the Win32 MEMORY_BASIC_INFORMATION struct on
 // amd64. Only RegionSize is read here; the explicit padding keeps RegionSize at
 // its native offset (24) so VirtualQuery fills it correctly.
+//
+// amd64-ONLY LAYOUT (contract, not incidental): the field offsets below assume
+// an 8-byte uintptr. On windows/386 (4-byte uintptr) RegionSize lands at the
+// wrong offset and VirtualQuery mis-fills it. windows/amd64 is the sole
+// supported target and windows/386 is rejected at compile time in
+// platform_unsupported_arch.go — do NOT attempt to make this struct
+// arch-portable.
 type memoryBasicInformation struct {
 	BaseAddress       uintptr // 0
 	AllocationBase    uintptr // 8

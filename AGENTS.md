@@ -14,10 +14,10 @@ This repo's contract is **transport only**: never embed protocol-specific assump
 
 ## **Platform Targets**
 
-* **Sole deployment target**: Windows x86 / x86-64 (Intel/AMD), as the production consumer is `xll-gen`, which is Windows-only (see `xll-gen/AGENTS.md` §0.1). On x86/x64, TSO hardware ordering covers most of the acquire-release contract; correctness MUST still be implemented via proper atomic ops (no `relaxed` on synchronizing operations).
+* **Sole deployment target**: Windows **x86-64 (amd64)** on Intel/AMD, as the production consumer is `xll-gen`, which is Windows/x64-only (see `xll-gen/AGENTS.md` §0.1). **32-bit (x86 / GOARCH=386) is NOT supported** — the Go guest's Win32 struct layouts in `go/platform_windows.go` are hand-laid for the amd64 ABI, so `windows/386` is rejected at compile time (`go/platform_unsupported_arch.go`). On amd64, TSO hardware ordering covers most of the acquire-release contract; correctness MUST still be implemented via proper atomic ops (no `relaxed` on synchronizing operations).
 * **Library compile targets**: Windows only — MSVC 2019+ and MinGW (GCC). This repo is **Windows-only**; there is no Linux/POSIX support. Use `Platform.h` for all OS primitives (Win32 Events, file mappings).
 * **No ARM support**: neither Windows-on-ARM nor Apple Silicon is a target. Cache-line sizes other than 64 bytes are out of scope for tuning.
-* **Single-architecture matching at runtime**: C++ Host and Go Guest in a given deployment MUST run on the same architecture and bitness. Cross-arch IPC is not supported.
+* **Single-architecture matching at runtime**: both the C++ Host and the Go Guest MUST be **windows/amd64 (64-bit)**. This is the only supported bitness — there is no 32-bit build of either side. Cross-arch / mixed-bitness IPC is not supported (and 32-bit is not buildable; see above).
 
 ## **Affinity Recommendations**
 
