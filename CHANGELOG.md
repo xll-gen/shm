@@ -1,5 +1,36 @@
 # Changelog
 
+## [v0.8.13] - 2026-07-26
+
+No wire-protocol/ABI change — `SHM_VERSION` remains `0x00070000`, `SlotHeader`
+and `ExchangeHeader` are untouched, and the fix is invisible to the Guest
+(which only ever acts on `SLOT_REQ_READY` in the Host Slot range). C++ Host
+only; `activeWait` is a process-local field with no Go counterpart, so no
+parity change is required.
+
+### Fixed
+
+- **Host response consumption was unprotected against sibling-thread slot
+  theft** (SPEC §3.4 "Host requester consume-claim"). `WaitResponse` and
+  `WaitForSlot` dropped the process-local `activeWait` flag while `state` was
+  still `SLOT_RESP_READY`, and only *then* validated `msgSeq`/`msgType`, read
+  `respSize`, and copied the response out. `tryClaimSlot`'s zombie branch
+  steals any slot in {`REQ_READY`, `RESP_READY`, `GUEST_BUSY`} with
+  `activeWait == 0`, so on a multi-threaded Host a sibling `AcquireSlot` /
+  `AcquireSpecificSlot` / `TryAcquireSlot` could claim the slot mid-consume:
+  the consumer then read bytes the Guest was concurrently overwriting for the
+  thief's new transaction, and its blind terminal `SLOT_FREE` store clobbered
+  the thief's live claim (double-ownership). Exposed `ZeroCopySlot::Send` /
+  `SendFlatBuffer` (the longest window — the caller holds the response buffer
+  until the wrapper dies — and the xll-gen production path), `SendAcquired`,
+  and `WaitForSlot` (hence `Send`, `SendToSlot`, and the `Stream.h` chunk
+  paths). `SendHeld` was already correct. The shared
+  `SlotAllocator::FinishWait` now parks a responded slot at `SLOT_BUSY` before
+  dropping `activeWait`, reusing the v0.8.5 held-slot consume-claim ordering;
+  the timeout path is unchanged (the transaction is still in flight, so the
+  slot is disowned for the zombie/lease reclaim paths). Regression test:
+  `tests/test_host_consume_claim.cpp`.
+
 ## [v0.8.12] - 2026-07-25
 
 No wire-protocol/ABI change — `SHM_VERSION` remains `0x00070000`. Go stream

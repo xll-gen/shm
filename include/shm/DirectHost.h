@@ -166,6 +166,13 @@ public:
 
         /**
          * @brief Sends a request using the zero-copy buffer.
+         *
+         * On success the slot is parked at SLOT_BUSY (not SLOT_RESP_READY) by
+         * the host-side consume-claim in SlotAllocator::FinishWait, so the
+         * response stays owned for as long as the caller holds this
+         * ZeroCopySlot and reads GetRespBuffer(). The destructor performs the
+         * terminal SLOT_FREE store.
+         *
          * @return Result<void> Success or Error.
          */
         Result<void> Send(int32_t size, MsgType msgType, uint32_t timeoutMs = USE_DEFAULT_TIMEOUT) {
@@ -211,6 +218,10 @@ public:
 
         /**
          * @brief Sends the FlatBuffer request.
+         *
+         * Same ownership contract as Send(): on success the slot is parked at
+         * SLOT_BUSY until this wrapper releases it.
+         *
          * @return Result<void> Success or Error.
          */
         Result<void> SendFlatBuffer(int32_t size, uint32_t timeoutMs = USE_DEFAULT_TIMEOUT) {

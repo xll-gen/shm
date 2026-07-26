@@ -174,9 +174,54 @@ public:
     }
 
     /**
+     * @brief Host-side consume-claim: park a responded slot in a non-stealable
+     *        state before the local active-wait flag is dropped (SPEC §3.4).
+     *
+     * The window between "WaitForRespReady returned true" and the caller's
+     * terminal SLOT_FREE store is a *consumption* window: the caller still has
+     * to read msgSeq/msgType/respSize and copy (or, for ZeroCopySlot, hand out
+     * a pointer into) the response buffer. `activeWait` is the only thing that
+     * keeps tryClaimSlot's zombie branch off the slot during that window, so
+     * dropping it while `state` is still SLOT_RESP_READY exposes the slot to a
+     * sibling host thread's steal — which republishes the slot under a new
+     * transaction while the response is being read, and whose claim the
+     * consumer's own blind SLOT_FREE store then clobbers.
+     *
+     * Parking at SLOT_BUSY first removes the slot from the steal set
+     * ({REQ_READY, RESP_READY, GUEST_BUSY}) *before* the flag drops. The
+     * load-bearing invariant is NOT "no observer can see RESP_READY with
+     * activeWait==false" (a racing reader that loaded state before this store
+     * can transiently see that pair) — it is that tryClaimSlot's arbitrating
+     * state CAS is sequenced after its activeWait acquire-load: an observer
+     * whose activeWait load returned false synchronizes-with the release store
+     * below, therefore its state CAS sees SLOT_BUSY and fails.
+     *
+     * The BUSY park is invisible to the Guest — per SPEC §3.4 it only ever
+     * acts on SLOT_REQ_READY in the Host Slot range and never observes or
+     * requires SLOT_FREE between exchanges — so this is wire/ABI-neutral. The
+     * subsequent BUSY -> FREE transition can stay a plain release store
+     * because no other party can own a SLOT_BUSY slot.
+     *
+     * On timeout the slot is deliberately left alone: the transaction is still
+     * in flight (the guest may yet publish SLOT_RESP_READY), so the caller
+     * disowns it and the zombie/lease reclaim paths recover it.
+     */
+    static void FinishWait(Slot* slot, bool ready) {
+        if (ready) {
+            slot->header->state.store(SLOT_BUSY, std::memory_order_release);
+        }
+        slot->activeWait.store(false, std::memory_order_release);
+    }
+
+    /**
      * @brief Internal helper to wait for a response on a specific slot.
      * Publishes the request + signals the guest, then runs the shared wait
      * (see WaitForRespReady).
+     *
+     * On success the slot is left parked at SLOT_BUSY (not SLOT_RESP_READY) so
+     * the caller can consume the response unmolested — see FinishWait. Callers
+     * own the terminal SLOT_FREE store exactly as before.
+     *
      * @param slot Pointer to the slot to wait on.
      * @param timeoutMs Timeout in milliseconds.
      * @return true if response is ready, false if error/timeout.
@@ -194,7 +239,7 @@ public:
 
         bool ready = WaitForRespReady(slot, timeoutMs);
 
-        slot->activeWait.store(false, std::memory_order_release);
+        FinishWait(slot, ready);
         return ready;
     }
 
@@ -623,7 +668,10 @@ public:
 
         bool ready = WaitForRespReady(slot, t);
 
-        slot->activeWait.store(false, std::memory_order_release);
+        // Consume-claim before the flag drops (see FinishWait): the msgSeq
+        // check and the response copy-out below run on a slot that must not be
+        // stealable by a sibling host thread.
+        FinishWait(slot, ready);
 
         if (!ready) {
              return Result<int>(Error::Timeout);
@@ -800,23 +848,15 @@ public:
         uint32_t t = (timeoutMs == USE_DEFAULT_TIMEOUT) ? responseTimeoutMs : timeoutMs;
         bool ready = WaitForRespReady(slot, t);
 
+        // Consume-claim: park at SLOT_BUSY BEFORE dropping activeWait — the
+        // shared host-side rule, see FinishWait. For a held session the park
+        // is also the resting state: the slot stays owned for the next
+        // SendHeld instead of returning to SLOT_FREE.
+        FinishWait(slot, ready);
+
         if (!ready) {
-             slot->activeWait.store(false, std::memory_order_release);
              return Result<int>(Error::Timeout);
         }
-
-        // Consume-claim: park at SLOT_BUSY BEFORE dropping activeWait. The
-        // load-bearing invariant is NOT "no observer can see RESP_READY with
-        // activeWait==false" (a racing reader that loaded state before this
-        // store can transiently see that pair) — it is that tryClaimSlot's
-        // arbitrating state CAS is sequenced after its activeWait
-        // acquire-load: an observer whose activeWait load returned false
-        // synchronizes-with the store below, therefore its state CAS sees
-        // SLOT_BUSY (not in the steal set) and fails. Dropping activeWait
-        // first would let the CAS win against a still-parked RESP_READY and
-        // double-own the slot. Mirrors go/guest_slot.go's consume-claim.
-        slot->header->state.store(SLOT_BUSY, std::memory_order_release);
-        slot->activeWait.store(false, std::memory_order_release);
 
         if (slot->header->msgSeq != currentSeq) {
              // Misbehaving peer: release the slot entirely (same rationale as
