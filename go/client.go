@@ -169,6 +169,31 @@ func (c *Client) AcquireGuestSlot() (*GuestSlot, error) {
 	return c.guest.AcquireGuestSlot()
 }
 
+// MaxRequestSize returns the capacity, in bytes, of a slot's request buffer
+// (respOffset - reqOffset from the Host's ExchangeHeader). Host slots and
+// guest slots share that one geometry, so the value is exactly
+// len(AcquireGuestSlot().RequestBuffer()) and the largest |size| that Send /
+// SendGuestCall / SendGuestCallBuffer accept without a size error.
+//
+// It is a pure read of geometry fixed at connect time: no slot is claimed, no
+// shared memory is written, and the result never changes while the Client is
+// connected. Use it to size chunk budgets instead of acquiring a slot just to
+// measure its buffer.
+//
+// The value is the raw capacity — no framing overhead is deducted. A caller
+// that writes its own header (or uses shm's streaming ChunkHeader, 24 bytes)
+// must subtract that itself.
+//
+// Returns 0 for a nil or not-connected Client, which callers should read as
+// "unknown, use a conservative fallback". Calling it on a typed-nil *Client
+// is safe and does not panic.
+func (c *Client) MaxRequestSize() int {
+	if c == nil {
+		return 0
+	}
+	return c.guest.MaxRequestSize()
+}
+
 // Close releases all resources associated with the client.
 // It closes shared memory handles and event handles.
 // Note: This does not stop background workers if they are blocked on OS events.

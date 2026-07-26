@@ -1,5 +1,24 @@
 # Changelog
 
+## [v0.8.15] - 2026-07-26
+
+No wire-protocol/ABI change — `SHM_VERSION` remains `0x00070000`. Pure Go API
+addition.
+
+### Added
+
+- **`Client.MaxRequestSize()` / `DirectGuest.MaxRequestSize()`** — the raw
+  capacity of a slot request buffer, read straight from the geometry captured
+  at attach. Until now the only way to learn it was to claim a slot and read
+  `RequestBuffer()`, so consumers computing a chunk budget had to acquire and
+  immediately release a slot, and xll-gen carried that probe in two places.
+  Host and guest slots share the value (both sides derive it once from the
+  exchange header), so the accessor needs no slot index. Framing overhead is
+  deliberately NOT deducted — the caller subtracts its own header, and must not
+  double-count shm's 24-byte streaming ChunkHeader, which StreamSender already
+  subtracts internally. Returns 0 for a nil or unconnected receiver rather than
+  panicking.
+
 ## [v0.8.14] - 2026-07-26
 
 No wire-protocol/ABI change — `SHM_VERSION` remains `0x00070000`, `SlotHeader`

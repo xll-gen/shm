@@ -519,6 +519,33 @@ func (g *DirectGuest) GetAutoReclaimTimeout() time.Duration {
 	return time.Duration(atomic.LoadUint64(&g.autoReclaimTimeoutNs))
 }
 
+// MaxRequestSize returns the capacity, in bytes, of a slot's request buffer:
+// respOffset - reqOffset from the ExchangeHeader the Host published at Init.
+//
+// The Host lays out every slot from that single geometry, so the value is the
+// same for host slots and guest slots; it is exactly
+// len((*GuestSlot).RequestBuffer()) for any slot this guest can acquire, and
+// the largest |size| that (*GuestSlot).Send, SendGuestCall and
+// SendGuestCallBuffer accept without failing on size. Callers that need only
+// the budget can read it here instead of claim-and-Release probing a slot.
+//
+// This is the raw buffer capacity: no framing overhead of any kind is
+// deducted. A caller that prefixes its own header — including shm's own
+// streaming ChunkHeader (24 bytes), which StreamSender subtracts itself —
+// must subtract it before sizing a payload.
+//
+// Returns 0 on a nil receiver so a caller holding an unset guest can treat
+// "unknown" as "use my own fallback" without a nil check. A non-nil
+// DirectGuest is always attached (NewDirectGuest validates the geometry
+// before returning one), so the value is otherwise always positive and fixed
+// for the lifetime of the mapping.
+func (g *DirectGuest) MaxRequestSize() int {
+	if g == nil {
+		return 0
+	}
+	return int(g.respOffset - g.reqOffset)
+}
+
 // reclaimPreCASHook is a test-only seam fired inside
 // TryReclaimAbandonedSlot after the staleness decision but before the
 // lease re-validation and CAS. Production builds leave it nil, so the

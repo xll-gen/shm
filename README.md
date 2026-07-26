@@ -259,6 +259,22 @@ host.Start([](const uint8_t* req, int32_t reqSize, uint8_t* resp, uint32_t maxRe
 resp, err := client.SendGuestCall([]byte("AsyncData"), shm.MsgTypeGuestCall)
 ```
 
+### Request Buffer Capacity
+
+Both sides can read the per-slot request-buffer capacity without holding a
+slot. The Host lays out every slot (host and guest alike) from the one geometry
+it publishes in the `ExchangeHeader`, so the value is identical for all slots
+and fixed for the lifetime of the mapping. It is the raw capacity — subtract
+your own framing before sizing a payload.
+
+```go
+budget := client.MaxRequestSize() // == len(slot.RequestBuffer()); 0 if not connected
+```
+
+```cpp
+int32_t budget = host.GetMaxReqSize(0); // or slot.GetMaxReqSize() on a held/zero-copy slot
+```
+
 ### Large Data Streaming (Double Buffering)
 
 For sending large datasets (exceeding slot size) efficiently, the library provides a Streaming API. This API splits the data into chunks and uses multiple slots in parallel ("Double Buffering" or "N-Buffering") to maximize throughput.
