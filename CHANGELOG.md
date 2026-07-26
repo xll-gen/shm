@@ -1,5 +1,61 @@
 # Changelog
 
+## [v0.8.14] - 2026-07-26
+
+No wire-protocol/ABI change — `SHM_VERSION` remains `0x00070000`, `SlotHeader`
+and `ExchangeHeader` are untouched, and no state value was added. Both sides of
+the fix are publish-side only, so a peer that has not taken the fix sees an
+identical byte stream.
+
+### Fixed
+
+- **Responder published `SLOT_RESP_READY` blindly, clobbering a stolen slot's
+  new transaction** (SPEC §3.4/§3.5 "Responder publish rule"). The Guest
+  responder (`go/direct.go::workerLoopInternal`) and its C++ mirror, the Host
+  guest-call responder (`include/shm/GuestCallWorker.h::ProcessGuestCalls`),
+  ended every transaction with an unconditional `state` store. Responder
+  ownership is not eternal: once the peer's response timeout elapses it disowns
+  the slot *without writing `state`* (§3.4/§3.5 timeout rule), and the slot is
+  then recycled — on the Host side by `SlotAllocator::tryClaimSlot`'s zombie
+  steal, which is gated only on the process-local `activeWait` and **not** on
+  `autoReclaimTimeoutNs`, so it fires even under `fastPathAllowed == 1`. A late
+  handler's blind store then stamped `SLOT_RESP_READY` over the new owner's
+  in-flight transaction while the response buffer still held the *previous*
+  one's bytes. Because a responder never rewrites `msgSeq`, the requester's
+  `msgSeq` guard validated and silently accepted the stale response: a wrong
+  value in a cell, or a crash on a mis-sized/mis-typed payload. Low frequency
+  (a prior timeout is a necessary trigger), silent when it hits.
+
+  Both responders now publish with a CAS from their owned state — Go
+  `CAS(SLOT_GUEST_BUSY → SLOT_RESP_READY)`, C++ `CAS(SLOT_BUSY →
+  SLOT_RESP_READY)`, both `seq_cst` so the §4.2 doorbell Dekker is unaffected —
+  and drop the response when the CAS fails, logging and leaving the new owner's
+  transaction untouched (it is served by the next loop iteration).
+
+  This required **narrowing the v0.8.8 no-reclaim fast path**: it had dropped
+  the responder's `SLOT_REQ_READY → SLOT_GUEST_BUSY` consume-claim CAS, and
+  without it there is no airtight state to publish from — a CAS expecting
+  `SLOT_REQ_READY` succeeds anyway, because a stolen slot is republished at
+  exactly `SLOT_REQ_READY`. Only `SLOT_GUEST_BUSY` discriminates: on a Host slot
+  it is written solely by the owning Guest responder (C++ never writes it at
+  all), and a steal goes `GUEST_BUSY → BUSY → REQ_READY`, never back. The claim
+  CAS is therefore mandatory on both paths; the fast path still skips the `gen`
+  bump and the `lease` refresh (SPEC §3.6.1 reclaim-off carve-out, which now
+  states explicitly that it never licenses dropping a claiming CAS). Measured
+  cost on the Host→Guest direction, 1 thread / 64 B, within-session A/B/A:
+  ~13.2–14.3 M ops/s → ~11.7–12.1 M ops/s (≈ −9 % to −18 %, ≈ +15 ns/RTT, one
+  extra locked RMW). Guest-call direction is unchanged within noise (the C++
+  claim CAS was already there; only a `seq_cst` store became a `seq_cst` CAS).
+
+  Regression tests: `go/fastpath_test.go::TestGuestResponderFastPath_HostTimeoutStealDoesNotCorrupt`
+  replays `tryClaimSlot`'s steal verbatim after a simulated timeout (no contract
+  violation needed). `..._HostReclaimDuringHandlerCorrupts` is redefined as
+  `..._HostReclaimDuringHandlerIsRejected` — it asserted the corruption; it now
+  asserts the publish CAS fails, the stale response is dropped, and the new
+  owner's transaction is served correctly. The 2026-07-24 verdict that the
+  hazard was "unreachable by a conforming host" is retracted: the zombie steal,
+  not auto-reclaim, is the recycler.
+
 ## [v0.8.13] - 2026-07-26
 
 No wire-protocol/ABI change — `SHM_VERSION` remains `0x00070000`, `SlotHeader`

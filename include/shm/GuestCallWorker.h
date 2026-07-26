@@ -169,6 +169,47 @@ public:
     }
 
     /**
+     * @brief Publishes SLOT_RESP_READY on a guest slot this worker owns at
+     *        SLOT_BUSY (SPEC §3.5 step 5).
+     *
+     * The transition is a CAS, never a blind store — the mirror of the Go
+     * responder's publishResponse (go/direct.go). Ownership of a claimed guest
+     * slot is not eternal: a slow handler can outlive the Guest sender's
+     * response timeout, after which the Guest's opt-in lease reclaimer
+     * (TryReclaimAbandonedSlot) can free the slot and a fresh sender can claim
+     * and republish it under a NEW transaction. A blind store would then stamp
+     * RESP_READY over that transaction while respBuffer still holds the old
+     * one's bytes; because the responder never rewrites msgSeq, the sender's
+     * msgSeq guard validates and silently accepts the wrong value. CAS from the
+     * owned SLOT_BUSY makes the publishing side airtight: a recycled slot is at
+     * SLOT_FREE / SLOT_GUEST_BUSY / SLOT_REQ_READY when the late publish
+     * arrives, so the CAS fails and the response is dropped instead.
+     *
+     * Signal elision (two-sided Dekker, same pattern as SlotAllocator's
+     * REQ_READY publish): the guest caller stores
+     * guestState=GUEST_STATE_WAITING with seq_cst and re-checks `state` before
+     * parking (go/direct.go), so a seq_cst RESP_READY publish followed by a
+     * seq_cst guestState load can never both miss — either the guest sees
+     * RESP_READY and skips the park, or we see WAITING and deliver the
+     * (kernel-priced) SetEvent. A spinning guest costs no syscall at all.
+     *
+     * @return true if the response was published, false if the slot was lost.
+     */
+    static bool PublishResponse(Slot* slot, uint32_t slotIdx) {
+        uint32_t expected = SLOT_BUSY;
+        if (!slot->header->state.compare_exchange_strong(
+                expected, SLOT_RESP_READY, std::memory_order_seq_cst)) {
+            SHM_LOG_WARN("Guest-call response dropped: slot ", slotIdx,
+                         " was reclaimed while the handler ran (state=", expected, ")");
+            return false;
+        }
+        if (slot->header->guestState.load(std::memory_order_seq_cst) == GUEST_STATE_WAITING) {
+            Platform::SignalEvent(slot->hRespEvent);
+        }
+        return true;
+    }
+
+    /**
      * @brief Processes any pending Guest Calls (Guest -> Host).
      * @return int Number of requests processed.
      */
@@ -217,10 +258,7 @@ public:
                 if (absReqSize > slot->maxReqSize) {
                     slot->header->respSize = 0;
                     slot->header->msgType = MsgType::SYSTEM_ERROR;
-                    slot->header->state.store(SLOT_RESP_READY, std::memory_order_seq_cst);
-                    if (slot->header->guestState.load(std::memory_order_seq_cst) == GUEST_STATE_WAITING) {
-                        Platform::SignalEvent(slot->hRespEvent);
-                    }
+                    PublishResponse(slot, i);
                     processed++;
                     continue;
                 }
@@ -242,19 +280,7 @@ public:
 
                 slot->header->respSize = respSize;
 
-                // Signal elision (two-sided Dekker, same pattern as
-                // SlotAllocator's REQ_READY publish): the guest caller
-                // stores guestState=GUEST_STATE_WAITING with seq_cst and
-                // re-checks `state` before parking (go/direct.go), so a
-                // seq_cst RESP_READY publish followed by a seq_cst
-                // guestState load can never both miss — either the guest
-                // sees RESP_READY and skips the park, or we see WAITING and
-                // deliver the (kernel-priced) SetEvent. A spinning guest
-                // costs no syscall at all.
-                slot->header->state.store(SLOT_RESP_READY, std::memory_order_seq_cst);
-                if (slot->header->guestState.load(std::memory_order_seq_cst) == GUEST_STATE_WAITING) {
-                    Platform::SignalEvent(slot->hRespEvent);
-                }
+                PublishResponse(slot, i);
 
                 processed++;
             }

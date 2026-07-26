@@ -1120,8 +1120,14 @@ func (g *DirectGuest) workerLoop(idx int, handler func([]byte, []byte, MsgType) 
 						// successful empty response on the host side.
 						header.MsgType = MsgTypeSystemError
 						header.RespSize = 0
-						atomic.StoreUint32(&header.State, SlotRespReady)
-						SignalEvent(slot.respEvent)
+						// CAS from the observed owned state, never a blind
+						// store — see publishResponse. A slot the host already
+						// stole must not receive our error publish.
+						if atomic.CompareAndSwapUint32(&header.State, state, SlotRespReady) {
+							SignalEvent(slot.respEvent)
+						} else {
+							Error("Panic error-response dropped: slot no longer owned", "worker", idx)
+						}
 					}
 				}
 			}()
@@ -1133,6 +1139,40 @@ func (g *DirectGuest) workerLoop(idx int, handler func([]byte, []byte, MsgType) 
 			return
 		}
 	}
+}
+
+// publishResponse completes a Direct-Exchange transaction on a host slot the
+// responder owns at SlotGuestBusy (SPEC §3.4 step 5).
+//
+// The transition is a CAS, never a blind store. The responder's ownership of a
+// host slot is not eternal: on a host-side response timeout the host disowns
+// the slot without writing State, and its next slot acquisition steals the
+// abandoned slot (SlotAllocator::tryClaimSlot's §3.6.1 gen handshake) and
+// republishes it under a *new* transaction. A blind store would then stamp
+// RESP_READY over that new transaction while the response buffer still holds
+// the old one's bytes; because the responder never rewrites MsgSeq, the host's
+// msgSeq guard validates and the caller silently receives the wrong value.
+//
+// CAS-from-SlotGuestBusy is airtight on the publishing side: SlotGuestBusy on a
+// host slot is written only here (the C++ host never writes SLOT_GUEST_BUSY),
+// and a steal takes the slot SlotGuestBusy → SlotBusy → SlotReqReady, so it can
+// never be back at SlotGuestBusy when we publish. A failed CAS therefore means
+// the slot was definitively lost: drop the response (the new owner's
+// transaction stays intact and is served by the next loop iteration) and let
+// the original requester's own timeout report the failure.
+//
+// Returns true if the response was published.
+func publishResponse(slot *slotContext, idx int) bool {
+	header := slot.header
+	if !atomic.CompareAndSwapUint32(&header.State, SlotGuestBusy, SlotRespReady) {
+		Error("Response dropped: slot was stolen while the handler ran",
+			"worker", idx, "state", atomic.LoadUint32(&header.State))
+		return false
+	}
+	if atomic.LoadUint32(&header.HostState) == HostStateWaiting {
+		SignalEvent(slot.respEvent)
+	}
+	return true
 }
 
 func (g *DirectGuest) workerLoopInternal(idx int, handler func([]byte, []byte, MsgType) (int32, MsgType)) bool {
@@ -1166,27 +1206,35 @@ func (g *DirectGuest) workerLoopInternal(idx int, handler func([]byte, []byte, M
 		ready := slot.waitStrategy.WaitState(&header.State, SlotReqReady, sleepAction)
 
 		if ready {
+			// Consume-claim (BOTH paths, v0.8.14). The responder must own the
+			// slot in SlotGuestBusy — a state the *next* transaction can never
+			// re-enter — before it runs the handler, so that the RESP_READY
+			// publish below can be an airtight CAS. See publishResponse.
+			//
+			// v0.8.8 let the fast path process while State stayed REQ_READY and
+			// publish with a blind store. That is unsafe once a host response
+			// timeout has occurred: the host disowns a timed-out slot without
+			// touching State (§3.4), and SlotAllocator::tryClaimSlot then
+			// *steals* the abandoned REQ_READY slot for a new transaction —
+			// the zombie steal is NOT gated on autoReclaimTimeoutNs, so it runs
+			// even under FastPathAllowed==1. A late handler's blind store then
+			// published a stale response under the new owner's msgSeq (silent
+			// wrong value). A publish CAS expecting REQ_READY would not fix it
+			// either: the stolen slot is republished at REQ_READY, so the CAS
+			// would still succeed. Only SlotGuestBusy is exclusive — it is
+			// written solely by this worker (C++ never writes SLOT_GUEST_BUSY
+			// at all), and a host steal moves the slot to SLOT_BUSY →
+			// SLOT_REQ_READY, never back to SlotGuestBusy.
+			//
+			// The fast path still skips the two pieces the reclaim machinery
+			// owns — the gen bump and the lease refresh (§3.6/§3.6.1
+			// reclaim-off carve-out) — so v0.8.8 keeps 2 of its 3 saved locked
+			// ops. The claiming CAS also restores the acquire fence that guards
+			// the request-buffer reads below.
 			if g.fastPathAllowed {
-				// No-reclaim fast path (v0.8.8): the host published
-				// FastPathAllowed==1, guaranteeing auto-reclaim is off. On a
-				// host slot this worker owns 1:1, with the host waiting only on
-				// RESP_READY and no reclaimer running, the per-RTT gen bump +
-				// REQ_READY→GUEST_BUSY consume-claim + lease refresh have no
-				// counterparty — skip all three (3 locked ops/RTT). State stays
-				// REQ_READY through processing (the host never observes
-				// GUEST_BUSY) and is published to RESP_READY below exactly as
-				// the slow path does. WaitState already acquire-observed
-				// REQ_READY, and this worker is the only writer until the
-				// RESP_READY publish, so no re-confirm CAS is needed. See
-				// SPECIFICATION.md §3.4 and shm-protocol-guardian review.
-				//
-				// PLATFORM NOTE: the slow path's REQ_READY→GUEST_BUSY CAS also
-				// acted as the acquire fence guarding the request-buffer reads
-				// below. The fast path drops it, so correctness rests on
-				// WaitState's load being acquire — true on x86/x64 TSO (the only
-				// supported runtime; spinUntilEq32 is an opaque asm call the
-				// compiler cannot hoist past). If ever ported to a weak-memory
-				// target (ARM), add an explicit acquire fence here.
+				if !atomic.CompareAndSwapUint32(&header.State, SlotReqReady, SlotGuestBusy) {
+					continue
+				}
 			} else {
 				claimSlotGen(header)
 				if !atomic.CompareAndSwapUint32(&header.State, SlotReqReady, SlotGuestBusy) {
@@ -1198,10 +1246,7 @@ func (g *DirectGuest) workerLoopInternal(idx int, handler func([]byte, []byte, M
 			msgType := header.MsgType
 			if msgType == MsgTypeShutdown {
 				header.RespSize = 0
-				atomic.StoreUint32(&header.State, SlotRespReady)
-				if atomic.LoadUint32(&header.HostState) == HostStateWaiting {
-					SignalEvent(slot.respEvent)
-				}
+				publishResponse(slot, idx)
 				return false
 			}
 
@@ -1216,10 +1261,7 @@ func (g *DirectGuest) workerLoopInternal(idx int, handler func([]byte, []byte, M
 					if reqSize > int32(len(slot.reqBuffer)) {
 						header.RespSize = 0
 						header.MsgType = MsgTypeSystemError
-						atomic.StoreUint32(&header.State, SlotRespReady)
-						if atomic.LoadUint32(&header.HostState) == HostStateWaiting {
-							SignalEvent(slot.respEvent)
-						}
+						publishResponse(slot, idx)
 						continue
 					}
 					reqData = slot.reqBuffer[:reqSize]
@@ -1228,10 +1270,7 @@ func (g *DirectGuest) workerLoopInternal(idx int, handler func([]byte, []byte, M
 					if rLen < 0 || rLen > int32(len(slot.reqBuffer)) {
 						header.RespSize = 0
 						header.MsgType = MsgTypeSystemError
-						atomic.StoreUint32(&header.State, SlotRespReady)
-						if atomic.LoadUint32(&header.HostState) == HostStateWaiting {
-							SignalEvent(slot.respEvent)
-						}
+						publishResponse(slot, idx)
 						continue
 					}
 					offset := int32(len(slot.reqBuffer)) - rLen
@@ -1243,11 +1282,7 @@ func (g *DirectGuest) workerLoopInternal(idx int, handler func([]byte, []byte, M
 				header.MsgType = respType
 			}
 
-			atomic.StoreUint32(&header.State, SlotRespReady)
-
-			if atomic.LoadUint32(&header.HostState) == HostStateWaiting {
-				SignalEvent(slot.respEvent)
-			}
+			publishResponse(slot, idx)
 		}
 	}
 }
