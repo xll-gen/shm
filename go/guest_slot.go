@@ -20,14 +20,35 @@ type GuestSlot struct {
 	// State untouched — storing SlotFree would clobber the host's or a
 	// new owner's transaction. Recovery is handled by the Case-2 zombie
 	// reclaim in AcquireGuestSlot or by lease-based reclamation.
+	//
+	// Forfeit is terminal for the handle, not just for Release: once the
+	// slot can be recovered by a reclaimer, a second owner may already be
+	// running a transaction on it, so EVERY accessor must refuse. Send /
+	// SendWithTimeout return an error without touching shared memory, and
+	// RequestBuffer / ResponseBuffer return nil. This is what makes the
+	// forfeit a real ownership boundary: a retry on a forfeited handle used
+	// to write ReqSize/MsgType/MsgSeq, store ActiveWait=1 and publish
+	// SlotReqReady over the new owner's in-flight request, and to race the
+	// new owner on slotContext.nextMsgSeq.
 	lost bool
 }
+
+// dead reports that the handle no longer owns its slot — released, or
+// forfeited by a timed-out / reclaimed Send.
+func (s *GuestSlot) dead() bool { return s == nil || s.slot == nil || s.lost }
 
 // RequestBuffer returns the shared memory buffer for the request.
 // The user should write their data into this buffer.
 // For standard messages, write at the beginning.
 // For Zero-Copy (FlatBuffers), write at the end and use a negative size in Send().
+//
+// Returns nil once the handle is released or has forfeited ownership (see
+// GuestSlot.lost): the buffer then belongs to whoever recovers the slot, and
+// writing into it would corrupt their request.
 func (s *GuestSlot) RequestBuffer() []byte {
+	if s.dead() {
+		return nil
+	}
 	return s.slot.reqBuffer
 }
 
@@ -35,7 +56,13 @@ func (s *GuestSlot) RequestBuffer() []byte {
 // This buffer contains the valid response data after Send() returns successfully.
 // Note: The valid data range depends on the size returned by the Host (available in the header),
 // but for raw access, this returns the full buffer.
+//
+// Returns nil once the handle is released or has forfeited ownership: after a
+// timed-out or reclaimed Send the bytes are no longer this caller's response.
 func (s *GuestSlot) ResponseBuffer() []byte {
+	if s.dead() {
+		return nil
+	}
 	return s.slot.respBuffer
 }
 
@@ -57,7 +84,21 @@ func (s *GuestSlot) Send(size int32, msgType MsgType) (int32, MsgType, error) {
 }
 
 // SendWithTimeout is the same as Send but with a custom timeout.
+//
+// Sending on a handle that was released, or whose previous Send forfeited
+// ownership (timeout / lost consume-claim), is refused before any shared
+// memory is touched: the slot may already have been recovered by the Case-2
+// zombie reclaim or by lease reclamation, and re-publishing a request into it
+// would overwrite the new owner's ReqSize/MsgType/MsgSeq/State. Acquire a
+// fresh slot instead.
 func (s *GuestSlot) SendWithTimeout(size int32, msgType MsgType, timeout time.Duration) (int32, MsgType, error) {
+	if s.slot == nil {
+		return 0, 0, fmt.Errorf("slot already released")
+	}
+	if s.lost {
+		return 0, 0, fmt.Errorf("slot ownership forfeited by a previous Send; acquire a new slot")
+	}
+
 	header := s.slot.header
 
 	// Validate Size
@@ -153,8 +194,11 @@ func (s *GuestSlot) SendWithTimeout(size int32, msgType MsgType, timeout time.Du
 
 	if !ready {
 		// Timeout: the host may still own the slot (SlotReqReady/SlotBusy).
-		// Forfeit ownership so Release() leaves State untouched.
+		// Forfeit ownership so Release() leaves State untouched. The forfeit
+		// is terminal for this handle (see GuestSlot.lost), so hand our clock
+		// to whichever reclaim path recovers the slot.
 		s.lost = true
+		releaseSlotHandoff(s.slot)
 		return 0, 0, fmt.Errorf("timeout waiting for host")
 	}
 	if !claimed {
@@ -162,6 +206,7 @@ func (s *GuestSlot) SendWithTimeout(size int32, msgType MsgType, timeout time.Du
 		// observing SlotRespReady and the consume-claim CAS. The response
 		// buffer can no longer be trusted; forfeit ownership.
 		s.lost = true
+		releaseSlotHandoff(s.slot)
 		return 0, 0, fmt.Errorf("slot reclaimed while consuming response")
 	}
 
@@ -186,6 +231,7 @@ func (s *GuestSlot) Release() {
 			// CAS from the owned state (SlotGuestBusy) instead of a blind
 			// store: if a lease-based reclaimer stole the slot, the new
 			// owner's state must not be clobbered with SlotFree.
+			releaseSlotHandoff(s.slot)
 			atomic.CompareAndSwapUint32(&s.slot.header.State, SlotGuestBusy, SlotFree)
 		}
 		s.slot = nil

@@ -411,22 +411,12 @@ func TestGuestSlot_ConcurrentConsumersNoCorruption(t *testing.T) {
 		hostWg.Wait()
 	}()
 
-	// raceHB mirrors the per-slot ownership handoff for the benefit of the
-	// Go race detector. The REAL synchronization is the State atomic in the
-	// SlotHeader, but that lives in file-mapped shared memory, and the race
-	// detector cannot model happens-before edges through atomics located
-	// outside the Go heap (verified empirically: a plain heap handoff
-	// synchronized only by an atomic in CreateShm memory is reported as a
-	// race). Without this mirror, every legitimate slot handoff between
-	// workers is misreported as a race on slotContext.nextMsgSeq.
-	//
-	// Each worker acquire-loads the mirror right after winning the slot and
-	// release-stores it right before Release(). This cannot mask the steal
-	// bug this test targets: a thief acquires while the holder has NOT yet
-	// stored the mirror, and corruption is asserted functionally (payload
-	// equality below), not via the race detector.
-	var raceHB [numGuest]uint32
-
+	// The per-slot ownership handoff used to be mirrored here in a local
+	// raceHB array, because the real synchronization — the State atomic in the
+	// SlotHeader — lives in file-mapped shared memory that the race detector
+	// cannot model happens-before through. That mirror now lives in the
+	// library itself (acquireSlotHandoff / releaseSlotHandoff, race builds
+	// only), so every caller benefits and not just this test.
 	var workerWg sync.WaitGroup
 	errCh := make(chan error, numWorkers*iters)
 	for w := 0; w < numWorkers; w++ {
@@ -450,13 +440,10 @@ func TestGuestSlot_ConcurrentConsumersNoCorruption(t *testing.T) {
 					}
 					time.Sleep(20 * time.Microsecond)
 				}
-				atomic.LoadUint32(&raceHB[slot.slotIdx-1])
-
 				copy(slot.RequestBuffer(), payload)
 				n, _, serr := slot.Send(int32(len(payload)), MsgTypeGuestCall)
 				if serr != nil {
 					errCh <- fmt.Errorf("worker %d iter %d: send failed: %v", w, i, serr)
-					atomic.StoreUint32(&raceHB[slot.slotIdx-1], 1)
 					slot.Release()
 					return
 				}
@@ -467,11 +454,9 @@ func TestGuestSlot_ConcurrentConsumersNoCorruption(t *testing.T) {
 
 				if got := string(slot.ResponseBuffer()[:n]); got != payload {
 					errCh <- fmt.Errorf("worker %d iter %d: response corrupted: want %q, got %q", w, i, payload, got)
-					atomic.StoreUint32(&raceHB[slot.slotIdx-1], 1)
 					slot.Release()
 					return
 				}
-				atomic.StoreUint32(&raceHB[slot.slotIdx-1], 1)
 				slot.Release()
 			}
 		}(w)

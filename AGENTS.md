@@ -173,6 +173,26 @@ flagged by past reviews and confirmed correct — do not "fix" or re-propose:
   SPECIFICATION.md §4.4.
 * The **header-only** C++ library structure is a design decision (see Project
   Structure) — no `.cpp` files for library logic.
+* `go/race_annotate_on.go` / `race_annotate_off.go` are **not dead code and not
+  synchronization** (2026-07-26). Slot ownership is handed over through the
+  atomics on `SlotHeader.State`, which lives in the file-mapped region. Go's
+  race detector silently drops every acquire/release annotation *and* every
+  access instrumentation whose address falls outside the Go arena and data
+  segment (`runtime.isvalidaddr`, `racecalladdr<>` in `race_amd64.s`) — a
+  `MapViewOfFile` region is in neither. So every shm-mediated handoff is
+  invisible to tsan, and the next owner's perfectly legal use of
+  `slotContext.nextMsgSeq` gets reported as a data race. That is a detector
+  blind spot, **not** a Go-memory-model race: `sync/atomic` is sequentially
+  consistent, so the `State` CAS pair is a genuine release/acquire edge.
+  `releaseSlotHandoff`/`acquireSlotHandoff` re-publish that edge on a Go-heap
+  address at the real handoff points; `//go:build !race` compiles them to empty
+  inlined functions, so production builds are unaffected. **Do not delete them
+  and do not "fix" the underlying race by making `nextMsgSeq` atomic** — the
+  counter is not the problem. Placement is load-bearing: release goes
+  immediately *before* the state store that publishes the slot as claimable and
+  only from a goroutine that actually owns it (a forfeited owner publishes
+  nothing, so a genuine use-after-forfeit still trips the detector); acquire
+  goes immediately *after* the claiming CAS.
 
 ### Over-defensive-logic audit (2026-06-25)
 
@@ -204,6 +224,53 @@ internally-produced value — never on an exported API, the C++↔Go SHM wire, o
 raw peer bytes, and never when it doubles as a behavior-selecting branch. Prefer
 **compile-time size asserts** (the dual `_ [K - sizeof] / [sizeof - K]` pattern)
 over runtime size re-checks.
+
+### Performance ideas already tried and REFUTED — do not re-propose
+
+Migrated 2026-07-26 from the workspace `IMPROVEMENT_BACKLOG.md` §6, which is
+being retired. Every entry below was **measured**, not reasoned about, and every
+one is the kind of plausible-sounding optimization a performance sweep will
+propose again. Re-proposing one costs a benchmark cycle to re-refute, so read
+this list before opening any throughput work. Where a refutation is scoped to
+this host's topology, that scope is stated — those may be revisited on genuinely
+different hardware, but only with numbers.
+
+* **Time-based calibration of the spin window** — refuted twice (2026-06-25 VM,
+  2026-06-26 native Windows). A 200 µs target cost **−65% throughput**; a 3 ms
+  target merely matched the legacy behavior (zero gain). Re-measured natively on
+  a Ryzen 9 3900X: still no throughput gain. The iteration-count window stays.
+* **`PAUSE` on every spin iteration is deliberate policy, not an oversight**
+  (2026-06-26 native sweep). Four variants were benchmarked — PAUSE every
+  iteration, every 2, every 4, and none. Best case was ≤ +3% throughput, and the
+  1024 B single-thread cell **regressed −16%**. The user's standing decision is
+  that HT/SMT cache-contention hygiene outweighs that margin, so
+  `go/spin_amd64.s` keeps PAUSE on every iteration. Do not "optimize" it away.
+* **Single-thread RTT has a ~447 ns floor here; no single change buys >30%**
+  (2026-06-26, third multi-agent RTT decomposition). A frequently-cited "0.04 µs"
+  figure is measurement-resolution noise — the real RTT is 1/2.24M ≈ 447 ns, of
+  which roughly 100–160 ns is cross-CCD cache-line bounce, a physical property of
+  the Ryzen 9 3900X. Treat proposals that promise a large 1T RTT win as suspect
+  until they account for that floor.
+* **Stream `maxInFlight` pipelining — no dramatic gain on a single memory
+  controller** (2026-06-26, re-confirmed 2026-07-09). Hypothesis was +150%;
+  measured +8% at 16 MiB down to −31% at 1 MiB, and under co-location every
+  depth-2 cell came out −56% or worse. The library default is in-flight 1.
+  Scope: single-memory-controller hosts. A NUMA/multi-controller topology is the
+  one place this is worth re-measuring.
+* **`reqOffset = 64` slot geometry — refuted** (2026-07-04), scoped to this host
+  with the Sibling affinity default. Sibling affinity places both endpoints on
+  the same physical core sharing L1d, so separating the header and data lines
+  saves a cross-core transfer that never happens; every default harness cell
+  estimated ~0%. Reconsider only for a non-SMT or deliberately remote placement.
+* **Large-page (`SEC_LARGE_PAGES`) stream mapping — refuted** (2026-07-04),
+  scoped to this host. The stream plateau is a memory-controller bandwidth
+  bottleneck (established by the `maxInFlight` experiment above), not a TLB
+  bottleneck, and `SeLockMemoryPrivilege` carries a real deployment burden.
+  Revisit only on a NUMA/multi-controller topology.
+
+**Working rule, not a perf item:** `gofmt -l` flags a large number of files in
+these repos because every existing file is CRLF. That is noise, not a formatting
+defect. Format only the files you actually modified; never bulk-reformat.
 
 ## **Known Improvement Backlog**
 

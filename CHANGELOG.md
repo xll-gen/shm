@@ -1,5 +1,44 @@
 # Changelog
 
+## [0.8.16] - 2026-07-26
+
+No wire-protocol/ABI change — `SHM_VERSION` remains `0x00070000`, `SlotHeader`
+and `ExchangeHeader` are untouched. Guest-side only; the byte stream a peer
+sees is unchanged (the fix *removes* writes the protocol never sanctioned).
+
+### Fixed
+
+- **`GuestSlot` forfeit is now terminal, matching C++** (SPEC §3.5 "Disown is
+  terminal"). `GuestSlot.lost` — set when a `Send` times out or loses its
+  consume-claim to a reclaimer — was consulted in exactly one place,
+  `Release()`. Every other accessor ignored it, so a caller that retried
+  `Send` on a forfeited handle wrote `ReqSize`/`MsgType`/`MsgSeq`, stored
+  `ActiveWait = 1` and published `SlotReqReady` **into a slot the Case-2
+  zombie steal or lease reclamation may already have handed to a new owner** —
+  silently destroying that owner's in-flight transaction, past the `MsgSeq`
+  guard (the intruder rewrites `MsgSeq` too). `Send`/`SendWithTimeout` now
+  return an error before touching shared memory, and
+  `RequestBuffer`/`ResponseBuffer` return `nil`. This is the parity fix for
+  what C++ `ZeroCopySlot`/`HeldSlot` have always done via `slotIdx = -1` +
+  `IsValid()`. A `Send` after `Release()` also returns an error instead of
+  nil-dereferencing. Regression:
+  `go/guest_slot_forfeit_test.go::TestGuestSlot_ForfeitedHandleCannotClobberNewOwner`
+  (deterministic — it does not depend on `-race` catching an interleaving).
+- **`go test -race` no longer misreports every guest-slot handoff.** Slot
+  ownership is handed over through the atomics on `SlotHeader.State`, which
+  lives in the file-mapped region. The Go race detector drops every
+  acquire/release annotation whose address falls outside the Go arena and data
+  segment (`runtime.isvalidaddr`), so those handoffs were invisible to it and
+  the next owner's perfectly legal use of `slotContext.nextMsgSeq` was reported
+  as a data race — reproducible at HEAD with
+  `go test ./go/... -race -run TestStreamSender_ChunkRejection_ReturnsError -count=12`.
+  The handoff is now mirrored on a Go-heap address at the real
+  release/acquire points (`releaseSlotHandoff`/`acquireSlotHandoff`,
+  `go/race_annotate_on.go`). Annotations only: `//go:build !race` compiles them
+  to empty inlined functions, so production builds are byte-identical and the
+  v0.8.9 hot-path baselines are untouched. Supersedes the test-local `raceHB`
+  workaround in `zombie_steal_test.go`.
+
 ## [v0.8.15] - 2026-07-26
 
 No wire-protocol/ABI change — `SHM_VERSION` remains `0x00070000`. Pure Go API

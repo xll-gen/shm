@@ -684,6 +684,7 @@ func (g *DirectGuest) TryReclaimAbandonedSlot(slotIdx int, maxLeaseAge time.Dura
 	// {reclaimer frees, claimant claims} wins. If ours fails, a live
 	// claimant took the slot; we refuse (the burned Gen tick is harmless —
 	// Gen only ever advances).
+	releaseSlotHandoff(s)
 	return atomic.CompareAndSwapUint32(&s.header.State, state, SlotFree)
 }
 
@@ -746,6 +747,7 @@ func tryClaimGuestSlot(s *slotContext) bool {
 	case SlotFree:
 		claimSlotGen(s.header)
 		if atomic.CompareAndSwapUint32(&s.header.State, SlotFree, SlotGuestBusy) {
+			acquireSlotHandoff(s)
 			atomic.StoreUint64(&s.header.Lease, MonotonicNanos())
 			return true
 		}
@@ -762,6 +764,7 @@ func tryClaimGuestSlot(s *slotContext) bool {
 		// re-use of the same zombie is detected and we yield.
 		if atomic.CompareAndSwapUint64(&s.header.Gen, genObserved, genObserved+1) {
 			if atomic.CompareAndSwapUint32(&s.header.State, SlotRespReady, SlotGuestBusy) {
+				acquireSlotHandoff(s)
 				atomic.StoreUint64(&s.header.Lease, MonotonicNanos())
 				return true
 			}
@@ -906,6 +909,7 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, buffer []byte, msgType 
 	}
 
 	if len(data) > len(slot.reqBuffer) {
+		releaseSlotHandoff(slot)
 		atomic.CompareAndSwapUint32(&slot.header.State, SlotGuestBusy, SlotFree)
 		return nil, fmt.Errorf("data too large")
 	}
@@ -1036,6 +1040,7 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, buffer []byte, msgType 
 		if fastConsume {
 			atomic.StoreInt32(&slot.ActiveWait, 0)
 		}
+		releaseSlotHandoff(slot)
 		atomic.CompareAndSwapUint32(&slot.header.State, ownedState, SlotFree)
 	}
 
@@ -1043,6 +1048,8 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, buffer []byte, msgType 
 		// Timeout: the host may still own the slot (SlotReqReady/SlotBusy).
 		// Do NOT store SlotFree — recovery is handled by the Case-2 zombie
 		// reclaim (once the host posts its late response) or lease reclaim.
+		// We touch the slot no further, so hand our clock to whoever recovers it.
+		releaseSlotHandoff(slot)
 		Debug("SendGuestCall timed out waiting for host")
 		return nil, fmt.Errorf("timeout waiting for host")
 	}
@@ -1050,6 +1057,7 @@ func (g *DirectGuest) sendGuestCallInternal(data []byte, buffer []byte, msgType 
 		// A reclaimer (lease-based crash recovery) took the slot between
 		// observing SlotRespReady and the consume-claim CAS. The response
 		// buffer can no longer be trusted.
+		releaseSlotHandoff(slot)
 		return nil, fmt.Errorf("slot reclaimed while consuming response")
 	}
 
