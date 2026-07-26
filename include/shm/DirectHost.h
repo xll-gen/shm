@@ -742,37 +742,54 @@ public:
     }
 
     /**
-     * @brief Gets the request buffer pointer for an acquired slot.
-     * @param slotIdx The slot index.
-     * @return Pointer to the buffer, or nullptr if invalid.
+     * @brief Gets the request buffer pointer for an acquired HOST slot.
+     *
+     * HOST slots only: slotIdx must be in [0, numHostSlots). Guest slots belong
+     * to the reverse (guest-initiated) flow, whose host-side driver is
+     * GuestCallWorker. See the index-range contract note in SlotAllocator.h —
+     * only TryReclaimAbandonedSlot spans both ranges.
+     *
+     * @param slotIdx Host slot index, in [0, numHostSlots).
+     * @return Pointer to the buffer, or nullptr when slotIdx is out of range.
      */
     uint8_t* GetReqBuffer(int32_t slotIdx) {
         return allocator_.GetReqBuffer(slotIdx);
     }
 
     /**
-     * @brief Gets the max request size for a slot.
-     * @param slotIdx The slot index.
-     * @return Max size in bytes.
+     * @brief Gets the request-buffer capacity of a HOST slot, in bytes.
+     *
+     * @param slotIdx Host slot index, in [0, numHostSlots).
+     * @return The capacity, or 0 when slotIdx is out of that range.
+     *
+     * @note **Zero means "not a host slot", never "a slot with no room"** —
+     *       Init floors the per-direction half-slot at 64 bytes, so an
+     *       initialized slot always reports >= 64. Treat 0 as an error and fall
+     *       back; do not size a buffer or an allocator arena to it.
+     *       `test_slot_accessor_contract.cpp` pins both halves of this. Do not
+     *       replace 0 with a negative sentinel — see the rationale on
+     *       SlotAllocator::GetMaxReqSize (Send's guard widens -1 to UINT32_MAX).
      */
     int32_t GetMaxReqSize(int32_t slotIdx) {
         return allocator_.GetMaxReqSize(slotIdx);
     }
 
     /**
-     * @brief Manually signals the Request Event for a slot.
+     * @brief Manually signals the Request Event for a HOST slot.
      * Used for custom protocols like RingBuffer.
+     * @param slotIdx Host slot index, in [0, numHostSlots); otherwise a no-op.
      */
     void SignalSlot(int32_t slotIdx) {
         allocator_.SignalSlot(slotIdx);
     }
 
     /**
-     * @brief Manually waits on the Response Event for a slot.
+     * @brief Manually waits on the Response Event for a HOST slot.
      * Used for custom protocols like RingBuffer.
-     * @param slotIdx The slot index.
+     * @param slotIdx Host slot index, in [0, numHostSlots).
      * @param timeoutMs Timeout in milliseconds.
-     * @return true if signaled, false if timeout.
+     * @return true if signaled; false on timeout OR when slotIdx is out of
+     *         range.
      */
     bool WaitForSlotEvent(int32_t slotIdx, uint32_t timeoutMs = 0xFFFFFFFF) {
         return allocator_.WaitForSlotEvent(slotIdx, timeoutMs);

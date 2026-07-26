@@ -516,7 +516,12 @@ public:
      * observed value) then arbitrates a same-generation reclaim against a
      * SLOT_RESP_READY zombie re-claim.
      *
-     * @param slotIdx The slot to inspect.
+     * @param slotIdx The slot to inspect. Unlike the request/response
+     *                accessors, which are host-slot-only, this accepts the
+     *                FULL range [0, numSlots + numGuestSlots) — see the
+     *                index-range contract note further down. Crash recovery is
+     *                role-blind on purpose: an abandoned guest slot is the
+     *                original motivation for the lease field.
      * @param maxLeaseAgeNs Maximum tolerated age in nanoseconds. Slots
      *                     whose lease is older than this are candidates
      *                     for reclamation.
@@ -576,9 +581,33 @@ public:
     }
 
     /**
-     * @brief Gets the request buffer pointer for an acquired slot.
-     * @param slotIdx The slot index.
-     * @return Pointer to the buffer, or nullptr if invalid.
+     * @brief Index-range contract for the accessors below.
+     *
+     * `slots` holds `numSlots + numGuestSlots` entries, but the accessors do
+     * NOT all accept the same range, and the split is deliberate:
+     *
+     *  - `GetReqBuffer`, `GetMaxReqSize`, `SignalSlot`, `WaitForSlotEvent`
+     *    accept `[0, numSlots)` — HOST slots only. They exist to drive the
+     *    host's own request/response exchange, and a guest slot's buffers and
+     *    events belong to the reverse (guest-initiated) flow, whose host-side
+     *    driver is `GuestCallWorker`, not these.
+     *  - `TryReclaimAbandonedSlot` accepts `[0, numSlots + numGuestSlots)`.
+     *    Crash recovery is deliberately role-blind: an abandoned lease has to
+     *    be reclaimable whichever endpoint stopped heartbeating, and a guest
+     *    slot left claimed by a dead guest is exactly the case the lease
+     *    mechanism was added for (SPECIFICATION.md §3.6).
+     *
+     * Out-of-contract indices do not throw or assert. Each accessor degrades to
+     * its own inert value (nullptr / 0 / no-op / false), and every one of those
+     * is distinguishable from a legitimate result — see the note on
+     * GetMaxReqSize.
+     */
+
+    /**
+     * @brief Gets the request buffer pointer for an acquired HOST slot.
+     * @param slotIdx Host slot index, in [0, numSlots).
+     * @return Pointer to the buffer, or nullptr when slotIdx is out of that
+     *         range (an initialized slot always has a non-null reqBuffer).
      */
     uint8_t* GetReqBuffer(int32_t slotIdx) {
         if (slotIdx < 0 || slotIdx >= (int32_t)numSlots) return nullptr;
@@ -586,9 +615,26 @@ public:
     }
 
     /**
-     * @brief Gets the max request size for a slot.
-     * @param slotIdx The slot index.
-     * @return Max size in bytes.
+     * @brief Gets the request-buffer capacity of a HOST slot, in bytes.
+     *
+     * @param slotIdx Host slot index, in [0, numSlots).
+     * @return The capacity, or 0 when slotIdx is out of that range.
+     *
+     * @note **Zero means "not a host slot", never "a slot with no room".**
+     *       `DirectHost::Init` floors the per-direction half-slot at 64 bytes
+     *       (`if (halfSize < 64) halfSize = 64;`) before assigning it to every
+     *       slot's `maxReqSize`, so an initialized slot's capacity is always
+     *       >= 64. Callers may therefore treat 0 as an error and fall back,
+     *       rather than sizing a buffer to it — sizing an arena to a 0 return
+     *       yields an allocator that hands out nullptr on its first request.
+     *       This matches the Go side's documented `MaxRequestSize()` contract
+     *       ("0 on a nil receiver ... otherwise always positive").
+     *
+     * @note **Do not "improve" this to a negative sentinel.** Returning -1 for an
+     *       out-of-range index looks stricter but is unsafe here: `DirectHost::Send`
+     *       compares `uAbsSize > (uint32_t)max`, so -1 widens to UINT32_MAX and the
+     *       oversized-request guard would ACCEPT everything. 0 is the safe
+     *       out-of-range value precisely because it fails that comparison closed.
      */
     int32_t GetMaxReqSize(int32_t slotIdx) {
         if (slotIdx < 0 || slotIdx >= (int32_t)numSlots) return 0;
@@ -596,8 +642,9 @@ public:
     }
 
     /**
-     * @brief Manually signals the Request Event for a slot.
+     * @brief Manually signals the Request Event for a HOST slot.
      * Used for custom protocols like RingBuffer.
+     * @param slotIdx Host slot index, in [0, numSlots); otherwise a no-op.
      */
     void SignalSlot(int32_t slotIdx) {
         if (slotIdx < 0 || slotIdx >= (int32_t)numSlots) return;
@@ -605,11 +652,12 @@ public:
     }
 
     /**
-     * @brief Manually waits on the Response Event for a slot.
+     * @brief Manually waits on the Response Event for a HOST slot.
      * Used for custom protocols like RingBuffer.
-     * @param slotIdx The slot index.
+     * @param slotIdx Host slot index, in [0, numSlots).
      * @param timeoutMs Timeout in milliseconds.
-     * @return true if signaled, false if timeout.
+     * @return true if signaled; false on timeout OR when slotIdx is out of
+     *         range.
      */
     bool WaitForSlotEvent(int32_t slotIdx, uint32_t timeoutMs = 0xFFFFFFFF) {
         if (slotIdx < 0 || slotIdx >= (int32_t)numSlots) return false;
