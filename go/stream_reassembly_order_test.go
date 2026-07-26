@@ -2,8 +2,11 @@ package shm
 
 import (
 	"bytes"
+	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // These tests pin the 2026-07-03 direct-into-destination reassembler: chunks
@@ -205,5 +208,208 @@ func TestStreamReassembly_ConcurrentStreams(t *testing.T) {
 		if !bytes.Equal(delivered[id], want) {
 			t.Errorf("stream %d: delivered bytes corrupted (cross-stream bleed?)", id)
 		}
+	}
+}
+
+// The tests below pin the 2026-07-25 per-stream locking split: the reassembler
+// map mutex no longer covers the chunk payload copy or the StreamStart
+// allocation, so each stream carries its own mutex plus done/dead markers and
+// the map entry is retired with a compare-and-delete. They are written to fail
+// under `-race` if that discipline regresses, and to fail deterministically if
+// the SPEC §3.3.4 exactly-once/completion invariants do.
+
+// TestStreamReassembly_ConcurrentSameStreamChunks drives the chunks of ONE
+// stream from several goroutines at once — the shape a multi-slot host worker
+// pool produces for a pipelined sender — with each worker owning an interleaved
+// subset of the chunk indices, so every worker is ahead of the in-order cursor
+// part of the time. Every stream must still deliver exactly once with its bytes
+// in index order.
+func TestStreamReassembly_ConcurrentSameStreamChunks(t *testing.T) {
+	const numStreams = 8
+	const chunksPerStream = 64
+	const workersPerStream = 4
+	const chunkLen = 512
+
+	payload := func(s, c int) []byte {
+		return bytes.Repeat([]byte{byte(s), byte(c)}, chunkLen/2)
+	}
+
+	var mu sync.Mutex
+	delivered := make(map[uint64]int)
+	assembled := make(map[uint64][]byte)
+	handler := NewStreamReassembler(func(streamID uint64, data []byte) {
+		mu.Lock()
+		delivered[streamID]++
+		assembled[streamID] = data
+		mu.Unlock()
+	}, nil)
+
+	var wg sync.WaitGroup
+	for s := 0; s < numStreams; s++ {
+		id := uint64(5000 + s)
+		if _, mt := handler(streamStartReq(id, chunksPerStream*chunkLen, chunksPerStream), nil, MsgTypeStreamStart); mt != MsgTypeNormal {
+			t.Fatalf("stream %d: start rejected: %v", id, mt)
+		}
+		for w := 0; w < workersPerStream; w++ {
+			wg.Add(1)
+			go func(s, w int) {
+				defer wg.Done()
+				for c := w; c < chunksPerStream; c += workersPerStream {
+					if _, mt := handler(streamChunkReq(uint64(5000+s), uint32(c), payload(s, c)), nil, MsgTypeStreamChunk); mt != MsgTypeNormal {
+						t.Errorf("stream %d chunk %d rejected: %v", 5000+s, c, mt)
+						return
+					}
+				}
+			}(s, w)
+		}
+	}
+	wg.Wait()
+
+	for s := 0; s < numStreams; s++ {
+		id := uint64(5000 + s)
+		if delivered[id] != 1 {
+			t.Errorf("stream %d delivered %d times, want exactly 1", id, delivered[id])
+			continue
+		}
+		want := make([]byte, 0, chunksPerStream*chunkLen)
+		for c := 0; c < chunksPerStream; c++ {
+			want = append(want, payload(s, c)...)
+		}
+		if !bytes.Equal(assembled[id], want) {
+			t.Errorf("stream %d: assembled bytes wrong (chunk landed at the wrong offset?)", id)
+		}
+	}
+}
+
+// TestStreamReassembly_ConcurrentRestartKeepsFreshContext pins the
+// compare-and-delete on retirement. A StreamStart that reuses a live stream ID
+// installs a fresh context; a chunk that was already in flight against the
+// replaced context may finish afterwards, and its retirement must NOT remove
+// the fresh entry. Without the identity check the fresh context vanishes and
+// the next chunk for that ID is answered SystemError.
+func TestStreamReassembly_ConcurrentRestartKeepsFreshContext(t *testing.T) {
+	const id = 4242
+	const iters = 400
+	// The chunks are deliberately large. The completing chunk holds the finishing
+	// context's lock for the length of a 1 MiB copy, which is what lets the
+	// concurrent restart install its replacement *before* the finishing chunk
+	// reaches retirement — precisely the interleaving the identity check exists
+	// for. With 4-byte chunks the window is too short to hit.
+	const chunkLen = 1 << 20
+	const totalSize = 2 * chunkLen
+
+	payload := bytes.Repeat([]byte{0xA5}, chunkLen)
+
+	var deliveries int32
+	handler := NewStreamReassembler(func(streamID uint64, data []byte) {
+		if streamID != id {
+			t.Errorf("delivered unexpected streamID %d", streamID)
+		}
+		if len(data) != totalSize {
+			t.Errorf("delivered %d bytes, want %d (partial buffer handed out?)", len(data), totalSize)
+		}
+		atomic.AddInt32(&deliveries, 1)
+	}, nil)
+
+	for i := 0; i < iters; i++ {
+		if _, mt := handler(streamStartReq(id, totalSize, 2), nil, MsgTypeStreamStart); mt != MsgTypeNormal {
+			t.Fatalf("iter %d: start rejected: %v", i, mt)
+		}
+		if _, mt := handler(streamChunkReq(id, 0, payload), nil, MsgTypeStreamChunk); mt != MsgTypeNormal {
+			t.Fatalf("iter %d: chunk0 rejected: %v", i, mt)
+		}
+
+		// Race the completing chunk of the current context against a restart of
+		// the same ID. Both requests are built up front so the goroutines race on
+		// the handler, not on request marshalling.
+		final := streamChunkReq(id, 1, payload)
+		restart := streamStartReq(id, totalSize, 2)
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			handler(final, nil, MsgTypeStreamChunk)
+		}()
+		go func() {
+			defer wg.Done()
+			runtime.Gosched()
+			handler(restart, nil, MsgTypeStreamStart)
+		}()
+		wg.Wait()
+
+		// Whichever way the race resolved, the restart's context is the live map
+		// entry, so a chunk for it must be accepted. (The restart is the last
+		// StreamStart for this ID; only a stale retirement could have removed it.)
+		if _, mt := handler(streamChunkReq(id, 0, payload), nil, MsgTypeStreamChunk); mt != MsgTypeNormal {
+			t.Fatalf("iter %d: chunk for the restarted stream got %v, want Normal — a stale completion deleted the fresh context", i, mt)
+		}
+		// Leftover state is irrelevant: the next iteration's StreamStart replaces it.
+	}
+
+	if n := atomic.LoadInt32(&deliveries); n == 0 {
+		t.Error("nothing ever completed — the test never reached the retirement path")
+	}
+}
+
+// TestStreamReassembly_PruneRacesChunkConsumption runs the age-based prune (and
+// the memory it frees) concurrently with chunk consumption on the streams it is
+// reclaiming. A reclaimed context must stop absorbing bytes and must never
+// deliver, so every stream ID delivers at most once and only ever with its full
+// advertised size — a context that kept consuming after being pruned would show
+// up as a second delivery or a short buffer.
+func TestStreamReassembly_PruneRacesChunkConsumption(t *testing.T) {
+	const numWorkers = 4
+	const streamsPerWorker = 200
+	const timeout = time.Millisecond
+
+	var nanos int64
+	clock := func() time.Time { return time.Unix(0, atomic.LoadInt64(&nanos)) }
+
+	var mu sync.Mutex
+	delivered := make(map[uint64]int)
+	handler := newStreamReassembler(func(streamID uint64, data []byte) {
+		if len(data) != 4 {
+			t.Errorf("stream %d delivered %d bytes, want 4", streamID, len(data))
+		}
+		if !bytes.Equal(data, []byte("aabb")) {
+			t.Errorf("stream %d delivered %q, want \"aabb\"", streamID, data)
+		}
+		mu.Lock()
+		delivered[streamID]++
+		mu.Unlock()
+	}, nil, timeout, clock)
+
+	var wg sync.WaitGroup
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < streamsPerWorker; i++ {
+				id := uint64(w)<<32 | uint64(i)
+				if _, mt := handler(streamStartReq(id, 4, 2), nil, MsgTypeStreamStart); mt != MsgTypeNormal {
+					t.Errorf("stream %d: start rejected: %v", id, mt)
+					return
+				}
+				// Push the virtual clock forward so other workers' StreamStarts
+				// prune streams (possibly this one) mid-flight.
+				atomic.AddInt64(&nanos, int64(timeout))
+				// A prune may have reclaimed this stream between the two chunks;
+				// SystemError is then the correct answer, not a failure.
+				handler(streamChunkReq(id, 0, []byte("aa")), nil, MsgTypeStreamChunk)
+				handler(streamChunkReq(id, 1, []byte("bb")), nil, MsgTypeStreamChunk)
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+	for id, n := range delivered {
+		if n != 1 {
+			t.Errorf("stream %d delivered %d times, want at most 1 (onStream must fire exactly once)", id, n)
+		}
+	}
+	if len(delivered) == 0 {
+		t.Fatal("no stream completed at all — the prune starved every stream, test is not exercising the race")
 	}
 }

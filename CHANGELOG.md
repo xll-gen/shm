@@ -1,5 +1,36 @@
 # Changelog
 
+## [v0.8.12] - 2026-07-25
+
+No wire-protocol/ABI change — `SHM_VERSION` remains `0x00070000`. Go stream
+path only; the public API is unchanged.
+
+### Changed
+
+- **Per-stream locking in the reassembler.** The reassembler-wide mutex used to
+  be held across the StreamStart allocation (up to 1 GiB) *and* every chunk
+  payload copy, so multi-stream receive serialized on one lock — the shape
+  behind the 8T/16MiB reverse-scaling (1T 186 → 8T 126 ops/s). Each
+  `streamContext` now carries its own mutex covering buf/next/offset/ooo/done;
+  the map mutex only guards lookup, insert, delete and the LRU counter. The
+  map-side reclaim paths (age prune, count-LRU, same-ID replacement) mark the
+  context `dead` atomically as it leaves the map, and a chunk handler that
+  snapshotted it observes that flag after taking the context lock — so a
+  reclaimed context can never absorb further bytes or fire `onStream`. Lock
+  order is map → context, never the reverse. Verified under `-race`.
+- **`StreamSender` takes an inline path at `maxInFlight == 1`** (the library
+  default since v0.8.9). At depth 1 the semaphore was acquired at the top of
+  the loop and released only after `Send`+`Release`, so nothing ever
+  overlapped: the per-chunk goroutine and channel handoff were pure overhead
+  (~0.7-1.5 µs each). The pipelined path for depth > 1 is untouched.
+- **Slot acquisition unified** (R17). `Send` was split up, the hardcoded `24`
+  now comes from `chunkHeaderSize` (pinned by the compile-time size assert),
+  and StreamStart's fixed 1000 × 1 ms retry / the chunk loop's unbounded 100 µs
+  retry — which also discarded every intermediate error — became one
+  deadline-bounded helper.
+- StreamStart parsing dropped reflection-based `binary.Read` for the manual
+  little-endian decode the chunk path already used.
+
 ## [v0.8.11] - 2026-07-24
 
 No wire-protocol/ABI change — `SHM_VERSION` remains `0x00070000`. Go-side

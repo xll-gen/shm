@@ -44,7 +44,8 @@ type zombieStealEnv struct {
 	cleanup    []func()
 }
 
-func newZombieStealEnv(t *testing.T, name string, numGuest int) *zombieStealEnv {
+// t is testing.TB so benchmarks (stream_bench_test.go) can build the same env.
+func newZombieStealEnv(t testing.TB, name string, numGuest int) *zombieStealEnv {
 	t.Helper()
 
 	env := &zombieStealEnv{
