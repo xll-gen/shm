@@ -132,6 +132,30 @@ int main() {
         CHECK(!fired, "no callback on overflow drop");
     }
 
+    // ---- Guard 3 (overflow), out-of-order arrival ----
+    // Same guard, but no chunk ever arrives at the in-order cursor: an
+    // implementation whose running-length check only covers the in-order path
+    // buffers every chunk and rejects only at completion, after the bytes are
+    // resident. Both peers must reject at arrival. This block is the Go/C++
+    // parity marker; the depth cases live in
+    // tests/test_reassembler_ooo_overflow.cpp and go/stream_ooo_guard_test.go.
+    {
+        bool fired = false;
+        StreamReassembler r(
+            [&](uint64_t, const std::vector<uint8_t>&) { fired = true; });
+        CHECK(handle(r, MsgType::STREAM_START, startReq(30, 3, 3)) ==
+                  MsgType::NORMAL,
+              "valid start ACKs");
+        CHECK(handle(r, MsgType::STREAM_CHUNK,
+                     chunkReq(30, 2, {0x01, 0x02})) == MsgType::NORMAL,
+              "ooo chunk2 within totalSize ACKs");
+        MsgType mt =
+            handle(r, MsgType::STREAM_CHUNK, chunkReq(30, 1, {0x03, 0x04}));
+        CHECK(mt == MsgType::SYSTEM_ERROR,
+              "ooo running-length overflow must be SYSTEM_ERROR at arrival");
+        CHECK(!fired, "no callback on ooo overflow drop");
+    }
+
     // ---- Guard 4: totalChunks == 0 && totalSize != 0 -> SYSTEM_ERROR ----
     {
         bool fired = false;

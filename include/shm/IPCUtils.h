@@ -227,9 +227,12 @@ enum SlotState {
     SLOT_REQ_READY = 1,
     /** @brief Response data is written. Ready for Host to read. */
     SLOT_RESP_READY = 2,
-    /** @brief Transaction complete (transient state).
-     *  SLOT_DONE = 3 (reserved; not currently used by the protocol but
-     *  retained for future flow extensions). */
+    /** @brief Responder publish lock (transient). Post-v0.8.16, SPEC §3.4/§3.5
+     *  responder publish rule: a responder that owns a slot moves it here
+     *  before writing any header field, then on to SLOT_RESP_READY to publish.
+     *  Deliberately outside the zombie-steal set
+     *  {SLOT_REQ_READY, SLOT_RESP_READY, SLOT_GUEST_BUSY}, so a slot parked
+     *  here cannot be stolen mid-publish. */
     SLOT_DONE = 3,
     /** @brief Slot is claimed by Host, writing request. */
     SLOT_BUSY = 4,

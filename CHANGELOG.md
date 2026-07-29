@@ -1,5 +1,150 @@
 # Changelog
 
+## [0.8.17] - 2026-07-29
+
+No wire-protocol/ABI change — `SHM_VERSION` remains `0x00070000`, `SlotHeader`
+and `ExchangeHeader` are untouched, and no state *value* is added (`SLOT_DONE = 3`
+has been defined on both sides since v0.6.0). An older peer is unaffected: it
+waits only on `SLOT_RESP_READY`, and `SLOT_DONE` is not in its zombie-steal set,
+so it neither acts on the transient state nor steals a slot parked in it.
+
+### Fixed
+
+- **Responder wrote header fields before proving it still owned the slot**
+  (SPEC §3.4/§3.5 "Responder publish rule"). v0.8.14 sealed the publish
+  *transition* — `CAS(owned → SLOT_RESP_READY)` instead of a blind store — but
+  the `respSize`/`msgType` stores that **precede** that CAS stayed
+  unconditional. That left the corruption only half fixed:
+
+  1. The Guest worker claims `SLOT_REQ_READY → SLOT_GUEST_BUSY` and runs the
+     handler.
+  2. The Host's response timeout fires. Per §3.4 it disowns the slot *without
+     writing `state`* (`SlotAllocator::FinishWait(slot, false)` only drops
+     `activeWait`), leaving `GUEST_BUSY` + `activeWait == 0` — a zombie-steal
+     candidate.
+  3. `AcquireSlot`'s `thread_local` slot cache makes the very thread that just
+     timed out the first to steal it back: `gen` CAS,
+     `CAS(GUEST_BUSY → BUSY)`, write a **new** transaction's
+     `reqSize`/`msgType`/`msgSeq`, publish `REQ_READY`.
+  4. The slow handler returns and unconditionally writes `header.RespSize` and
+     `header.MsgType` — onto that new transaction. The following publish CAS
+     fails and the response bytes are correctly dropped, **but the header is
+     already poisoned.**
+  5. Each host slot is serviced by exactly one worker goroutine, so the *same*
+     goroutine reads the poisoned `MsgType` on its next iteration, in program
+     order and deterministically. The new request is dispatched to the wrong
+     handler branch. `msgSeq` is untouched (a responder never writes it), so the
+     Host's `msgSeq` guard validates — a silently wrong value in a cell.
+
+  Both responders now publish in **two phases**: compute the response metadata
+  into locals, `CAS(owned → SLOT_DONE)` to lock ownership, and only then write
+  the header, followed by `CAS(SLOT_DONE → SLOT_RESP_READY)` (`seq_cst`, so the
+  §4.2 doorbell Dekker is unaffected). A failed lock writes **nothing** and
+  drops the response. `SLOT_DONE` is usable as the lock precisely because it is
+  outside the §3.6.1 zombie-steal set `{REQ_READY, RESP_READY, GUEST_BUSY}`, so
+  a slot parked there cannot be stolen mid-publish. Go
+  `go/direct.go::lockForPublish`/`publishResponse`; C++
+  `include/shm/GuestCallWorker.h::LockForPublish`/`PublishResponse` and
+  `ProcessGuestCalls`.
+
+  The steal set itself is deliberately **unchanged**: SPEC §3.4 defines
+  `SLOT_GUEST_BUSY` as stealable, and that is the responder's ownership token,
+  not reclaim machinery. Narrowing it would invert a documented, tested design
+  decision and change Host slot-recovery semantics.
+
+- **Panic recovery completed a transaction that had never run.** The Go worker's
+  `recover()` treated `state == SlotReqReady` as "we still hold the slot" and
+  stamped `MsgType = SYSTEM_ERROR`, `RespSize = 0`, publishing with
+  `CAS(observed → SlotRespReady)`. But the worker claims
+  `REQ_READY → GUEST_BUSY` *before* it touches anything, so seeing `REQ_READY`
+  at panic time means the slot was stolen and republished under a **different**
+  transaction — and the CAS then *succeeded*, completing as a system error a
+  request the handler was never even invoked for. Recovery now publishes only
+  from the owned `SlotGuestBusy`, through the same two-phase lock.
+
+- **Stream reassembly: the `totalSize` overflow guard did not cover
+  out-of-order chunks** (SPEC §3.3.4 per-chunk overflow guard, MUST). Both
+  peers checked the running assembled length only where a chunk landed at the
+  in-order cursor. A chunk that arrived *ahead* of the cursor was buffered on
+  nothing but an index-range and duplicate check — neither of which involves
+  `totalSize` — so a peer could advertise `totalSize = 1` with
+  `totalChunks = 1000` and then stream large chunks under indices `1..999`:
+  every payload was copied and retained, and the byte-sum was only questioned
+  once index 0 finally arrived. The final verdict (`Σ payloadSize == totalSize`)
+  was correct, so no wrong value was ever delivered, but rejection happened
+  *after* the bytes were resident — the unbounded allocation §3.3.4 exists to
+  prevent, multiplied by `maxConcurrentStreams`. Measured on the Go side:
+  33 MB retained for a stream advertising 1024 bytes (scaled-down repro; the
+  real bound is `maxStreamSize` per stream). The C++ reassembler had no
+  running-byte accounting at all, and its comment at the completion loop
+  *claimed* a per-chunk guard existed — that comment is corrected.
+
+  Both sides now carry an order-independent received-byte counter and apply the
+  guard **before** the payload is copied: Go `streamContext.oooBytes` +
+  `fits()`, checked in `park()` and `consume()` (`go/stream.go`); C++
+  `StreamContext::receivedBytes`, checked ahead of the
+  `chunks[idx].assign(...)` (`include/shm/StreamReassembler.h`). Draining a
+  parked chunk into the destination releases its `oooBytes` first, so a
+  well-formed out-of-order stream whose sum equals `totalSize` exactly still
+  completes. **Wire-neutral**: no new field, no new message type, `SHM_VERSION`
+  unchanged — the only observable difference is *when* a violating stream is
+  refused. No conforming sender is affected; the library's own `StreamSender`
+  never trips it.
+
+### Tests
+
+- `go/fastpath_test.go::TestGuestResponderSteal_NoHeaderWriteBeforeOwnership` —
+  replays the §3.4 timeout steal with **different** `msgType`s on the two
+  transactions (the pre-existing
+  `TestGuestResponderFastPath_HostTimeoutStealDoesNotCorrupt` used
+  `MsgTypeNormal` for both and asserted only on `RespSize`/bytes, so it could
+  not observe `msgType` poisoning at all — a SCOPE LIMIT note now records that
+  and points at the new test). Asserts the individual acts per the §3.5
+  disown-terminal lesson: the header snapshot taken at txn#2's dispatch must
+  carry txn#2's own `msgType`/`msgSeq`/`reqSize` and an untouched `respSize`
+  sentinel.
+- `go/fastpath_test.go::TestGuestResponderPanic_DoesNotStampErrorOnStolenSlot` —
+  panics a handler whose slot has already been stolen and republished, and
+  asserts the new transaction is *dispatched to the handler* rather than
+  completed as `SYSTEM_ERROR`.
+- `go/fastpath_test.go::TestGuestResponderTwoPhasePublish_RingsDoorbell` — the
+  transient `SLOT_DONE` must not swallow the §4.2 doorbell; the mock host parks
+  on the response event only and the host must never observe `SLOT_DONE`.
+- `tests/test_guest_call_publish_lock.cpp` — the C++ mirror (guest-call
+  direction, owned state `SLOT_BUSY`), driving the response-overflow branch so
+  the `msgType = SYSTEM_ERROR` write is the poisoning vector.
+- `go/stream_ooo_guard_test.go` — the out-of-order overflow guard.
+  `TestStreamReassembly_OutOfOrderRunningLengthOverflow` (table-driven: first
+  chunk already over, accumulation across several parked chunks, parked bytes
+  constraining a later in-order chunk, zero-length park) and
+  `TestStreamReassembly_OutOfOrderOverflowBoundsMemory`, which asserts on
+  `MemStats.TotalAlloc` — cumulative and GC-independent, so it observes the
+  parked copies even after they become garbage (33 MB before, < 1 MiB after).
+  The counterpart no-regression tests are the load-bearing ones:
+  `TestStreamReassembly_OutOfOrderPatternsComplete` (uneven chunk sizes
+  including a zero-length one, delivered reversed / odd-then-even /
+  drain-then-park / three fixed shuffles) and
+  `TestStreamReassembly_OutOfOrderExactFillAccepted` (the `>` vs `>=`
+  boundary). Verified by mutation: dropping the `oooBytes -=` on drain fails
+  every pattern subtest plus four pre-existing ones.
+- `tests/test_reassembler_ooo_overflow.cpp` — the C++ mirror of all of the
+  above, driving `StreamReassembler::Handle()` with crafted wire buffers; plus
+  an out-of-order overflow parity case added to
+  `tests/test_reassembler_contract.cpp` so the Go/C++ accept-reject tables stay
+  aligned.
+
+### Known residuals (documented in SPEC §3.4, not fixed here)
+
+- **Torn request bytes.** During the theft window the new owner overwrites
+  `reqBuffer` while the old handler still reads the same slice, so a handler can
+  parse a mid-flight mutation. This is a consequence of keeping
+  `SLOT_GUEST_BUSY` stealable; the mitigation is panic recovery plus the publish
+  drop.
+- **`SLOT_DONE` is reclaimable.** `TryReclaimAbandonedSlot` treats every
+  non-`SLOT_FREE` state as a candidate, so a stale lease plus an armed reclaimer
+  can free a slot inside the two-atomic-op `SLOT_DONE` window; the publish CAS
+  then fails and the response is dropped rather than mis-delivered.
+
 ## [0.8.16] - 2026-07-26
 
 No wire-protocol/ABI change — `SHM_VERSION` remains `0x00070000`, `SlotHeader`

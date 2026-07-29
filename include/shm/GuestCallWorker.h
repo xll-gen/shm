@@ -169,11 +169,16 @@ public:
     }
 
     /**
-     * @brief Publishes SLOT_RESP_READY on a guest slot this worker owns at
-     *        SLOT_BUSY (SPEC §3.5 step 5).
+     * @brief Phase 1 of the two-phase responder publish: converts this worker's
+     *        SLOT_BUSY claim on a guest slot into an exclusive publish lock
+     *        (SLOT_BUSY -> SLOT_DONE, SPEC §3.5 step 5).
      *
-     * The transition is a CAS, never a blind store — the mirror of the Go
-     * responder's publishResponse (go/direct.go). Ownership of a claimed guest
+     * Callers MUST NOT write a single header field — not respSize, not msgType —
+     * until this returns true. Mirror of the Go responder's lockForPublish
+     * (go/direct.go); the only difference is the owned state (SLOT_BUSY here,
+     * SLOT_GUEST_BUSY on host slots).
+     *
+     * The transition is a CAS, never a blind store. Ownership of a claimed guest
      * slot is not eternal: a slow handler can outlive the Guest sender's
      * response timeout, after which the Guest's opt-in lease reclaimer
      * (TryReclaimAbandonedSlot) can free the slot and a fresh sender can claim
@@ -185,6 +190,44 @@ public:
      * SLOT_FREE / SLOT_GUEST_BUSY / SLOT_REQ_READY when the late publish
      * arrives, so the CAS fails and the response is dropped instead.
      *
+     * Why the lock is a *separate* transition (post-v0.8.16). v0.8.14 sealed only the
+     * publishing transition and left the respSize/msgType stores that precede it
+     * unconditional, so after a reclaim+republish those stores landed on the new
+     * owner's transaction: the publish CAS then failed and the response bytes
+     * were correctly dropped, but the header was already poisoned and the next
+     * ProcessGuestCalls dispatch read the wrong msgType (a silent wrong value
+     * the msgSeq guard cannot catch). Proving ownership before the first header
+     * write is the only fix.
+     *
+     * SLOT_DONE (3) is the lock state because it is outside the zombie-steal set
+     * {SLOT_REQ_READY, SLOT_RESP_READY, SLOT_GUEST_BUSY} used by
+     * SlotAllocator::tryClaimSlot and the Go tryClaimGuestSlot, so a slot parked
+     * there cannot be stolen mid-publish, and because no other protocol
+     * transition produces or consumes it. The window is two atomic ops wide and
+     * is wire/ABI-neutral: the peer only ever waits on SLOT_RESP_READY.
+     *
+     * @return true if the slot is locked for publishing (header may be written).
+     */
+    static bool LockForPublish(Slot* slot, uint32_t slotIdx) {
+        uint32_t expected = SLOT_BUSY;
+        if (!slot->header->state.compare_exchange_strong(
+                expected, SLOT_DONE, std::memory_order_acq_rel)) {
+            SHM_LOG_WARN("Guest-call response dropped: slot ", slotIdx,
+                         " was reclaimed while the handler ran (state=", expected, ")");
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * @brief Phase 2 of the responder publish: SLOT_DONE -> SLOT_RESP_READY.
+     *
+     * Only the holder of the publish lock can be at SLOT_DONE, so this CAS
+     * cannot legitimately fail; a failure means an invariant was violated
+     * (someone wrote `state` while we held the lock) and is logged as an error
+     * rather than silently swallowed.
+     *
+     * The CAS stays seq_cst because the §4.2 doorbell Dekker depends on it.
      * Signal elision (two-sided Dekker, same pattern as SlotAllocator's
      * REQ_READY publish): the guest caller stores
      * guestState=GUEST_STATE_WAITING with seq_cst and re-checks `state` before
@@ -193,14 +236,15 @@ public:
      * RESP_READY and skips the park, or we see WAITING and deliver the
      * (kernel-priced) SetEvent. A spinning guest costs no syscall at all.
      *
-     * @return true if the response was published, false if the slot was lost.
+     * @return true if the response was published.
      */
     static bool PublishResponse(Slot* slot, uint32_t slotIdx) {
-        uint32_t expected = SLOT_BUSY;
+        uint32_t expected = SLOT_DONE;
         if (!slot->header->state.compare_exchange_strong(
                 expected, SLOT_RESP_READY, std::memory_order_seq_cst)) {
-            SHM_LOG_WARN("Guest-call response dropped: slot ", slotIdx,
-                         " was reclaimed while the handler ran (state=", expected, ")");
+            SHM_LOG_ERROR("Guest-call publish lock lost on slot ", slotIdx,
+                          " between SLOT_DONE and the RESP_READY publish (state=",
+                          expected, ") — protocol invariant violated");
             return false;
         }
         if (slot->header->guestState.load(std::memory_order_seq_cst) == GUEST_STATE_WAITING) {
@@ -255,10 +299,18 @@ public:
                 const uint8_t* reqData = nullptr;
                 uint32_t absReqSize = (reqSize < 0) ? (0u - (uint32_t)reqSize) : (uint32_t)reqSize;
 
+                // Every response-producing branch below follows the same
+                // two-phase order (§3.5 responder publish rule): compute the
+                // response metadata into LOCALS, take the publish lock, and only
+                // then write header fields. A branch whose LockForPublish fails
+                // writes nothing — the slot now carries somebody else's
+                // transaction.
                 if (absReqSize > slot->maxReqSize) {
-                    slot->header->respSize = 0;
-                    slot->header->msgType = MsgType::SYSTEM_ERROR;
-                    PublishResponse(slot, i);
+                    if (LockForPublish(slot, i)) {
+                        slot->header->respSize = 0;
+                        slot->header->msgType = MsgType::SYSTEM_ERROR;
+                        PublishResponse(slot, i);
+                    }
                     processed++;
                     continue;
                 }
@@ -273,14 +325,18 @@ public:
                 int32_t respSize = handler(reqData, (int32_t)absReqSize, slot->respBuffer, slot->maxRespSize, slot->header->msgType);
 
                 uint32_t absRespSize = (respSize < 0) ? (0u - (uint32_t)respSize) : (uint32_t)respSize;
-                if (absRespSize > slot->maxRespSize) {
+                const bool respOverflow = absRespSize > slot->maxRespSize;
+                if (respOverflow) {
                     respSize = 0;
-                    slot->header->msgType = MsgType::SYSTEM_ERROR;
                 }
 
-                slot->header->respSize = respSize;
-
-                PublishResponse(slot, i);
+                if (LockForPublish(slot, i)) {
+                    if (respOverflow) {
+                        slot->header->msgType = MsgType::SYSTEM_ERROR;
+                    }
+                    slot->header->respSize = respSize;
+                    PublishResponse(slot, i);
+                }
 
                 processed++;
             }

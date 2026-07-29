@@ -107,6 +107,13 @@ type streamContext struct {
 	// index. Presence in the map (not slice nil-ness) is the dedup marker so
 	// zero-length chunks are counted exactly once. nil until first needed.
 	ooo map[uint32][]byte
+	// oooBytes is Σ len(ooo[i]) — the bytes currently parked ahead of the
+	// cursor. offset+oooBytes is the running *received* length of the stream,
+	// which is what the SPEC §3.3.4 per-chunk overflow guard bounds by
+	// totalSize; without it, a peer that only ever sends ahead-of-cursor
+	// indices parks unbounded memory and is caught only once the gap fills.
+	// Decremented exactly when a parked chunk is drained into buf.
+	oooBytes uint64
 	// done is set when this context is retired from within the chunk path:
 	// either the stream completed (buf handed to onStream) or it was dropped as
 	// corrupt. It makes the "onStream fires exactly once" and "no bytes are
@@ -141,17 +148,45 @@ type streamContext struct {
 	started time.Time
 }
 
-// consume appends data at the in-order cursor, enforcing the SPEC §3.3.4
-// per-chunk running-length guard (assembled length must never exceed
-// totalSize). Returns false if the guard trips; the caller must then drop the
-// stream and answer MSG_TYPE_SYSTEM_ERROR. Must be called under c.mu.
+// fits reports whether accepting n more bytes keeps the running received
+// length (assembled + parked) within totalSize — the SPEC §3.3.4 per-chunk
+// overflow guard. Parked bytes count because every parked index is eventually
+// drained into buf, so they are already part of Σ payloadSize. Must be called
+// under c.mu.
+func (c *streamContext) fits(n int) bool {
+	return c.offset+c.oooBytes+uint64(n) <= c.totalSize
+}
+
+// consume appends data at the in-order cursor, enforcing the per-chunk
+// running-length guard. Returns false if the guard trips; the caller must then
+// drop the stream and answer MSG_TYPE_SYSTEM_ERROR. Draining a parked chunk
+// releases its oooBytes first (see the drain loop), so a chunk that fit when it
+// was parked still fits when it is consumed. Must be called under c.mu.
 func (c *streamContext) consume(data []byte) bool {
-	if c.offset+uint64(len(data)) > c.totalSize {
+	if !c.fits(len(data)) {
 		return false
 	}
 	copy(c.buf[c.offset:], data)
 	c.offset += uint64(len(data))
 	c.next++
+	return true
+}
+
+// park buffers a chunk that arrived ahead of the in-order cursor. The overflow
+// guard runs BEFORE the copy is allocated, so an over-advertised stream is
+// rejected at arrival time instead of after all of its bytes are resident.
+// Returns false if the guard trips. Must be called under c.mu.
+func (c *streamContext) park(index uint32, data []byte) bool {
+	if !c.fits(len(data)) {
+		return false
+	}
+	if c.ooo == nil {
+		c.ooo = make(map[uint32][]byte)
+	}
+	parked := make([]byte, len(data))
+	copy(parked, data)
+	c.ooo[index] = parked
+	c.oooBytes += uint64(len(data))
 	return true
 }
 
@@ -380,6 +415,11 @@ func newStreamReassembler(onStream StreamHandler, fallback func(req []byte, resp
 						break
 					}
 					delete(ctx.ooo, ctx.next)
+					// These bytes move from "parked" to "assembled"; releasing
+					// the count first keeps offset+oooBytes invariant across the
+					// drain, so a legitimately-sized stream cannot be rejected
+					// for bytes it counted twice.
+					ctx.oooBytes -= uint64(len(buffered))
 					ok = ctx.consume(buffered)
 				}
 				if !ok {
@@ -387,16 +427,12 @@ func newStreamReassembler(onStream StreamHandler, fallback func(req []byte, resp
 					// Drop it rather than deliver truncated/garbled data.
 					corrupt = true
 				}
-			} else {
+			} else if !ctx.park(chunkIndex, data) {
 				// Ahead of the cursor (pipelined sender): the byte offset is
-				// unknown until the gap fills, so park a copy. The slot buffer
-				// is reused after this handler returns, hence the copy.
-				if ctx.ooo == nil {
-					ctx.ooo = make(map[uint32][]byte)
-				}
-				parked := make([]byte, len(data))
-				copy(parked, data)
-				ctx.ooo[chunkIndex] = parked
+				// unknown until the gap fills, so park a copy — but only if the
+				// running received length still fits totalSize. Rejected here
+				// the parked bytes are never allocated at all.
+				corrupt = true
 			}
 
 			ready := false

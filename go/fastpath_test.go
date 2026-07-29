@@ -478,6 +478,15 @@ func TestGuestResponderFastPath_HostReclaimDuringHandlerIsRejected(t *testing.T)
 // SlotReqReady would NOT have helped: the stolen slot is republished at
 // SlotReqReady, so such a CAS still succeeds. Only the SlotGuestBusy claim —
 // a state a stolen slot can never be back in — makes the publish airtight.
+//
+// SCOPE LIMIT (do not widen this test — add cases next to it instead): this
+// case CANNOT observe msgType corruption. txn#1's handler return type and
+// txn#2's request type are both MsgTypeNormal, and the assertions only look at
+// RespSize and the response bytes, so a responder that writes header.MsgType
+// before proving ownership passes here unnoticed. The header-field writes that
+// precede the publish CAS are covered by
+// TestGuestResponderSteal_NoHeaderWriteBeforeOwnership (msgType/respSize) and
+// TestGuestResponderPanic_DoesNotStampErrorOnStolenSlot (panic path).
 func TestGuestResponderFastPath_HostTimeoutStealDoesNotCorrupt(t *testing.T) {
 	env := newFPHostSlotEnv(t, "FastPathTimeoutStealSHM")
 	defer env.cleanup()
@@ -556,5 +565,342 @@ func TestGuestResponderFastPath_HostTimeoutStealDoesNotCorrupt(t *testing.T) {
 	}
 	if got != string(req2) {
 		t.Fatalf("txn#2 response mismatch: got %q want %q", got, req2)
+	}
+}
+
+// replayHostTimeoutSteal reproduces SlotAllocator::tryClaimSlot's zombie-steal
+// branch verbatim on the test's slot: the host's response timeout fired (
+// FinishWait(slot,false) dropped activeWait and left `state` untouched), so the
+// host's next acquisition recycles the abandoned slot. Snapshot Gen, observe
+// State, win the §3.6.1 gen CAS, then CAS State -> SlotBusy and restamp Lease.
+// The slot is left claimed at SlotBusy, ready for the caller to publish a NEW
+// transaction on it. The responder that is still running its handler has now
+// definitively lost the slot.
+func replayHostTimeoutSteal(t *testing.T, hdr *SlotHeader) {
+	t.Helper()
+	genObserved := atomic.LoadUint64(&hdr.Gen)
+	observed := atomic.LoadUint32(&hdr.State)
+	if observed != SlotGuestBusy {
+		t.Fatalf("precondition: responder should own the slot at SlotGuestBusy, state=%d", observed)
+	}
+	if !atomic.CompareAndSwapUint64(&hdr.Gen, genObserved, genObserved+1) {
+		t.Fatal("host steal: Gen CAS lost")
+	}
+	if !atomic.CompareAndSwapUint32(&hdr.State, observed, SlotBusy) {
+		t.Fatalf("host steal: State CAS lost (observed=%d)", observed)
+	}
+	atomic.StoreUint64(&hdr.Lease, MonotonicNanos())
+}
+
+// TestGuestResponderSteal_NoHeaderWriteBeforeOwnership closes the hole
+// TestGuestResponderFastPath_HostTimeoutStealDoesNotCorrupt structurally cannot
+// see (see the SCOPE LIMIT note there).
+//
+// v0.8.14 sealed the *publish transition* (CAS SlotGuestBusy -> SlotRespReady)
+// but left the header-field writes that precede it unconditional:
+//
+//	respSize, respType := handler(...)
+//	header.RespSize = respSize   // <-- executed even after the slot was stolen
+//	header.MsgType  = respType   // <-- ditto
+//	publishResponse(...)         // CAS fails, response "dropped"
+//
+// After a host response timeout + zombie steal, those two stores land on the
+// STEALER's brand-new transaction. The publish CAS then fails and the response
+// bytes are correctly dropped — but the header is already poisoned. Because a
+// host slot is serviced by exactly one worker goroutine, the very same goroutine
+// then reads the poisoned header.MsgType in the next loop iteration and
+// dispatches txn#2 to the WRONG handler branch. msgSeq is untouched (the
+// responder never writes it), so the host's msgSeq guard validates and the
+// caller silently gets a wrong value.
+//
+// Per SPEC §3.5's disown-terminal lesson, assert the individual acts, not just
+// the final cell value: the request txn#2 is dispatched with must carry txn#2's
+// own msgType/reqSize/msgSeq, and RespSize must still hold the sentinel the
+// stealer left, proving the late responder wrote NOTHING.
+func TestGuestResponderSteal_NoHeaderWriteBeforeOwnership(t *testing.T) {
+	env := newFPHostSlotEnv(t, "FastPathStealHeaderWriteSHM")
+	defer env.cleanup()
+
+	const (
+		reqType1  = MsgTypeAppStart + 1 // txn#1 request type
+		respType1 = MsgTypeAppStart + 7 // txn#1 handler's RESPONSE type — the poison
+		reqType2  = MsgTypeAppStart + 2 // txn#2 request type
+	)
+	// A value no participant would ever legitimately write, so seeing it proves
+	// the late responder did not touch RespSize.
+	const respSizeSentinel = int32(-31337)
+
+	type dispatch struct {
+		msgType  MsgType
+		respSize int32
+		msgSeq   uint32
+		reqSize  int32
+		req      string
+	}
+	second := make(chan dispatch, 4)
+
+	release := make(chan struct{})
+	entered := make(chan struct{})
+	var firstCall int32
+	var firstReq []byte
+	env.client.Handle(func(req []byte, respBuf []byte, mt MsgType) (int32, MsgType) {
+		if atomic.CompareAndSwapInt32(&firstCall, 0, 1) {
+			firstReq = append([]byte(nil), req...)
+			close(entered)
+			<-release
+			copy(respBuf, firstReq)
+			return int32(len(firstReq)), respType1
+		}
+		// Snapshot the header EXACTLY as the worker handed this request over,
+		// before anything writes a response for it.
+		second <- dispatch{
+			msgType:  mt,
+			respSize: env.hdr.RespSize,
+			msgSeq:   env.hdr.MsgSeq,
+			reqSize:  env.hdr.ReqSize,
+			req:      string(req),
+		}
+		n := copy(respBuf, req)
+		return int32(n), mt
+	})
+	if err := env.client.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// Host publishes transaction #1 the way SlotAllocator does.
+	req1 := []byte("AAAA")
+	copy(env.reqBuf, req1)
+	env.hdr.ReqSize = int32(len(req1))
+	env.hdr.MsgType = reqType1
+	env.hdr.MsgSeq = 1
+	atomic.AddUint64(&env.hdr.Gen, 1)
+	atomic.StoreUint64(&env.hdr.Lease, MonotonicNanos())
+	atomic.StoreUint32(&env.hdr.State, SlotReqReady)
+	SignalEvent(env.hReq)
+
+	<-entered // worker is inside handler(txn#1), blocked
+
+	// responseTimeout elapses, then the host steals the abandoned slot.
+	replayHostTimeoutSteal(t, env.hdr)
+
+	// Transaction #2 on the recycled slot, with a DIFFERENT msgType so header
+	// poisoning is observable at all.
+	req2 := []byte("BBBB")
+	copy(env.reqBuf, req2)
+	env.hdr.ReqSize = int32(len(req2))
+	env.hdr.MsgType = reqType2
+	env.hdr.MsgSeq = 2
+	env.hdr.RespSize = respSizeSentinel
+	atomic.StoreUint32(&env.hdr.State, SlotReqReady)
+	SignalEvent(env.hReq)
+
+	close(release) // handler#1 returns; its late publish must write nothing
+
+	var d dispatch
+	select {
+	case d = <-second:
+	case <-time.After(3 * time.Second):
+		t.Fatal("txn#2 was never dispatched to the handler")
+	}
+
+	if d.msgType != reqType2 {
+		t.Errorf("txn#2 dispatched with msgType=%d, want %d: the late responder overwrote header.MsgType before proving ownership%s",
+			d.msgType, reqType2, msgTypeHint(d.msgType, respType1))
+	}
+	if d.respSize != respSizeSentinel {
+		t.Errorf("header.RespSize=%d at txn#2 dispatch, want sentinel %d: the late responder overwrote header.RespSize before proving ownership",
+			d.respSize, respSizeSentinel)
+	}
+	if d.msgSeq != 2 {
+		t.Errorf("header.MsgSeq=%d at txn#2 dispatch, want 2", d.msgSeq)
+	}
+	if d.reqSize != int32(len(req2)) {
+		t.Errorf("header.ReqSize=%d at txn#2 dispatch, want %d", d.reqSize, len(req2))
+	}
+	if d.req != string(req2) {
+		t.Errorf("txn#2 dispatched with req=%q, want %q", d.req, req2)
+	}
+
+	if !waitForStateEq(env.hdr, SlotRespReady, 3*time.Second) {
+		t.Fatal("txn#2 never received a response")
+	}
+	if env.hdr.MsgSeq != 2 {
+		t.Fatalf("MsgSeq=%d want 2 (responder does not rewrite msgSeq)", env.hdr.MsgSeq)
+	}
+	if env.hdr.MsgType != reqType2 {
+		t.Fatalf("response MsgType=%d want %d (echo of txn#2's own type)", env.hdr.MsgType, reqType2)
+	}
+	if env.hdr.RespSize != int32(len(req2)) {
+		t.Fatalf("response RespSize=%d want %d", env.hdr.RespSize, len(req2))
+	}
+	if got := string(env.respBuf[:env.hdr.RespSize]); got != string(req2) {
+		t.Fatalf("txn#2 response mismatch: got %q want %q", got, req2)
+	}
+}
+
+func msgTypeHint(got, poison MsgType) string {
+	if got == poison {
+		return " (it is txn#1's response type verbatim)"
+	}
+	return ""
+}
+
+// TestGuestResponderPanic_DoesNotStampErrorOnStolenSlot covers the panic-
+// recovery mirror of the same defect.
+//
+// workerLoop's recover() used to accept `state == SlotReqReady` as "we still
+// hold the slot" and stamp MsgType=SYSTEM_ERROR + RespSize=0 on it, publishing
+// with CAS(observed -> SlotRespReady). But the worker CAS-claims
+// SlotReqReady -> SlotGuestBusy BEFORE it touches anything, so observing
+// SlotReqReady at panic time means the slot was stolen after a host response
+// timeout and REPUBLISHED under a different transaction. The CAS then SUCCEEDS
+// and completes, as a system error, a request that was never executed — and the
+// handler is never invoked for it at all.
+//
+// Only SlotGuestBusy proves ownership, so that is the sole state the recovery
+// may publish from.
+func TestGuestResponderPanic_DoesNotStampErrorOnStolenSlot(t *testing.T) {
+	env := newFPHostSlotEnv(t, "FastPathPanicStealSHM")
+	defer env.cleanup()
+
+	const reqType2 = MsgTypeAppStart + 2
+
+	second := make(chan MsgType, 4)
+	release := make(chan struct{})
+	entered := make(chan struct{})
+	var firstCall int32
+	env.client.Handle(func(req []byte, respBuf []byte, mt MsgType) (int32, MsgType) {
+		if atomic.CompareAndSwapInt32(&firstCall, 0, 1) {
+			close(entered)
+			<-release
+			panic("simulated handler panic, raised after the slot was stolen")
+		}
+		second <- mt
+		n := copy(respBuf, req)
+		return int32(n), mt
+	})
+	if err := env.client.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	req1 := []byte("AAAA")
+	copy(env.reqBuf, req1)
+	env.hdr.ReqSize = int32(len(req1))
+	env.hdr.MsgType = MsgTypeNormal
+	env.hdr.MsgSeq = 1
+	atomic.AddUint64(&env.hdr.Gen, 1)
+	atomic.StoreUint64(&env.hdr.Lease, MonotonicNanos())
+	atomic.StoreUint32(&env.hdr.State, SlotReqReady)
+	SignalEvent(env.hReq)
+
+	<-entered // worker is inside handler(txn#1), about to panic
+
+	replayHostTimeoutSteal(t, env.hdr)
+
+	req2 := []byte("BBBB")
+	copy(env.reqBuf, req2)
+	env.hdr.ReqSize = int32(len(req2))
+	env.hdr.MsgType = reqType2
+	env.hdr.MsgSeq = 2
+	env.hdr.RespSize = -31337
+	atomic.StoreUint32(&env.hdr.HostState, HostStateWaiting)
+	atomic.StoreUint32(&env.hdr.State, SlotReqReady)
+	SignalEvent(env.hReq)
+
+	close(release) // handler#1 panics now
+
+	// The panic recovery must leave txn#2 alone, so the restarted worker picks
+	// it up and the handler runs for it. This is the load-bearing assertion:
+	// a recovery that stamps SYSTEM_ERROR completes txn#2 without ever calling
+	// the handler, so this channel stays empty.
+	select {
+	case mt := <-second:
+		if mt != reqType2 {
+			t.Fatalf("txn#2 dispatched with msgType=%d want %d", mt, reqType2)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("txn#2 was never dispatched: the panic recovery published a response (state=%d, MsgType=%d, RespSize=%d) for a request that never ran",
+			atomic.LoadUint32(&env.hdr.State), env.hdr.MsgType, env.hdr.RespSize)
+	}
+
+	if !waitForStateEq(env.hdr, SlotRespReady, 3*time.Second) {
+		t.Fatal("txn#2 never received a response")
+	}
+	if env.hdr.MsgType == MsgTypeSystemError {
+		t.Fatalf("SYSTEM_ERROR was stamped on txn#2, which the panicking handler never processed")
+	}
+	if env.hdr.MsgSeq != 2 {
+		t.Fatalf("MsgSeq=%d want 2", env.hdr.MsgSeq)
+	}
+	if env.hdr.RespSize != int32(len(req2)) {
+		t.Fatalf("RespSize=%d want %d", env.hdr.RespSize, len(req2))
+	}
+	if got := string(env.respBuf[:env.hdr.RespSize]); got != string(req2) {
+		t.Fatalf("txn#2 response mismatch: got %q want %q", got, req2)
+	}
+}
+
+// TestGuestResponderTwoPhasePublish_RingsDoorbell is the no-regression guard for
+// the two-phase publish (SlotGuestBusy -> SlotDone -> SlotRespReady): the
+// transient SlotDone lock must not swallow the §4.2 doorbell. The mock host
+// publishes hostState=WAITING and then parks on the response event ONLY — no
+// state polling — so the test hangs if the publish stops signalling. It also
+// pins that the host never has to know about SlotDone: it observes exactly
+// SlotRespReady, as before.
+func TestGuestResponderTwoPhasePublish_RingsDoorbell(t *testing.T) {
+	env := newFPHostSlotEnv(t, "FastPathTwoPhaseDoorbellSHM")
+	defer env.cleanup()
+
+	env.client.Handle(func(req []byte, respBuf []byte, mt MsgType) (int32, MsgType) {
+		n := copy(respBuf, req)
+		return int32(n), mt
+	})
+	if err := env.client.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	for round := 0; round < 3; round++ {
+		payload := []byte(fmt.Sprintf("ding-%d", round))
+		copy(env.reqBuf, payload)
+		env.hdr.ReqSize = int32(len(payload))
+		env.hdr.MsgType = MsgTypeNormal
+		env.hdr.MsgSeq = uint32(round + 1)
+		env.hdr.RespSize = -1
+
+		// Drain any latched signal so this round's waiter can only be woken by
+		// this round's publish (the response event is auto-reset).
+		WaitForEvent(env.hResp, 0)
+		woke := make(chan struct{})
+		go func() {
+			WaitForEvent(env.hResp, 3000)
+			close(woke)
+		}()
+
+		// Publish hostState=WAITING before the request so the responder is
+		// guaranteed to observe it and take the signalling branch.
+		atomic.StoreUint32(&env.hdr.HostState, HostStateWaiting)
+		atomic.AddUint64(&env.hdr.Gen, 1)
+		atomic.StoreUint64(&env.hdr.Lease, MonotonicNanos())
+		atomic.StoreUint32(&env.hdr.State, SlotReqReady)
+		SignalEvent(env.hReq)
+
+		if !waitForStateEq(env.hdr, SlotRespReady, 3*time.Second) {
+			t.Fatalf("round %d: no response (state=%d) — the two-phase publish never reached SlotRespReady",
+				round, atomic.LoadUint32(&env.hdr.State))
+		}
+		select {
+		case <-woke:
+		case <-time.After(1500 * time.Millisecond):
+			t.Fatalf("round %d: response published but the doorbell was never rung — the two-phase publish dropped the SetEvent", round)
+		}
+		atomic.StoreUint32(&env.hdr.HostState, HostStateActive)
+
+		if env.hdr.RespSize != int32(len(payload)) {
+			t.Fatalf("round %d: RespSize=%d want %d", round, env.hdr.RespSize, len(payload))
+		}
+		if got := string(env.respBuf[:env.hdr.RespSize]); got != string(payload) {
+			t.Fatalf("round %d: echo mismatch: got %q want %q", round, got, payload)
+		}
+		atomic.StoreUint32(&env.hdr.State, SlotFree)
 	}
 }

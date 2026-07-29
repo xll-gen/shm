@@ -44,6 +44,13 @@ private:
         uint64_t totalSize;
         uint32_t totalChunks;
         uint32_t receivedChunks;
+        // Running Sum(payloadSize) over every chunk index accepted so far, in
+        // whatever order they arrived. This is what the SPEC §3.3.4 per-chunk
+        // overflow guard bounds by totalSize: without it, a peer that advertises
+        // a tiny totalSize and then sends only out-of-order indices has every
+        // payload stored, and the byte-sum is not questioned until the
+        // completion assembly loop — i.e. after all of the bytes are resident.
+        uint64_t receivedBytes;
         std::vector<std::vector<uint8_t>> chunks;
         // Per-index presence flag. Mirrors Go's nil-vs-non-nil sentinel
         // (go/stream.go: chunks[i]==nil means "not yet received"): an empty
@@ -143,6 +150,7 @@ public:
             ctx.totalSize = header->totalSize;
             ctx.totalChunks = header->totalChunks;
             ctx.receivedChunks = 0;
+            ctx.receivedBytes = 0;
             ctx.startTime = std::chrono::steady_clock::now();
 
             try {
@@ -200,6 +208,19 @@ public:
                 return true;
             }
 
+            // Per-chunk overflow guard (SPEC §3.3.4), applied BEFORE the payload
+            // is copied so an over-advertised stream never becomes resident.
+            // The check is order-independent: it counts every accepted chunk,
+            // including ones buffered while an earlier index is still missing.
+            // Matches go/stream.go's streamContext.fits (offset+oooBytes).
+            if (ctx.receivedBytes + static_cast<uint64_t>(header->payloadSize) >
+                ctx.totalSize) {
+                streams.erase(it);
+                msgType = MsgType::SYSTEM_ERROR;
+                respSize = 0;
+                return true;
+            }
+
             const uint8_t* payloadPtr = static_cast<const uint8_t*>(req) + sizeof(ChunkHeader);
             try {
                 ctx.chunks[header->chunkIndex].assign(payloadPtr, payloadPtr + header->payloadSize);
@@ -211,14 +232,19 @@ public:
 
             ctx.seen[header->chunkIndex] = true;
             ctx.receivedChunks++;
+            ctx.receivedBytes += header->payloadSize;
 
             if (ctx.receivedChunks == ctx.totalChunks) {
-                // Assemble with strict completion validation (SPEC §3.3.4):
-                // the assembled byte count must equal the advertised totalSize.
-                // (a) A per-chunk overflow guard rejects a running length that
-                // would exceed totalSize. (b) After all chunks, the total must
-                // equal totalSize exactly, else the stream is dropped rather
-                // than delivered truncated/garbled.
+                // Completion validation (SPEC §3.3.4): the assembled byte count
+                // must equal the advertised totalSize, else the stream is
+                // dropped rather than delivered truncated/garbled. That
+                // equality check below is the load-bearing one here — it is what
+                // catches an UNDER-sized stream, which no per-chunk guard can
+                // see. The `> ctx.totalSize` bound inside the loop cannot fire:
+                // the arrival-time receivedBytes guard above already rejected
+                // any stream that exceeded totalSize, and Sum(chunk.size()) ==
+                // receivedBytes. It is kept as a cheap invariant re-assert over
+                // peer-supplied lengths on the wire path.
                 std::vector<uint8_t> fullData;
                 try {
                     fullData.reserve(ctx.totalSize);

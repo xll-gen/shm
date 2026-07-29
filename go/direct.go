@@ -25,9 +25,11 @@ const (
 	SlotReqReady = 1
 	// SlotRespReady indicates the Guest has written a response and it is ready for the Host.
 	SlotRespReady = 2
-	// SlotDone is a transient state indicating transaction completion.
-	// SLOT_DONE = 3 (reserved; not currently used by the protocol but
-	// retained for future flow extensions).
+	// SlotDone is the responder's transient publish lock (post-v0.8.16, SPEC §3.4
+	// responder publish rule): a responder that owns a slot moves it here
+	// before writing any header field and on to SlotRespReady to publish. It is
+	// deliberately outside the zombie-steal set {REQ_READY, RESP_READY,
+	// GUEST_BUSY}, so a slot parked here cannot be stolen mid-publish.
 	SlotDone = 3
 	// SlotBusy indicates the Host has claimed the slot and is writing data.
 	SlotBusy = 4
@@ -1146,22 +1148,28 @@ func (g *DirectGuest) workerLoop(idx int, handler func([]byte, []byte, MsgType) 
 					slot := &g.slots[idx]
 					header := slot.header
 
-					// Check if state implies we are holding the slot
-					state := atomic.LoadUint32(&header.State)
-					if state == SlotReqReady || state == SlotGuestBusy {
+					// SlotGuestBusy is the ONLY state that proves we still own
+					// the slot. The worker CAS-claims SlotReqReady ->
+					// SlotGuestBusy before it touches anything, so observing
+					// SlotReqReady here does not mean "we were interrupted
+					// before processing" — it means the host timed out, its
+					// zombie steal recycled the slot (SlotGuestBusy -> SlotBusy
+					// -> SlotReqReady) and republished it under a NEW
+					// transaction. Accepting SlotReqReady (up to v0.8.16) made the
+					// publish CAS below succeed against that transaction and
+					// completed, as a system error, a request that was never
+					// executed.
+					if atomic.LoadUint32(&header.State) == SlotGuestBusy {
 						// We failed during processing. Host is likely waiting.
 						// Mark the response as a SYSTEM_ERROR: RespSize=0 with
 						// the request's MsgType intact would read as a
-						// successful empty response on the host side.
-						header.MsgType = MsgTypeSystemError
-						header.RespSize = 0
-						// CAS from the observed owned state, never a blind
-						// store — see publishResponse. A slot the host already
-						// stole must not receive our error publish.
-						if atomic.CompareAndSwapUint32(&header.State, state, SlotRespReady) {
-							SignalEvent(slot.respEvent)
-						} else {
-							Error("Panic error-response dropped: slot no longer owned", "worker", idx)
+						// successful empty response on the host side. Ownership
+						// is locked FIRST (see lockForPublish) so a stolen slot
+						// never receives these header writes.
+						if lockForPublish(slot, idx) {
+							header.MsgType = MsgTypeSystemError
+							header.RespSize = 0
+							publishResponse(slot, idx)
 						}
 					}
 				}
@@ -1176,8 +1184,10 @@ func (g *DirectGuest) workerLoop(idx int, handler func([]byte, []byte, MsgType) 
 	}
 }
 
-// publishResponse completes a Direct-Exchange transaction on a host slot the
-// responder owns at SlotGuestBusy (SPEC §3.4 step 5).
+// lockForPublish is phase 1 of the two-phase responder publish (SPEC §3.4
+// step 5): it converts the responder's claim on a host slot into an exclusive
+// *publish lock* by CAS'ing SlotGuestBusy → SlotDone. Callers MUST NOT write a
+// single header field until this returns true.
 //
 // The transition is a CAS, never a blind store. The responder's ownership of a
 // host slot is not eternal: on a host-side response timeout the host disowns
@@ -1196,11 +1206,52 @@ func (g *DirectGuest) workerLoop(idx int, handler func([]byte, []byte, MsgType) 
 // transaction stays intact and is served by the next loop iteration) and let
 // the original requester's own timeout report the failure.
 //
+// Why the lock is a *separate* transition (post-v0.8.16). v0.8.14 sealed only the
+// publishing transition and left the RespSize/MsgType stores that precede it
+// unconditional. After a steal those stores landed on the stealer's new
+// transaction; the publish CAS then failed and the response bytes were dropped,
+// but the header was already poisoned, and since each host slot is serviced by
+// exactly one worker goroutine that same goroutine deterministically re-read the
+// poisoned MsgType on its next iteration and dispatched the new request to the
+// wrong branch (silent wrong value, invisible to the msgSeq guard). Proving
+// ownership before the first header write is the only fix.
+//
+// SlotDone (3) is the lock state because it is outside tryClaimSlot's zombie-
+// steal set {REQ_READY, RESP_READY, GUEST_BUSY} (SlotAllocator.h) — a slot
+// parked there cannot be stolen out from under the publish — and because no
+// other transition in the protocol produces or consumes it. The window is two
+// atomic ops wide and is wire/ABI-neutral: the host only ever waits on
+// SlotRespReady.
+//
+// Returns true if the slot is locked for publishing and the header may be
+// written.
+func lockForPublish(slot *slotContext, idx int) bool {
+	header := slot.header
+	if !atomic.CompareAndSwapUint32(&header.State, SlotGuestBusy, SlotDone) {
+		Error("Response dropped: slot was stolen while the handler ran",
+			"worker", idx, "state", atomic.LoadUint32(&header.State))
+		return false
+	}
+	return true
+}
+
+// publishResponse is phase 2 of the responder publish: SlotDone →
+// SlotRespReady. Only the holder of the publish lock can be at SlotDone, so
+// this CAS cannot legitimately fail; a failure means an invariant was violated
+// (someone else wrote State while we held the lock) and is logged as such
+// rather than silently ignored.
+//
+// The CAS is seq_cst (Go's sync/atomic is sequentially consistent), which the
+// §4.2 doorbell Dekker depends on: the host stores hostState=WAITING (seq_cst)
+// and re-checks State before parking, so a seq_cst RESP_READY publish followed
+// by a seq_cst hostState load can never both miss. A spinning host costs no
+// SetEvent syscall.
+//
 // Returns true if the response was published.
 func publishResponse(slot *slotContext, idx int) bool {
 	header := slot.header
-	if !atomic.CompareAndSwapUint32(&header.State, SlotGuestBusy, SlotRespReady) {
-		Error("Response dropped: slot was stolen while the handler ran",
+	if !atomic.CompareAndSwapUint32(&header.State, SlotDone, SlotRespReady) {
+		Error("Invariant violation: publish lock lost between SlotDone and the RESP_READY publish",
 			"worker", idx, "state", atomic.LoadUint32(&header.State))
 		return false
 	}
@@ -1243,8 +1294,8 @@ func (g *DirectGuest) workerLoopInternal(idx int, handler func([]byte, []byte, M
 		if ready {
 			// Consume-claim (BOTH paths, v0.8.14). The responder must own the
 			// slot in SlotGuestBusy — a state the *next* transaction can never
-			// re-enter — before it runs the handler, so that the RESP_READY
-			// publish below can be an airtight CAS. See publishResponse.
+			// re-enter — before it runs the handler, so that the publish lock
+			// below can be an airtight CAS. See lockForPublish.
 			//
 			// v0.8.8 let the fast path process while State stayed REQ_READY and
 			// publish with a blind store. That is unsafe once a host response
@@ -1278,14 +1329,24 @@ func (g *DirectGuest) workerLoopInternal(idx int, handler func([]byte, []byte, M
 				atomic.StoreUint64(&header.Lease, MonotonicNanos())
 			}
 
+			// Every response-producing branch below follows the same two-phase
+			// order (§3.4 responder publish rule): compute the response
+			// metadata into locals, take the publish lock, and only then write
+			// header fields. A branch whose lockForPublish fails must write
+			// NOTHING — the slot now belongs to somebody else's transaction.
 			msgType := header.MsgType
 			if msgType == MsgTypeShutdown {
-				header.RespSize = 0
-				publishResponse(slot, idx)
+				if lockForPublish(slot, idx) {
+					header.RespSize = 0
+					publishResponse(slot, idx)
+				}
 				return false
 			}
 
 			if msgType == MsgTypeHeartbeatReq {
+				if !lockForPublish(slot, idx) {
+					continue
+				}
 				header.MsgType = MsgTypeHeartbeatResp
 				header.RespSize = 0
 			} else {
@@ -1294,18 +1355,22 @@ func (g *DirectGuest) workerLoopInternal(idx int, handler func([]byte, []byte, M
 
 				if reqSize >= 0 {
 					if reqSize > int32(len(slot.reqBuffer)) {
-						header.RespSize = 0
-						header.MsgType = MsgTypeSystemError
-						publishResponse(slot, idx)
+						if lockForPublish(slot, idx) {
+							header.RespSize = 0
+							header.MsgType = MsgTypeSystemError
+							publishResponse(slot, idx)
+						}
 						continue
 					}
 					reqData = slot.reqBuffer[:reqSize]
 				} else {
 					rLen := -reqSize
 					if rLen < 0 || rLen > int32(len(slot.reqBuffer)) {
-						header.RespSize = 0
-						header.MsgType = MsgTypeSystemError
-						publishResponse(slot, idx)
+						if lockForPublish(slot, idx) {
+							header.RespSize = 0
+							header.MsgType = MsgTypeSystemError
+							publishResponse(slot, idx)
+						}
 						continue
 					}
 					offset := int32(len(slot.reqBuffer)) - rLen
@@ -1313,6 +1378,9 @@ func (g *DirectGuest) workerLoopInternal(idx int, handler func([]byte, []byte, M
 				}
 
 				respSize, respType := handler(reqData, slot.respBuffer, msgType)
+				if !lockForPublish(slot, idx) {
+					continue
+				}
 				header.RespSize = respSize
 				header.MsgType = respType
 			}

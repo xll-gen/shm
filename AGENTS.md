@@ -173,6 +173,39 @@ flagged by past reviews and confirmed correct — do not "fix" or re-propose:
   SPECIFICATION.md §4.4.
 * The **header-only** C++ library structure is a design decision (see Project
   Structure) — no `.cpp` files for library logic.
+* **`SLOT_GUEST_BUSY` stays in the zombie-steal set** (`SlotAllocator::tryClaimSlot`,
+  the `{SLOT_REQ_READY, SLOT_RESP_READY, SLOT_GUEST_BUSY}` branch). A 2026-07-29
+  review proposed removing it to fix the responder header-write defect; the
+  proposal was **rejected**. `SPECIFICATION.md` §3.4 codifies stealability of
+  `SLOT_GUEST_BUSY` as a *design premise* — it is what makes the responder's
+  consume-claim CAS an ownership token rather than reclaim machinery — and
+  narrowing the set would change Host slot-recovery semantics. The real defect
+  was narrower (writing header fields before proving ownership) and is fixed by
+  the two-phase publish below. Do not re-propose narrowing the steal set.
+* **`SLOT_DONE = 3` is the responder's publish lock, no longer "reserved".** Both
+  sides produce and consume it: a responder that owns a slot CAS's
+  `owned → SLOT_DONE`, writes `respSize`/`msgType`, then CAS's
+  `SLOT_DONE → SLOT_RESP_READY` (seq_cst, for the §4.2 Dekker). It works as a
+  lock *only* because it is outside the zombie-steal set — do not add it there,
+  and do not "simplify" the two phases back into one. See `SPECIFICATION.md`
+  §3.1/§3.4/§3.5 and the note below on the historical v0.6.0 annotation.
+* **The stream reassemblers' received-byte counters are the §3.3.4 memory bound,
+  not bookkeeping** (2026-07-29). Go `streamContext.oooBytes` + `fits()`
+  (`go/stream.go`) and C++ `StreamContext::receivedBytes`
+  (`include/shm/StreamReassembler.h`) exist so the per-chunk overflow guard
+  covers chunks that arrive **ahead of the in-order cursor**. Before they
+  existed, only the in-order branch consulted `totalSize`, so an untrusted peer
+  could advertise `totalSize = 1`, park unbounded bytes under out-of-order
+  indices, and only be refused once the gap filled — after every byte was
+  resident. Three parts are load-bearing and must move together: (a) the check
+  runs **before** the payload copy/`assign`, not after; (b) it counts parked
+  bytes, so `offset + oooBytes` is the running received length; (c) the drain
+  loop releases `oooBytes` for a parked chunk **before** consuming it, or a
+  well-formed out-of-order stream is rejected as over-sized. Do not "simplify"
+  the guard back onto the in-order path only, and do not move it after the copy
+  "since we reject anyway" — the point is *when* the rejection happens.
+  Regression: `go/stream_ooo_guard_test.go`,
+  `tests/test_reassembler_ooo_overflow.cpp`.
 * `go/race_annotate_on.go` / `race_annotate_off.go` are **not dead code and not
   synchronization** (2026-07-26). Slot ownership is handed over through the
   atomics on `SlotHeader.State`, which lives in the file-mapped region. Go's
@@ -297,7 +330,7 @@ The shm-protocol-guardian audit findings of 2026-05-16 have been addressed:
 * `alignas(64)` added to C++ `SlotHeader`; `static_assert`s added for `SlotHeader` (128 bytes), `ExchangeHeader` (64 bytes), and `StreamHeader` (24 bytes).
 * Go-side compile-time size assertions added for `SlotHeader`, `ExchangeHeader`, `StreamHeader`, `ChunkHeader`.
 * SPECIFICATION.md §4.4 "Memory Ordering Contract" added — codifies release/acquire pairing on the `state` field.
-* `SLOT_DONE = 3` annotated as reserved-for-future-extensions in C++, Go, and SPECIFICATION.md §3.1.
+* `SLOT_DONE = 3` annotated as reserved-for-future-extensions in C++, Go, and SPECIFICATION.md §3.1. **Superseded (2026-07-29):** `SLOT_DONE` is now the responder's publish-lock state — see "Confirmed-Correct Decisions" above and SPECIFICATION.md §3.1/§3.4/§3.5. The constant is no longer reserved.
 * CHANGELOG.md v0.6.0 entry augmented.
 * ChunkHeader C++ side padded to 24 bytes — cross-language parity restored. static_assert added. SPECIFICATION.md §3.3.2 was already canonical.
 
