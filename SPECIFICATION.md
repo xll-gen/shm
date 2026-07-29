@@ -156,15 +156,18 @@ The `reqSize` and `respSize` fields indicate the location of the data within the
 
 A reassembler accepts `StreamHeader`/`ChunkHeader` messages from an untrusted peer. The wire layout (§3.3.1/§3.3.2) is the only thing the peer controls, so corrupt or malicious values MUST NOT drive unbounded allocation, silent truncation, or mis-delivery. Both the C++ Host (`StreamReassembler`) and the Go Guest (`NewStreamReassembler`) implement the **identical** contract below; a stream accepted by one peer is accepted by the other, and a stream rejected by one is rejected by the other.
 
-**Bounds (checked at `STREAM_START`, before any allocation).** A `StreamHeader` violating any bound MUST be rejected with `MSG_TYPE_SYSTEM_ERROR`:
+**Bounds.** The first two are header bounds, checked at `STREAM_START` before any allocation: a `StreamHeader` violating either MUST be rejected with `MSG_TYPE_SYSTEM_ERROR`. The last two bound in-flight reassembly state and are enforced where their own clauses below say:
 
 | Bound | Value | Field guarded |
 | :--- | :--- | :--- |
 | `maxStreamSize` | `1 << 30` (1 GiB) | `totalSize` |
 | `maxStreamChunks` | `1 << 20` | `totalChunks` |
 | `maxConcurrentStreams` | `1024` | number of in-flight (partially reassembled) streams |
+| `maxParkedChunks` | `1024` (= `maxStreamChunks / maxConcurrentStreams`) | number of chunks one stream may hold buffered ahead of its in-order cursor |
 
-`totalChunks` MUST be validated **before** sizing the per-chunk slice/vector so an oversized header cannot trigger a giant allocation.
+`totalChunks` MUST be validated **before** any allocation is sized, and it MUST NOT itself size an allocation: see "Residency bound" below.
+
+**Residency bound (MUST).** Per-stream reassembly state MUST be `O(totalSize)` — the advertised size — plus the bounded parked-chunk bookkeeping below. It MUST NOT be `O(totalChunks)`. An implementation that indexes a `totalChunks`-sized array (one element per chunk, a presence bitmap, etc.) violates this clause: `totalChunks` and `totalSize` are independent header fields, so a peer advertising `totalSize = 1` with `totalChunks = maxStreamChunks` would commit per-chunk overhead × 2^20 for a one-byte stream (measured ~24 MiB per stream, ~25 GiB at `maxConcurrentStreams`), which no payload-byte guard can see. Both peers therefore preallocate a destination buffer of `totalSize` at `STREAM_START`, copy in-order chunks straight into it at a running cursor, and buffer **only** ahead-of-cursor chunks, sparsely (`go/stream.go`: `streamContext.buf` / `ooo`; `include/shm/StreamReassembler.h`: `StreamContext::buf` / `ooo`). Peak residency for a completing stream is likewise bounded by `totalSize`: assembling into a second full-size buffer at completion time (`2 × totalSize`, i.e. 2 GiB for a 1 GiB stream) is not permitted.
 
 **Completion contract.** A stream completes — and the `onStream` callback fires exactly once — only when **both**:
 1. `received == totalChunks` (every chunk index filled exactly once), and
@@ -174,7 +177,27 @@ If all chunks have arrived but `Σ payloadSize != totalSize`, the stream is **dr
 
 **Per-chunk overflow guard (order-independent, MUST).** On every `STREAM_CHUNK`, and **before** the payload is copied or buffered anywhere, the reassembler MUST compute the running *received* length — `Σ payloadSize` over every chunk index accepted so far — and reject the message with `MSG_TYPE_SYSTEM_ERROR`, dropping the stream, if accepting this chunk would make that sum exceed `totalSize`. The running length MUST include chunks that arrived **ahead of the in-order cursor** and are still buffered while an earlier index is missing; an implementation that applies the guard only to the in-order path does not satisfy this clause. Such an implementation lets a peer advertise a tiny `totalSize`, then park unbounded bytes under out-of-order indices — the completion check above would eventually reject the stream, but only once every byte was already resident, which is precisely the unbounded allocation this section forbids. Rejection MUST therefore happen at arrival time, not at completion time. This bounds reassembly memory for any single stream to `totalSize`, and — combined with `maxConcurrentStreams` below — total reassembly memory to `maxConcurrentStreams × maxStreamSize`.
 
-The guard is a strict `>` comparison: a chunk that exactly fills the remaining advertised space is valid and MUST be accepted. Implementations that assemble into a preallocated destination at an in-order cursor MUST account for buffered out-of-order bytes separately and release that accounting exactly when those bytes are moved into the destination, or a well-formed out-of-order stream will be rejected as over-sized (`go/stream.go`: `streamContext.oooBytes` / `fits`; `include/shm/StreamReassembler.h`: `StreamContext::receivedBytes`).
+The guard is a strict `>` comparison: a chunk that exactly fills the remaining advertised space is valid and MUST be accepted. Implementations that assemble into a preallocated destination at an in-order cursor MUST account for buffered out-of-order bytes separately and release that accounting exactly when those bytes are moved into the destination, or a well-formed out-of-order stream will be rejected as over-sized (`go/stream.go`: `streamContext.oooBytes` / `fits`; `include/shm/StreamReassembler.h`: `StreamContext::oooBytes` / `Fits`).
+
+**Parked-chunk bound (count dimension, MUST).** The byte guard above bounds *payload*; it cannot bound per-chunk bookkeeping, for two independent reasons: a buffered chunk costs memory even at zero payload, and a **zero-length chunk can never trip the byte guard** (`Σ payloadSize + 0 > totalSize` is false for any stream that is still alive). A reassembler MUST therefore also refuse, with `MSG_TYPE_SYSTEM_ERROR` and dropping the stream, an ahead-of-cursor chunk that would make the number of simultaneously buffered (parked) chunks for that stream exceed `maxParkedChunks`. The check MUST run **before** the parked copy is allocated. Without it a peer advertises `totalSize = 1` with `totalChunks = maxStreamChunks` and parks 2^20−1 zero-length chunks — measured at ~80 B per entry on the Go side, i.e. ~80 MiB resident for a stream that advertised one byte, times `maxConcurrentStreams`.
+
+`maxParkedChunks` is `maxStreamChunks / maxConcurrentStreams` (1024 with the values above): the bound that keeps the *aggregate* parked-entry count across all in-flight streams no larger than the chunk count of one maximal stream, i.e. ~64–80 MiB of bookkeeping worst case. It is far above any legitimate sender — `StreamSender` parks at most `maxInFlight − 1` chunks and the library default in-flight depth is 1 — but it does mean a stream delivered in strictly descending index order is only accepted while its chunk count stays within the bound. The value is part of this accept/reject contract, not a local tuning knob: changing it on one peer alone makes a stream that peer accepts get rejected by the other. Combined with the byte guard, per-stream residency is `totalSize` plus at most `maxParkedChunks` entries of bookkeeping, and total reassembly memory is bounded by `maxConcurrentStreams ×` that.
+
+**Which rejections drop the stream.** `MSG_TYPE_SYSTEM_ERROR` on a `STREAM_CHUNK` does not always retire the reassembly context, and the split is normative because a sender treats a chunk rejection as terminal for the whole stream (it never retries an index):
+
+| Rejection | Stream context |
+| :--- | :--- |
+| `reqSize` too small for `ChunkHeader`, or smaller than `ChunkHeader + payloadSize` | **kept** (framing is rejected before the stream is looked up; the stream may still complete from its other chunks) |
+| `chunkIndex >= totalChunks` | **kept** |
+| unknown / already-reclaimed `streamId` | n/a (nothing to drop) |
+| running-length overflow (byte guard) | **dropped** |
+| parked-chunk bound exceeded | **dropped** |
+| all indices filled but `Σ payloadSize != totalSize` | **dropped** |
+| the reassembler cannot store an accepted chunk (local allocation failure) | **dropped** |
+
+The last row is what makes the set complete: a context that could not absorb a chunk it had already accepted can never satisfy the completion contract, and since the sender will not retry, retaining it would only pin `totalSize` bytes until the reclaim mechanism below fires.
+
+**Duplicate chunk index (first arrival wins).** A `chunkIndex` that has already been filled — whether it is already assembled into the destination or still parked — is **ACK-ignored**: the reassembler answers `MSG_TYPE_NORMAL`, keeps the bytes it received first, and discards the duplicate without consulting its `payloadSize`. This holds even when the duplicate declares a *different* `payloadSize` than the first arrival: the duplicate gate runs **before** the running-length guard, so a duplicate declaring a huge length is neither counted against `totalSize` nor cause to drop the stream. Consequently `Σ payloadSize` in the completion contract is the sum over *first arrivals only*, and a peer cannot revise a chunk it has already sent.
 
 **Empty stream.** `totalChunks == 0` ⇔ `totalSize == 0`. A `STREAM_START` with `totalChunks == 0` and `totalSize != 0` (or vice versa) MUST be rejected with `MSG_TYPE_SYSTEM_ERROR`. A valid empty stream completes immediately at `STREAM_START` (callback fires once with empty data); no chunks follow.
 

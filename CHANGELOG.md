@@ -1,5 +1,110 @@
 # Changelog
 
+## [0.8.18] - 2026-07-29
+
+No wire-format/ABI change — `SHM_VERSION` is untouched, and `SlotHeader`,
+`ExchangeHeader`, `StreamHeader` and `ChunkHeader` keep their layouts. One
+**wire behavior** change is called out under "Parked-chunk bound" below.
+
+### Fixed
+
+- **`StreamStart` committed ~25 MB per stream regardless of the advertised
+  `totalSize`** (SPEC §3.3.4 "Residency bound"). The C++ reassembler sized its
+  reassembly state by `totalChunks`: `ctx.chunks.resize(totalChunks)` built one
+  `std::vector<uint8_t>` element per chunk plus a `std::vector<bool>` presence
+  bitmap. `totalChunks` and `totalSize` are **independent** header fields, so a
+  peer advertising `totalSize = 1` with the maximum `totalChunks` (2^20)
+  committed **25,355,264 bytes per stream** — measured, 8 streams at once — and
+  ~26 GB at `maxStreams` (1024). The v0.8.17 running-byte guard is blind to this
+  dimension by construction: the overhead exists at zero payload, and a
+  zero-length chunk can never trip a `Σ payloadSize > totalSize` test.
+  Tightening `totalChunks <= totalSize` was not an option — the SPEC allows
+  zero-length chunks, so the two dimensions are genuinely independent.
+
+  The C++ storage layout is now the Go one (`go/stream.go`): allocate a
+  destination buffer of exactly `totalSize` at `STREAM_START`, copy in-order
+  chunks straight into it at a running cursor, and park only ahead-of-cursor
+  chunks in a sparse map. No `totalChunks`-sized allocation exists. Measured per
+  stream for the case above: **25,355,264 → 0 bytes** (below the
+  `PrivateUsage` granularity). `include/shm/StreamReassembler.h`; regression
+  `tests/test_reassembler_tiny_stream_footprint.cpp`.
+
+  Two backlog items closed by the same rework:
+
+  - **Peak residency at completion was `2 × totalSize`.** Every chunk was copied
+    into its own vector and then concatenated into a second full-size buffer
+    while the per-chunk copies were still alive — 2 GiB for a 1 GiB stream, a
+    risk the Go reassembler never had. The destination is now handed to
+    `onStream` by move. Measured peak commit for a 64 MiB stream:
+    **2.013 × → 1.003 ×**. Regression
+    `tests/test_reassembler_completion_peak.cpp`.
+  - **Per-chunk heap allocation.** `chunks[idx].assign(...)` allocated and copied
+    once per chunk, and the completion concatenation copied every byte again.
+    In-order chunks are now copied once, into the destination; only
+    ahead-of-cursor chunks still take a parked copy.
+
+- **Parked-chunk bound: the count dimension of the same hazard** (SPEC §3.3.4
+  "Parked-chunk bound"). Sparse parking fixes the *array*, not the *entry count*:
+  a peer that floods zero-length chunks under ahead-of-cursor indices grows the
+  side map to `totalChunks` entries, and zero-length chunks pass the byte guard
+  by construction. **Both** peers had this exposure — the Go reassembler was
+  measured at 1,048,575 parked entries, **83,989,416 bytes (80.1 MiB) of live
+  heap, 0 rejections**, for a stream advertising 1 byte; the reworked C++ side at
+  65,712,128 bytes. Both now refuse an ahead-of-cursor chunk that would exceed
+  `maxParkedChunks` / `MaxParkedChunks` and drop the stream, with the check
+  running before the parked copy is allocated. Post-fix residency for the same
+  flood: **80.1 MiB → 0 bytes** (Go, live heap) and **62.7 MiB → 12,288 bytes**
+  (C++, private bytes).
+
+  The bound is `maxStreamChunks / maxConcurrentStreams` = **1024** on both sides:
+  the value that keeps the aggregate parked-entry count across all in-flight
+  streams no larger than the chunk count of one maximal stream (~64–80 MiB worst
+  case, vs. ~82 GB unbounded). `StreamSender` parks at most `maxInFlight - 1`
+  chunks and the default in-flight depth is 1, so legitimate senders have ~3
+  orders of magnitude of headroom.
+
+  **This is a wire behavior change**, the only one in this release: a stream
+  delivered in strictly descending index order with more than 1024 chunks was
+  previously accepted and is now rejected. It is symmetric across both peers and
+  normative in SPEC §3.3.4. `go/stream.go::park`,
+  `include/shm/StreamReassembler.h::StreamContext::Park`; regression
+  `go/stream_park_cap_test.go`, `tests/test_reassembler_park_cap.cpp`.
+
+- **A C++ chunk-path allocation failure left the stream in the map.** The
+  `catch (...)` around the per-chunk copy answered `SYSTEM_ERROR` without
+  `streams.erase(it)`, so the context stayed resident — with its state not
+  advanced — while every *other* error path in the same function (and the Go
+  guest, which retires a corrupt stream immediately) dropped it. The judgment,
+  now written into SPEC §3.3.4 as a table of which rejections drop the stream:
+  **drop**. Both senders treat a chunk `SYSTEM_ERROR` as terminal for the whole
+  stream and never retry an index (`Stream.h::StreamSender::Send`,
+  `go/stream_sender.go::sendChunk`), so no retry can ever arrive and the retained
+  context only pins `totalSize` bytes until the timeout prune.
+
+### Documentation
+
+- SPEC §3.3.4 gained four normative clauses that were previously implicit: the
+  residency bound (state sized by `totalSize`, never `totalChunks`; no `2 ×`
+  completion peak), the parked-chunk count bound, a table of **which chunk
+  rejections drop the stream** and which leave it completable (framing and
+  out-of-range rejections do not — both peers already behaved this way), and
+  **first-arrival-wins duplicate handling**. The last one is a pure
+  documentation gap: a duplicate `chunkIndex` is ACK-ignored without consulting
+  its `payloadSize`, so a duplicate declaring a *different* length is neither
+  counted against `totalSize` nor cause to drop the stream, because the dedup
+  gate precedes the overflow guard. Both peers already did this identically; no
+  code changed.
+
+### Testing
+
+- `tests/test_reassembler_parity_table.cpp` + `go/stream_parity_table_test.go`:
+  a 20-case accept/reject table whose case list **and** expected digests are
+  duplicated verbatim in both languages, so each side asserts against a constant
+  instead of against the other implementation's current behavior. Captured
+  against the pre-rework code first; all 20 digests are byte-identical
+  pre- and post-rework and identical across C++ and Go, which is what
+  demonstrates the storage rework did not move the accept/reject boundary.
+
 ## [0.8.17] - 2026-07-29
 
 No wire-protocol/ABI change — `SHM_VERSION` remains `0x00070000`, `SlotHeader`

@@ -253,12 +253,14 @@ int main() {
     }
 
     // ---- Zero-length chunk + duplicate: dedup by presence, not emptiness ----
-    // Mirrors go/stream.go's nil-vs-empty sentinel. A zero-length chunk0
-    // followed by a DUPLICATE zero-length chunk0 must be counted exactly once;
-    // the stream then completes when chunk1 arrives. With an emptiness-based
-    // sentinel the duplicate re-passes the gate, double-counts receivedChunks,
-    // forces premature assembly, and the stream is dropped (SYSTEM_ERROR) —
-    // diverging from Go, which accepts it. This case bites the presence-flag fix.
+    // Mirrors go/stream.go. A zero-length chunk0 followed by a DUPLICATE
+    // zero-length chunk0 must be counted exactly once; the stream then completes
+    // when chunk1 arrives. Any dedup marker that cannot distinguish "received,
+    // empty" from "not received" — an emptiness test over stored payloads —
+    // lets the duplicate re-pass the gate, double-counts the chunk, forces
+    // premature completion, and drops the stream (SYSTEM_ERROR), diverging from
+    // Go, which accepts it. Both sides therefore track presence explicitly: the
+    // cursor for assembled indices plus membership in the parked map.
     {
         int fired = 0;
         std::vector<uint8_t> got;

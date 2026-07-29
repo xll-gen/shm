@@ -59,6 +59,33 @@ const (
 	// bytes) forever. When a new StreamStart would exceed this bound, the
 	// least-recently-active in-flight stream is evicted.
 	MaxConcurrentStreams = 1024
+	// MaxParkedChunks bounds how many chunks one stream may hold parked ahead of
+	// its in-order cursor (streamContext.ooo).
+	//
+	// The SPEC §3.3.4 running-byte guard (fits/oooBytes) bounds the *payload* a
+	// stream can make resident by its advertised TotalSize. It cannot bound
+	// per-chunk bookkeeping, for two independent reasons: a parked entry costs
+	// memory at zero payload, and a zero-length chunk passes the byte guard by
+	// construction (offset+oooBytes+0 <= TotalSize holds for any live stream).
+	// Without a count bound, a peer advertises TotalSize = 1 with
+	// TotalChunks = MaxStreamChunks and parks 2^20-1 zero-length chunks —
+	// measured at 80.1 B/entry, i.e. 80 MiB of live heap for a stream that
+	// advertised one byte, times MaxConcurrentStreams.
+	//
+	// The value is derived as MaxStreamChunks / MaxConcurrentStreams, the bound
+	// that makes the *aggregate* parked-entry count across all in-flight streams
+	// no larger than the chunk count of a single maximal stream: 2^20 / 2^10 =
+	// 1024 entries per stream (~80 KiB) and ~80 MiB across 1024 streams. It
+	// leaves two orders of magnitude of headroom over any legitimate sender —
+	// StreamSender parks at most maxInFlight-1 chunks, and the library default
+	// in-flight depth is 1.
+	//
+	// The C++ reassembler carries the same bound with the same default
+	// (include/shm/StreamReassembler.h: StreamReassemblerConfig::
+	// maxParkedChunks). It is part of the §3.3.4 accept/reject parity contract,
+	// not a local tuning knob: changing it on one side alone makes a stream that
+	// one peer accepts get rejected by the other.
+	MaxParkedChunks = MaxStreamChunks / MaxConcurrentStreams
 )
 
 // DefaultStreamTimeout bounds how long a partially-reassembled stream may sit
@@ -172,12 +199,19 @@ func (c *streamContext) consume(data []byte) bool {
 	return true
 }
 
-// park buffers a chunk that arrived ahead of the in-order cursor. The overflow
-// guard runs BEFORE the copy is allocated, so an over-advertised stream is
-// rejected at arrival time instead of after all of its bytes are resident.
-// Returns false if the guard trips. Must be called under c.mu.
+// park buffers a chunk that arrived ahead of the in-order cursor. Both guards
+// run BEFORE the copy is allocated, so an over-advertised or over-fragmented
+// stream is rejected at arrival time instead of after all of its bytes (or all
+// of its map entries) are resident. Returns false if either guard trips; the
+// caller must then drop the stream. Must be called under c.mu.
 func (c *streamContext) park(index uint32, data []byte) bool {
 	if !c.fits(len(data)) {
+		return false
+	}
+	// Count bound (SPEC §3.3.4). Independent of fits: parked-entry overhead
+	// exists at zero payload, and a zero-length chunk can never trip the byte
+	// guard. See MaxParkedChunks.
+	if len(c.ooo) >= MaxParkedChunks {
 		return false
 	}
 	if c.ooo == nil {

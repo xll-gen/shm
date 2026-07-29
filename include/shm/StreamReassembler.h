@@ -16,12 +16,39 @@ namespace shm {
  */
 struct StreamReassemblerConfig {
     // Reassembly bounds. These defaults match the Go reference reassembler
-    // (go/stream.go: MaxStreamSize / MaxStreamChunks / MaxConcurrentStreams)
-    // and the SPECIFICATION.md §3.3.4 Reassembly Limits & Completion Contract.
-    // A stream accepted by one peer must be accepted by the other.
+    // (go/stream.go: MaxStreamSize / MaxStreamChunks / MaxConcurrentStreams /
+    // MaxParkedChunks) and the SPECIFICATION.md §3.3.4 Reassembly Limits &
+    // Completion Contract. A stream accepted by one peer must be accepted by
+    // the other.
     size_t maxStreamSize = 1 << 30;   // 1 GiB (bounds StreamHeader::totalSize)
     size_t maxStreamChunks = 1 << 20; // bounds StreamHeader::totalChunks
     size_t maxStreams = 1024;         // max concurrent in-flight streams
+    /**
+     * @brief Max chunks a single stream may hold parked ahead of its cursor.
+     *
+     * The §3.3.4 running-byte guard bounds the *payload* a stream can make
+     * resident by its advertised totalSize. It cannot bound per-chunk
+     * bookkeeping, for two independent reasons: the overhead of a parked entry
+     * exists at zero payload, and a zero-length chunk passes the byte guard by
+     * construction (`Fits(0)` holds for any live stream). Without a
+     * count bound a peer advertises `totalSize = 1` with
+     * `totalChunks = maxStreamChunks` and parks 2^20-1 zero-length chunks —
+     * measured at ~80 B/entry on the Go side, i.e. ~80 MiB per stream, times
+     * maxStreams.
+     *
+     * The default is derived as `maxStreamChunks / maxStreams`, which is the
+     * bound that makes the *aggregate* parked-entry count across all in-flight
+     * streams no larger than the chunk count of one maximal stream. With the
+     * defaults that is 2^20 / 2^10 = 1024 entries per stream (~64 KiB of
+     * bookkeeping here, ~80 KiB in Go) and ~64-80 MiB across 1024 streams. It
+     * leaves two orders of magnitude of headroom over any legitimate sender:
+     * StreamSender parks at most `maxInFlight - 1` chunks (default in-flight
+     * is 1, so normally zero).
+     *
+     * Keep this value equal to Go's MaxParkedChunks — it is part of the §3.3.4
+     * accept/reject parity contract, not a local tuning knob.
+     */
+    size_t maxParkedChunks = 1024;
     uint32_t streamTimeoutMs = 10000;
 };
 
@@ -40,26 +67,79 @@ public:
     using OnStreamFn = std::function<void(uint64_t streamId, const std::vector<uint8_t>& data)>;
 
 private:
+    /**
+     * @brief Reassembly state for one in-flight stream.
+     *
+     * Mirrors go/stream.go's streamContext: the destination buffer is allocated
+     * once at STREAM_START and in-order chunks are copied straight into it at a
+     * running cursor, while only chunks that arrive *ahead* of the cursor are
+     * parked in a sparse map. There is deliberately no totalChunks-sized array:
+     * an array indexed by chunk index costs O(totalChunks) even when the stream
+     * advertises one byte (the old `chunks.resize(totalChunks)` +
+     * `seen.resize(totalChunks)` layout measured ~24 MiB per stream at
+     * totalChunks = 2^20), and the per-chunk vectors plus the completion-time
+     * concatenation made peak residency 2 x totalSize. Regression tests:
+     * tests/test_reassembler_tiny_stream_footprint.cpp,
+     * tests/test_reassembler_completion_peak.cpp.
+     */
     struct StreamContext {
-        uint64_t totalSize;
-        uint32_t totalChunks;
-        uint32_t receivedChunks;
-        // Running Sum(payloadSize) over every chunk index accepted so far, in
-        // whatever order they arrived. This is what the SPEC §3.3.4 per-chunk
-        // overflow guard bounds by totalSize: without it, a peer that advertises
-        // a tiny totalSize and then sends only out-of-order indices has every
-        // payload stored, and the byte-sum is not questioned until the
-        // completion assembly loop — i.e. after all of the bytes are resident.
-        uint64_t receivedBytes;
-        std::vector<std::vector<uint8_t>> chunks;
-        // Per-index presence flag. Mirrors Go's nil-vs-non-nil sentinel
-        // (go/stream.go: chunks[i]==nil means "not yet received"): an empty
-        // chunk vector is ambiguous because a legitimately zero-length payload
-        // is also empty. Tracking presence explicitly keeps the dedup /
-        // receivedChunks accounting identical to the Go reference, so the same
-        // stream is accepted by both peers (SPEC §3.3.4).
-        std::vector<bool> seen;
+        uint64_t totalSize = 0;
+        uint32_t totalChunks = 0;
+        uint32_t next = 0;    ///< next in-order chunk index to consume into buf
+        uint64_t offset = 0;  ///< bytes written into buf so far (Σ payloadSize)
+        /**
+         * @brief Σ size of the chunks currently parked ahead of the cursor.
+         *
+         * `offset + oooBytes` is the running *received* length of the stream,
+         * which is what the SPEC §3.3.4 per-chunk overflow guard bounds by
+         * totalSize. Without counting parked bytes, a peer that only ever sends
+         * ahead-of-cursor indices parks unbounded memory and is refused only
+         * once the gap fills — after every byte is resident. Released exactly
+         * when a parked chunk is drained into buf.
+         */
+        uint64_t oooBytes = 0;
+        std::vector<uint8_t> buf;  ///< destination, size == totalSize
+        /**
+         * @brief Chunks received ahead of `next`, keyed by chunk index.
+         *
+         * Presence in the map (not emptiness of the value) is the dedup marker,
+         * so a legitimately zero-length payload is counted exactly once —
+         * matching Go's `ooo` map and the old `seen[]` bitmap.
+         */
+        std::unordered_map<uint32_t, std::vector<uint8_t>> ooo;
         std::chrono::steady_clock::time_point startTime;
+
+        /**
+         * @brief Whether accepting `n` more bytes keeps the running received
+         *        length (assembled + parked) within totalSize.
+         */
+        bool Fits(size_t n) const {
+            return offset + oooBytes + static_cast<uint64_t>(n) <= totalSize;
+        }
+
+        /** @brief Appends at the cursor. False if the running-length guard trips. */
+        bool Consume(const uint8_t* data, size_t n) {
+            if (!Fits(n)) return false;
+            if (n > 0) std::memcpy(buf.data() + offset, data, n);
+            offset += n;
+            ++next;
+            return true;
+        }
+
+        /**
+         * @brief Buffers a chunk that arrived ahead of the cursor.
+         *
+         * Both guards run BEFORE the copy is allocated, so an over-advertised or
+         * over-fragmented stream is rejected at arrival time instead of after
+         * its bytes are resident. False means the caller must drop the stream.
+         */
+        bool Park(uint32_t index, const uint8_t* data, size_t n, size_t maxParked) {
+            if (!Fits(n)) return false;
+            if (ooo.size() >= maxParked) return false;
+            ooo.emplace(index, std::vector<uint8_t>(data, data + n));
+            oooBytes += n;
+            return true;
+        }
     };
 
     std::unordered_map<uint64_t, StreamContext> streams;
@@ -110,9 +190,8 @@ public:
             const StreamHeader* header = static_cast<const StreamHeader*>(req);
 
             // Bound checks (SPECIFICATION.md §3.3.4). A corrupt or malicious
-            // header must not drive a huge allocation. totalChunks is checked
-            // before the vector resize below so an oversized header cannot
-            // trigger a giant allocation.
+            // header must not drive a huge allocation. Both bounds are checked
+            // before the destination buffer below is sized.
             if (header->totalSize > config.maxStreamSize ||
                 header->totalChunks > config.maxStreamChunks) {
                  msgType = MsgType::SYSTEM_ERROR;
@@ -149,13 +228,12 @@ public:
             StreamContext ctx;
             ctx.totalSize = header->totalSize;
             ctx.totalChunks = header->totalChunks;
-            ctx.receivedChunks = 0;
-            ctx.receivedBytes = 0;
             ctx.startTime = std::chrono::steady_clock::now();
 
             try {
-                ctx.chunks.resize(ctx.totalChunks);
-                ctx.seen.resize(ctx.totalChunks, false);
+                // The one allocation this stream makes: exactly what the peer
+                // advertised. Sized by totalSize, never by totalChunks.
+                ctx.buf.resize(static_cast<size_t>(header->totalSize));
             } catch (...) {
                 msgType = MsgType::SYSTEM_ERROR; // OOM
                 respSize = 0;
@@ -193,88 +271,94 @@ public:
 
             StreamContext& ctx = it->second;
 
-            if (header->chunkIndex >= ctx.chunks.size()) {
+            if (header->chunkIndex >= ctx.totalChunks) {
                  msgType = MsgType::SYSTEM_ERROR;
                  respSize = 0;
                  return true;
             }
 
-            // Idempotency: if this index was already received, ignore. Use the
-            // explicit presence flag (not vector emptiness) so a zero-length
-            // payload is still counted exactly once — matching go/stream.go.
-            if (ctx.seen[header->chunkIndex]) {
+            // Idempotency (SPEC §3.3.4 "first arrival wins"): an index that is
+            // already assembled or already parked is ACK-ignored without
+            // consulting its payloadSize, so a duplicate that declares a
+            // different length neither re-counts nor trips the overflow guard.
+            // Presence in `ooo`, not emptiness of its value, is the marker so a
+            // zero-length payload is counted exactly once — matching go/stream.go.
+            if (header->chunkIndex < ctx.next ||
+                ctx.ooo.find(header->chunkIndex) != ctx.ooo.end()) {
                 msgType = MsgType::NORMAL;
                 respSize = 0;
                 return true;
             }
 
-            // Per-chunk overflow guard (SPEC §3.3.4), applied BEFORE the payload
-            // is copied so an over-advertised stream never becomes resident.
-            // The check is order-independent: it counts every accepted chunk,
-            // including ones buffered while an earlier index is still missing.
-            // Matches go/stream.go's streamContext.fits (offset+oooBytes).
-            if (ctx.receivedBytes + static_cast<uint64_t>(header->payloadSize) >
-                ctx.totalSize) {
+            const uint8_t* payloadPtr = static_cast<const uint8_t*>(req) + sizeof(ChunkHeader);
+            bool corrupt = false;
+            try {
+                if (header->chunkIndex == ctx.next) {
+                    // In-order fast path: copy straight from the slot buffer
+                    // into the preallocated destination, then drain any parked
+                    // chunks the cursor has caught up to.
+                    bool ok = ctx.Consume(payloadPtr, header->payloadSize);
+                    while (ok) {
+                        auto parked = ctx.ooo.find(ctx.next);
+                        if (parked == ctx.ooo.end()) break;
+                        std::vector<uint8_t> buffered = std::move(parked->second);
+                        ctx.ooo.erase(parked);
+                        // These bytes move from "parked" to "assembled";
+                        // releasing the count first keeps offset+oooBytes
+                        // invariant across the drain, so a legitimately-sized
+                        // stream is not rejected for bytes counted twice.
+                        ctx.oooBytes -= buffered.size();
+                        ok = ctx.Consume(buffered.data(), buffered.size());
+                    }
+                    if (!ok) corrupt = true;
+                } else if (!ctx.Park(header->chunkIndex, payloadPtr,
+                                     header->payloadSize, config.maxParkedChunks)) {
+                    // Ahead of the cursor (pipelined sender): the destination
+                    // offset is unknown until the gap fills, so park a copy —
+                    // but only while the running received length still fits
+                    // totalSize and the parked-entry bound holds.
+                    corrupt = true;
+                }
+            } catch (...) {
+                // Local allocation failure while parking. SPEC §3.3.4: a
+                // reassembler that cannot store an accepted chunk drops the
+                // stream. A retained context could never be completed — both
+                // senders treat a chunk SYSTEM_ERROR as terminal for the whole
+                // stream and never retry the index — so keeping it would only
+                // pin totalSize bytes until the timeout prune, and would leave
+                // this the one error path in the function that does not retire
+                // the stream.
+                corrupt = true;
+            }
+
+            if (!corrupt && ctx.next == ctx.totalChunks) {
+                // Completion contract (SPEC §3.3.4): every index filled exactly
+                // once AND Σ payloadSize == totalSize. The equality check is
+                // what catches an UNDER-sized stream, which no per-chunk guard
+                // can see; an over-sized one was already refused at arrival.
+                if (ctx.offset == ctx.totalSize) {
+                    // Hand the destination out by move: the old layout built a
+                    // second full-size buffer here, doubling peak residency.
+                    std::vector<uint8_t> fullData = std::move(ctx.buf);
+                    streams.erase(it);
+                    lock.unlock(); // Unlock before callback to prevent deadlock
+
+                    onStream(header->streamId, fullData);
+
+                    msgType = MsgType::NORMAL;
+                    respSize = 0;
+                    return true;
+                }
+                corrupt = true;
+            }
+
+            if (corrupt) {
+                // Drop rather than deliver truncated/garbled data, and never
+                // leave a context that can no longer complete.
                 streams.erase(it);
                 msgType = MsgType::SYSTEM_ERROR;
                 respSize = 0;
                 return true;
-            }
-
-            const uint8_t* payloadPtr = static_cast<const uint8_t*>(req) + sizeof(ChunkHeader);
-            try {
-                ctx.chunks[header->chunkIndex].assign(payloadPtr, payloadPtr + header->payloadSize);
-            } catch (...) {
-                 msgType = MsgType::SYSTEM_ERROR;
-                 respSize = 0;
-                 return true;
-            }
-
-            ctx.seen[header->chunkIndex] = true;
-            ctx.receivedChunks++;
-            ctx.receivedBytes += header->payloadSize;
-
-            if (ctx.receivedChunks == ctx.totalChunks) {
-                // Completion validation (SPEC §3.3.4): the assembled byte count
-                // must equal the advertised totalSize, else the stream is
-                // dropped rather than delivered truncated/garbled. That
-                // equality check below is the load-bearing one here — it is what
-                // catches an UNDER-sized stream, which no per-chunk guard can
-                // see. The `> ctx.totalSize` bound inside the loop cannot fire:
-                // the arrival-time receivedBytes guard above already rejected
-                // any stream that exceeded totalSize, and Sum(chunk.size()) ==
-                // receivedBytes. It is kept as a cheap invariant re-assert over
-                // peer-supplied lengths on the wire path.
-                std::vector<uint8_t> fullData;
-                try {
-                    fullData.reserve(ctx.totalSize);
-                    for (const auto& chunk : ctx.chunks) {
-                        if (fullData.size() + chunk.size() > ctx.totalSize) {
-                            streams.erase(it);
-                            msgType = MsgType::SYSTEM_ERROR;
-                            respSize = 0;
-                            return true;
-                        }
-                        fullData.insert(fullData.end(), chunk.begin(), chunk.end());
-                    }
-                } catch(...) {
-                     streams.erase(it);
-                     msgType = MsgType::SYSTEM_ERROR;
-                     respSize = 0;
-                     return true;
-                }
-
-                if (fullData.size() != ctx.totalSize) {
-                    streams.erase(it);
-                    msgType = MsgType::SYSTEM_ERROR;
-                    respSize = 0;
-                    return true;
-                }
-
-                streams.erase(it);
-                lock.unlock(); // Unlock before callback to prevent deadlock
-
-                onStream(header->streamId, fullData);
             }
 
             msgType = MsgType::NORMAL;

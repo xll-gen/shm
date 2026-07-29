@@ -191,7 +191,7 @@ flagged by past reviews and confirmed correct — do not "fix" or re-propose:
   §3.1/§3.4/§3.5 and the note below on the historical v0.6.0 annotation.
 * **The stream reassemblers' received-byte counters are the §3.3.4 memory bound,
   not bookkeeping** (2026-07-29). Go `streamContext.oooBytes` + `fits()`
-  (`go/stream.go`) and C++ `StreamContext::receivedBytes`
+  (`go/stream.go`) and C++ `StreamContext::oooBytes` + `Fits()`
   (`include/shm/StreamReassembler.h`) exist so the per-chunk overflow guard
   covers chunks that arrive **ahead of the in-order cursor**. Before they
   existed, only the in-order branch consulted `totalSize`, so an untrusted peer
@@ -206,6 +206,35 @@ flagged by past reviews and confirmed correct — do not "fix" or re-propose:
   "since we reject anyway" — the point is *when* the rejection happens.
   Regression: `go/stream_ooo_guard_test.go`,
   `tests/test_reassembler_ooo_overflow.cpp`.
+* **Stream reassembly state is sized by `totalSize`, never by `totalChunks`, and
+  the parked-chunk count is capped** (2026-07-29, SPEC §3.3.4 "Residency bound" /
+  "Parked-chunk bound"). `totalChunks` and `totalSize` are independent header
+  fields, so any per-chunk array — the C++ reassembler's old
+  `chunks.resize(totalChunks)` + `seen.resize(totalChunks)` — costs
+  `O(totalChunks)` for a stream that advertises one byte: **measured 25.4 MB per
+  stream** at `totalChunks = 2^20`, ~26 GB at `maxStreams`. The byte guard above
+  cannot see that dimension (the overhead exists at zero payload, and a
+  zero-length chunk can never trip a `Σ payloadSize > totalSize` test). Both
+  peers now preallocate a `totalSize` destination, copy in-order chunks straight
+  in at a cursor, park only ahead-of-cursor chunks sparsely, and refuse a park
+  past `maxParkedChunks` / `MaxParkedChunks` (1024 =
+  `maxStreamChunks / maxStreams`; keep the two sides equal — it is an
+  accept/reject parity value, not a tuning knob). Do **not** reintroduce a
+  chunk-indexed array, and do **not** assemble into a second full-size buffer at
+  completion — that was a 2× peak (2 GiB for a 1 GiB stream) the Go side never
+  had. Regression: `tests/test_reassembler_tiny_stream_footprint.cpp`,
+  `tests/test_reassembler_completion_peak.cpp`,
+  `tests/test_reassembler_park_cap.cpp`, `go/stream_park_cap_test.go`.
+* **`tests/test_reassembler_parity_table.cpp` and
+  `go/stream_parity_table_test.go` are one artifact** (2026-07-29). The case list
+  *and* the expected digest strings are duplicated verbatim so each side asserts
+  against a constant rather than against the other implementation's current
+  behavior. They pin what the §3.3.4 prose cannot state chunk-by-chunk: which
+  rejections drop the stream vs. leave it completable, first-arrival-wins dedup
+  (including a duplicate that declares a different `payloadSize`), and
+  `STREAM_START` replacing a live context. A digest change is a **wire behavior
+  change**: update SPEC §3.3.4 and both halves in the same commit, or don't make
+  it.
 * `go/race_annotate_on.go` / `race_annotate_off.go` are **not dead code and not
   synchronization** (2026-07-26). Slot ownership is handed over through the
   atomics on `SlotHeader.State`, which lives in the file-mapped region. Go's
