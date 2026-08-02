@@ -216,13 +216,24 @@ public:
             }
 
             std::lock_guard<std::mutex> lock(streamsMutex);
+            // Age-prune on EVERY start, matching the Go reassembler (go/stream.go).
+            // Previously this ran only on hitting maxStreams, so a host that never
+            // calls Prune() and stays under the cap held every abandoned context —
+            // each one pinning its full advertised totalSize — for the life of the
+            // process. SPEC §3.3.4 leaves the reclaim mechanism
+            // implementation-defined, so that was not a contract violation, but it
+            // was an asymmetry with real memory behind it: the two implementations
+            // are supposed to be interchangeable peers.
+            //
+            // Cost is one pass over at most maxStreams (1024) entries, on a path
+            // that is already allocating totalSize bytes for the new stream.
+            PruneInternal();
             if (streams.size() >= config.maxStreams) {
-                PruneInternal();
-                if (streams.size() >= config.maxStreams) {
-                     msgType = MsgType::SYSTEM_ERROR; // Too many streams
-                     respSize = 0;
-                     return true;
-                }
+                 // The pre-existing second prune here is now redundant: the cap
+                 // check is reached with a freshly pruned map.
+                 msgType = MsgType::SYSTEM_ERROR; // Too many streams
+                 respSize = 0;
+                 return true;
             }
 
             StreamContext ctx;

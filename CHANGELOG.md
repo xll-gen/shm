@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.8.20] - 2026-08-02
+
+No wire-format/ABI change; `SHM_VERSION` untouched.
+
+### Fixed
+
+- **The C++ reassembler reclaimed stale streams later than the Go one.** It ran
+  `PruneInternal` only when a new stream would exceed `maxStreams` (1024), so a
+  host that stays under the cap and never calls `Prune()` held every abandoned
+  stream context — each pinning its full advertised `totalSize` — for the life of
+  the process. Go prunes on every `StreamStart`. SPEC §3.3.4 leaves the reclaim
+  mechanism implementation-defined, so this was not a contract violation, but it
+  was an asymmetry with real memory behind it between two implementations that
+  are meant to be interchangeable peers. START now prunes unconditionally; the
+  cap check that follows is reached with a freshly pruned map, so its second
+  prune was removed as redundant. Cost is one pass over at most 1024 entries on a
+  path that is already allocating `totalSize` bytes.
+
+  Regression: `tests/test_reassembler_start_prune.cpp`, which drives the case FAR
+  below the cap on purpose — at or above it the old code pruned too, so a test
+  that filled the map would have passed either way. Mutation-verified against the
+  cap-only prune.
+
+Suite: 41/41.
+
 ## [0.8.19] - 2026-08-02
 
 No wire-format/ABI change — `SHM_VERSION` is untouched and every shared struct
