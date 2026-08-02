@@ -10,7 +10,33 @@
 
 using namespace shm;
 
+// Supplied by tests/CMakeLists.txt at configure time. Absolute, because ctest
+// runs this binary from the BUILD tree while the Go sources live in the SOURCE
+// tree; the previous source-relative paths could never resolve.
+#ifndef SHM_GO_EXECUTABLE
+#define SHM_GO_EXECUTABLE ""
+#endif
+#ifndef SHM_GO_INTEGRATION_DIR
+#define SHM_GO_INTEGRATION_DIR ""
+#endif
+#ifndef SHM_GO_INTEGRATION_BIN
+#define SHM_GO_INTEGRATION_BIN ""
+#endif
+
+// CTest SKIP_RETURN_CODE (see tests/CMakeLists.txt). A missing Go toolchain is
+// an environment fact, not a repository defect, and must not look like the
+// protocol regression this test exists to catch.
+static const int kSkipExitCode = 77;
+
 int main() {
+    const std::string goExe(SHM_GO_EXECUTABLE);
+    const std::string goDir(SHM_GO_INTEGRATION_DIR);
+    if (goExe.empty() || goDir.empty()) {
+        std::cout << "SKIP: no Go toolchain was found at configure time "
+                     "(re-run cmake with Go on PATH to enable this test)." << std::endl;
+        return kSkipExitCode;
+    }
+
     const std::string SHM_NAME = "StreamIntegration";
     const int NUM_SLOTS = 2;
     const int NUM_GUEST_SLOTS = 2;
@@ -54,18 +80,22 @@ int main() {
         return 0;
     });
 
-    // Spawn Go process
-    // Build Go binary first
-    int buildRet = system("cd tests/go_integration && go build -o integration_test");
+    // Spawn Go process. Absolute paths + quoting: the build dir is not the
+    // source dir, and both can contain spaces (e.g. under Program Files).
+    const std::string goBin(SHM_GO_INTEGRATION_BIN);
+    const std::string buildCmd =
+        "\"\"" + goExe + "\" build -C \"" + goDir + "\" -o \"" + goBin + "\"\"";
+    int buildRet = system(buildCmd.c_str());
     if (buildRet != 0) {
-        std::cerr << "Failed to build Go test" << std::endl;
+        std::cerr << "Failed to build Go test (rc=" << buildRet << "): " << buildCmd << std::endl;
         return 1;
     }
 
     std::cout << "Host: Launching Go Guest..." << std::endl;
     // Run in background
-    std::thread goProc([]() {
-        system("./tests/go_integration/integration_test -name StreamIntegration");
+    std::thread goProc([goBin]() {
+        std::string runCmd = "\"\"" + goBin + "\" -name StreamIntegration\"";
+        system(runCmd.c_str());
     });
     goProc.detach();
 

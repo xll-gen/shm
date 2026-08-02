@@ -154,6 +154,8 @@ Synchronization primitives must behave identically across languages and OSs.
 2.  **Go Implementation**: `go/platform.go` (shared dispatcher/doc comments), `go/platform_windows.go` (Win32 `syscall` implementation).
 **Constraint**: If you add a feature (e.g., timeout) to C++, you must implement it in Go.
 
+**One host per SHM name — the guard has two halves (2026-08-02).** `Platform::LockShm` holds a `Local\<name>_lock` named mutex, which enforces the rule ACROSS PROCESSES correctly (two Excel instances on the same project: the second host's `Init` is refused with `ResourceExhausted`). It cannot enforce it WITHIN a process: a Win32 mutex is owned by a *thread* and is *recursive*, so a second `Init` for the same name on the same thread finds `ERROR_ALREADY_EXISTS`, gets `WAIT_OBJECT_0` from the zero-timeout wait (that thread already owns it) and "acquires" the lock — after which `DirectHost::Init` runs `memset(shmBase, 0, totalSize)` over the LIVE host's segment. So `LockShm` also keeps a process-local registry of claimed names and refuses a duplicate before touching the mutex; `UnlockShm` drops the claim (keyed by handle, so the signature is unchanged). `tests/test_double_host.cpp` pins this and had been failing since it was written — the contract it asserts is real, the implementation was half-missing. **No Go parity work**: the Go side has no production host, only test mocks — nothing there creates and locks a segment as host.
+
 ### **Feature Parity (Host <-> Guest)**
 Logic changes often require symmetric updates.
 1.  **Host Logic**: `include/shm/DirectHost.h` (e.g., `Send`, `ProcessGuestCalls`).

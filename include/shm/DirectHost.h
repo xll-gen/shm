@@ -497,7 +497,9 @@ public:
         if (!shmBase) return Result<void>::Failure(Error::InternalError);
 
         if (!Platform::LockShm(hMapFile, shmName.c_str(), hLockFile)) {
-            SHM_LOG_ERROR("Failed to acquire lock on SHM: ", shmName, ". Another Host might be running.");
+            SHM_LOG_ERROR("Failed to acquire lock on SHM: ", shmName,
+                          ". Another Host holds this name - either in another process, or an "
+                          "earlier DirectHost in THIS process that has not been Shutdown().");
             Platform::CloseShm(hMapFile, shmBase, totalShmSize);
             shmBase = nullptr;
             return Result<void>::Failure(Error::ResourceExhausted);

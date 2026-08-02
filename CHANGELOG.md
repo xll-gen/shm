@@ -1,5 +1,52 @@
 # Changelog
 
+## [0.8.19] - 2026-08-02
+
+No wire-format/ABI change — `SHM_VERSION` is untouched and every shared struct
+keeps its layout. The behavior change is confined to host startup.
+
+### Fixed
+
+- **A second `DirectHost::Init` for the same SHM name inside one process
+  succeeded and wiped the live host's segment.** `Platform::LockShm` guards the
+  name with a `Local\<name>_lock` named mutex, which enforces "one host per
+  name" ACROSS PROCESSES correctly — two Excel instances on the same project
+  were never affected, which is why this survived. It cannot enforce it WITHIN a
+  process: a Win32 mutex is owned by a *thread* and is *recursive*, so a second
+  `Init` on the same thread finds `ERROR_ALREADY_EXISTS`, the zero-timeout
+  `WaitForSingleObject` returns `WAIT_OBJECT_0` because that thread already owns
+  the mutex, and the caller "acquires" the lock — after which `Init` runs
+  `memset(shmBase, 0, totalSize)` over the running host's shared memory.
+  `LockShm` now claims the name in a process-local registry first and refuses a
+  duplicate; `UnlockShm` releases the claim (keyed by handle, signature
+  unchanged). `tests/test_double_host` has asserted this contract since it was
+  written and had been failing the whole time — the test was right and the
+  implementation was half-missing.
+
+### Tests
+
+- **`tests/test_slot_recovery` was a coin flip, not a flaky test, and it hid the
+  fact that slot recovery had no regression gate at all.** Its mock guest bounded
+  waits by ITERATION COUNT (`++sanity > 1000000` around `yield()`); measured,
+  1,000,000 yields is ~105 ms, so the second wait began at t~250 ms and gave up
+  at t~355 ms while the host's recovery send lands at t~350 ms — a 5 ms margin
+  decided every run, and on expiry the guest published anyway instead of
+  failing. Waits are now bounded by wall clock (10 s, ~2 orders of magnitude
+  over the intervals the test depends on) and an expiry is a loud, named
+  failure. Verified by mutation: disabling the zombie-steal branch in
+  `SlotAllocator.h` now fails the test with the exact diagnostic, which the old
+  version could not detect.
+- **`tests/test_stream_integration` always failed, and the cause was not
+  `PATH`.** It shelled out to source-relative paths (`cd tests/go_integration
+  && go build`) while ctest runs from the build tree, so the `cd` failed before
+  Go was ever invoked. CMake now injects the absolute `go` path (found at
+  configure time), the source dir, and a build-tree output path; a missing Go
+  toolchain is reported as a CTest SKIP rather than a FAIL, because a hard
+  failure there is indistinguishable from the protocol regression the test
+  exists to catch.
+
+Full suite: 40/40 (was 37/40).
+
 ## [0.8.18] - 2026-07-29
 
 No wire-format/ABI change — `SHM_VERSION` is untouched, and `SlotHeader`,

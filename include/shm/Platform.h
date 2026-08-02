@@ -6,6 +6,8 @@
 #include <windows.h>
 #include <string>
 #include <vector>
+#include <map>
+#include <mutex>
 #include <cstdint>
 #include <cstring>
 
@@ -436,6 +438,26 @@ public:
         std::wstring w_name(s_name.begin(), s_name.end());
         std::wstring mutex_name = L"Local\\" + w_name + L"_lock";
 
+        // IN-PROCESS half of the guard. Claim the name in this process FIRST,
+        // because the named mutex below cannot do it: a Win32 mutex is owned by
+        // a THREAD and is RECURSIVE. A second Init for the same name on the
+        // SAME THREAD therefore sees ERROR_ALREADY_EXISTS, and the
+        // WaitForSingleObject(...,0) below returns WAIT_OBJECT_0 immediately
+        // (that thread already owns it) -- so the second host "acquired" the
+        // lock and went on to memset the LIVE host's shared segment to zero.
+        // Cross-process and cross-thread were never affected (a different
+        // thread gets WAIT_TIMEOUT), which is why this survived: the real
+        // two-Excel-instances case is a different process and was always
+        // refused correctly.
+        {
+            std::lock_guard<std::mutex> g(LockRegistryMutex());
+            // No logging here on purpose: Platform is the base layer and does
+            // not depend on Logger.h. The caller reports the failure.
+            for (const auto& kv : LockRegistry()) {
+                if (kv.second == s_name) return false;
+            }
+        }
+
         HANDLE hMutex = CreateMutexW(NULL, TRUE, mutex_name.c_str());
         if (!hMutex) return false;
 
@@ -444,16 +466,18 @@ public:
             // "The bInitialOwner parameter is ignored if the mutex already exists."
             // So we must try to wait for it.
             DWORD res = WaitForSingleObject(hMutex, 0);
-            if (res == WAIT_OBJECT_0) {
-                outLockHandle = hMutex;
-                return true;
-            } else {
+            if (res != WAIT_OBJECT_0) {
                 CloseHandle(hMutex);
                 return false;
             }
         }
 
-        // We created it and own it.
+        // We own it (created, or waited successfully). Record the claim so the
+        // in-process check above can see it, and so UnlockShm can release it.
+        {
+            std::lock_guard<std::mutex> g(LockRegistryMutex());
+            LockRegistry()[hMutex] = s_name;
+        }
         outLockHandle = hMutex;
         return true;
     }
@@ -466,10 +490,30 @@ public:
     static void UnlockShm(ShmHandle hShm, ShmHandle hLock) {
         (void)hShm;
         if (hLock) {
+            {
+                std::lock_guard<std::mutex> g(LockRegistryMutex());
+                LockRegistry().erase(hLock);
+            }
             ReleaseMutex(hLock);
             CloseHandle(hLock);
         }
     }
+
+private:
+    // Process-local registry of SHM names this process holds the lock for,
+    // keyed by the mutex handle so UnlockShm can drop the claim without being
+    // given the name. Function-local statics: this library is header-only, so
+    // these must have one definition across every TU that includes it.
+    static std::mutex& LockRegistryMutex() {
+        static std::mutex m;
+        return m;
+    }
+    static std::map<ShmHandle, std::string>& LockRegistry() {
+        static std::map<ShmHandle, std::string> reg;
+        return reg;
+    }
+
+public:
 };
 
 }
