@@ -393,12 +393,19 @@ was capping the multi-controller bandwidth).
   went spin-bound (v0.8.6), the remaining benefit is <2% on any cell, against a
   wire-ABI break and a formally-UB mixed-size-atomic (32-bit state store vs
   64-bit CAS on the same word) in the most safety-critical structure.
-- **xll-gen held-slot adoption** — deferred: real UDF round-trips are µs-to-
-  tens-of-µs (flatbuffer serialization + the Go handler's actual compute), so
-  the ~9 ns claim saving is <1%, not worth adding a per-thread held-slot
-  lifecycle + a §20 (DllMain unload) crash surface to the XLL. `TryAcquireSlot`
-  /`TryAcquireHeldSlot` (v0.8.6) remain for a future tight-loop low-RTT
-  host-send use case.
+- **xll-gen held-slot adoption** — **declined, not merely deferred** (2026-07-04
+  analysis; status settled 2026-08-03). Real UDF round-trips are µs-to-tens-of-µs
+  (flatbuffer serialization + the Go handler's actual compute), so the ~9 ns claim
+  saving is <1%, not worth adding a per-thread held-slot lifecycle + a §20 (DllMain
+  unload) crash surface to the XLL. `TryAcquireSlot`/`TryAcquireHeldSlot` (v0.8.6)
+  remain for a future tight-loop low-RTT host-send use case.
+  **The authoritative record is `xll-gen/AGENTS.md` → *Confirmed-Correct Decisions***
+  — it carries all five grounds and the two conditions under which the proposal may
+  be re-opened, which this line does not. This entry said "deferred" while that one
+  says settled-with-conditions; "declined" is the accurate word, and a re-proposal is
+  adjudicated there, not here. `shm/AGENTS.md`'s *"Consumer fact, not a perf item"*
+  paragraph records what the decision means for work in THIS repo (it is not a
+  deprecation of the held API).
 
 ## 2026-07-04 guest responder no-reclaim fast path (round 7, S7)
 

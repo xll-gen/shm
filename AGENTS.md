@@ -611,6 +611,29 @@ different hardware, but only with numbers.
   bottleneck, and `SeLockMemoryPrivilege` carries a real deployment burden.
   Revisit only on a NUMA/multi-controller topology.
 
+**Consumer fact, not a perf item (recorded 2026-08-03):** the Excel host does
+**not** adopt held slots. xll-gen's UDF hot path deliberately stays on a per-call
+`GetZeroCopySlot()`; the full reasoning and the two re-proposal conditions live in
+`xll-gen/AGENTS.md` → *Confirmed-Correct Decisions*. Two consequences for work in
+this repo. (1) **This is not a deprecation** — `HeldSlot`, `SendHeld`,
+`AcquireHeldSlot`/`TryAcquireHeldSlot` stay exactly as they are, they are the
+intended API for tight-loop low-RTT **non-Excel** hosts, and `tests/test_held_slot.cpp`
+plus the harness held cells remain the contract. Do not "clean up" or narrow the
+held path on the theory that nobody uses it. (2) **Do not price a proposal against
+an Excel consumer that will not exist** — a design whose payoff assumes "the XLL
+holds a slot per calculation thread" is computing its benefit against a
+configuration that was declined. **One recorded proposal has already broken on
+exactly that** (2026-07-25, *"ZeroCopySlot/HeldSlot lifetime-tracking: split the
+global `shared_ptr` control block per slot"*): its affinity premise fails in the
+`numHostSlots` < Excel-calc-thread-count configuration, because
+`SlotAllocator.h:285-295`'s `thread_local` cache falls back to the shared
+`nextSlot` round-robin on a failed claim. Two neighbouring held-path proposals from
+the same day — conditional removal of the `SendHeld` per-send lease heartbeat, and
+an in-place held response accessor — were refuted on **different** grounds
+(SPEC §3.6 `SPECIFICATION.md:300` makes the per-send refresh normative, and
+`TryReclaimAbandonedSlot` treats every `state != SLOT_FREE` slot as a candidate);
+do not fold them into this one, and do not re-refute them with this argument.
+
 **Working rule, not a perf item:** `gofmt -l` flags a large number of files in
 these repos because every existing file is CRLF. That is noise, not a formatting
 defect. Format only the files you actually modified; never bulk-reformat.
