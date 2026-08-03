@@ -1,5 +1,52 @@
 # Changelog
 
+## [0.8.21] - 2026-08-03
+
+No wire-format/ABI change; `SHM_VERSION` untouched. All four new members are
+non-virtual public additions to header-only classes, so no vtable or layout moves.
+
+### Added
+
+- **`DirectHost::WaitForGuestCall(timeoutMs)` / `WakeGuestCallWaiter()`** — the
+  §3.5 doorbell gate, for a host that runs its own processing loop instead of
+  `Start()`. Such a host previously had no way to reach the gate at all, and the
+  consequence is easy to miss: `hostState` on the guest slots is written only from
+  inside the worker's wait, so a host that never runs that wait leaves it
+  `HOST_STATE_ACTIVE` forever, the Guest sender's `hostState == HOST_STATE_WAITING`
+  doorbell never fires, and a hand-rolled wait expires on its own timeout on every
+  call. That is why such hosts have had to burn a core spinning — the spin was not
+  merely wasteful, it was the only thing holding latency at ~150 ns. Single-waiter
+  only; do not combine with `Start()`.
+
+### Changed
+
+- **The wait gate now has exactly ONE implementation.** `GuestWorkerLoop`'s wait
+  triple (the `anyRequestReady` seq_cst predicate, the
+  `HOST_STATE_WAITING → recheck → WaitEvent → ACTIVE` Dekker, and the spin phase)
+  moved into `GuestCallWorker::WaitForRequest`, which `GuestWorkerLoop` now calls.
+  A second copy of a Dekker is how a lost wakeup ships.
+
+- **`Stop()` wakes the waiter before joining.** Without it the join blocked for the
+  full 1 s park on every shutdown of an idle host: a flag flip is invisible to a
+  thread already blocked in `WaitForSingleObject`.
+
+### Verified
+
+- ctest 42/42 (the new `test_guest_worker_foreign_wait` included). It asserts the
+  Dekker and the on-demand wake **separately, on elapsed time against a 4 s park** —
+  an outcome-only test ("the request was eventually serviced") passes while the gate
+  is entirely broken, because the timeout self-heals it. Both FAIL-first stubs from
+  the design were run: dropping the `HOST_STATE_WAITING` publication makes the peer
+  never publish and the wait run its full 4004 ms; stubbing `WakeWaiter()` makes the
+  on-demand release take 4002 ms.
+- Guest-call A/B against a baseline worktree, same session, medians of 3: 1T/64B
+  +2.3%, 1T/1024B +2.2%, multi-thread cells all inside their own spread. **The
+  single-shot version of that A/B showed −17.6% on 4T/64B and would have been read as
+  a regression** — see EXPERIMENTS.md.
+- The two event-less fallback paths keep the pre-extraction 100 ms poll cadence
+  rather than inheriting the caller's 1 s park (`kFallbackPollMs`); honouring the
+  park there would have been a 10x latency and shutdown regression.
+
 ## [0.8.20] - 2026-08-02
 
 No wire-format/ABI change; `SHM_VERSION` untouched.

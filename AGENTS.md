@@ -258,6 +258,41 @@ flagged by past reviews and confirmed correct — do not "fix" or re-propose:
   nothing, so a genuine use-after-forfeit still trips the detector); acquire
   goes immediately *after* the claiming CAS.
 
+### The guest-call wait gate has exactly ONE implementation (2026-08-03)
+
+`GuestCallWorker::WaitForRequest(timeoutMs)` is the single implementation of the
+SPECIFICATION.md §3.5 doorbell gate: the `anyRequestReady` seq_cst predicate, the
+`HOST_STATE_WAITING → recheck → WaitEvent → ACTIVE` Dekker, and the spin phase.
+`GuestWorkerLoop` calls it; it does not carry its own copy. **Do not fork it for a new
+caller — add a parameter.** A second copy of a Dekker is how a lost wakeup ships, and
+this one is load-bearing for the +836% the worker/doorbell pair bought (EXPERIMENTS.md,
+2026-07-04 round 5).
+
+`WakeWaiter()` / `DirectHost::WakeGuestCallWaiter()` release a parked waiter. `Stop()`
+calls it before joining: without that the join blocks for the full park quantum (1 s)
+on every shutdown of an idle host, because a flag flip is invisible to a thread blocked
+in `WaitForSingleObject`.
+
+**WHY THE PUBLIC `DirectHost::WaitForGuestCall` EXISTS, and it is not a convenience.**
+`hostState` on guest slots is written ONLY from inside this wait. A host that runs its
+own loop instead of `Start()` therefore leaves it `HOST_STATE_ACTIVE` forever, the Go
+sender's `if hostState == HOST_STATE_WAITING` doorbell **never fires**, and a
+hand-rolled wait in that loop expires on its own timeout on every single call. That is
+why such hosts have had to burn a core spinning — the spin was not merely wasteful, it
+was the only thing keeping latency at ~150 ns. xll-gen's XLL worker is the live case.
+
+Single-waiter only: one thread at a time (the shared request event is auto-reset, so two
+waiters would race for one wake). Do not combine with `Start()`.
+
+The two fallback paths that have no event to park on (no guest slots; no shared request
+event) poll at `kFallbackPollMs = 100`, **not** at the caller's timeout — on those paths
+the timeout is a poll interval, and honouring a 1 s park would make both request latency
+and shutdown latency 1 s, a 10x regression against the pre-extraction loop.
+
+Wire-neutral: no byte, no layout, `SHM_VERSION` untouched. Guest-call A/B (medians of 3,
+baseline worktree, same session): 1T +2.2~2.3%, multi-thread cells all within their own
+spread. See EXPERIMENTS.md for why the single-shot run of that A/B was misleading.
+
 ### Over-defensive-logic audit (2026-06-25)
 
 A cross-repo audit looked for guards that are redundant because a caller already

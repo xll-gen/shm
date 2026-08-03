@@ -534,3 +534,46 @@ shared uncore/IF effects. Absolute throughput rises monotonically (8T 66.8M,
 **Session-freshness note:** this session's absolute normal-mode numbers ran
 ~10% above the round-7 session (1T 15.5M vs 14.0M) with identical binaries on
 the baseline side — reaffirming the within-session-A/B-only comparison rule.
+
+---
+
+## 2026-08-03: extracting the guest-call wait gate (WaitForRequest / WakeWaiter)
+
+**Change.** `GuestWorkerLoop`'s wait triple — the `anyRequestReady` seq_cst
+predicate, the `HOST_STATE_WAITING → recheck → WaitEvent → ACTIVE` Dekker, and the
+`waitStrategy.Wait(...)` spin phase — was extracted into
+`GuestCallWorker::WaitForRequest(timeoutMs)`, with `WakeWaiter()` added beside it and
+public `DirectHost::WaitForGuestCall` / `WakeGuestCallWaiter` forwarders. Additive and
+wire-neutral: no byte on the wire changes, no struct layout changes, `SHM_VERSION`
+untouched. `GuestWorkerLoop` now calls the extracted function so there is exactly ONE
+copy of the gate.
+
+**Why it needed measuring at all.** The extraction moved three lambdas from a
+function body into a member function, which is exactly the kind of edit that can cost
+inlining on a path whose RTT is ~150 ns. "Behaviour-preserving" does not imply
+"codegen-preserving".
+
+**Result: no regression. The stable cell is slightly faster.** Same-session A/B against
+a **baseline git worktree at HEAD** (not a stash — see the 2026-07-30 incident),
+`harness.ps1 -Mode guest-call`, medians of 3 runs at 6 s each:
+
+| cell      | new    | baseline | delta  | verdict |
+|-----------|--------|----------|--------|---------|
+| 1T/64B    | 9.75M  | 9.53M    | +2.3%  | unregressed (stable cell) |
+| 1T/1024B  | 7.79M  | 7.62M    | +2.2%  | unregressed (stable cell) |
+| 4T/64B    | 20.49M | 20.86M   | −1.8%  | noise (ranges overlap) |
+| 8T/64B    | 30.25M | 32.91M   | −8.1%  | noise (ranges overlap) |
+| 4T/1024B  | 15.40M | 15.86M   | −2.9%  | noise (ranges overlap) |
+| 8T/1024B  | 25.52M | 24.07M   | +6.0%  | noise (ranges overlap) |
+
+**⚠ THE SINGLE-SHOT RUN WOULD HAVE BEEN READ AS A REGRESSION.** One iteration per cell
+gave 4T/64B **−17.6%** and 8T/1024B **−9.6%** — both of which reversed or vanished at
+3 repeats (4T/64B median −1.8%; 8T/1024B median **+6.0%**). The baseline's OWN spread
+on those cells is 14–17%, consistent with the "unpinned = placement lottery" record.
+The 1T cells, whose spread is ~2%, are the only ones that can settle a question this
+size, and they came out positive. **Do not accept or reject a change on the multi-thread
+guest-call cells from a single run.**
+
+**Not measured here (and it is the actual motivation):** the idle-CPU saving for a host
+that adopts `WaitForGuestCall` instead of spinning. That is a property of the CONSUMER's
+loop, not of shm, so it belongs in the consumer's record — see xll-gen's `WorkerLoop`.

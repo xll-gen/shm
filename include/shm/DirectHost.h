@@ -915,6 +915,48 @@ public:
     int ProcessGuestCalls(Handler&& handler, int limit = -1) {
         return worker_.ProcessGuestCalls(std::forward<Handler>(handler), limit);
     }
+
+    /**
+     * @brief Blocks until a guest request looks ready, timeoutMs elapses, or
+     *        WakeGuestCallWaiter() is called. Advisory return; see
+     *        GuestCallWorker::WaitForRequest for the full contract.
+     *
+     * FOR HOSTS THAT RUN THEIR OWN LOOP instead of Start(). Such a host has no
+     * other way to reach the SPECIFICATION.md 3.5 doorbell gate, and the
+     * consequence of not reaching it is easy to miss: hostState on the guest
+     * slots is written ONLY from inside the worker loop, so a host that never
+     * runs that loop leaves it HOST_STATE_ACTIVE forever, the guest sender
+     * elides no doorbell but also signals nothing a foreign waiter can see, and
+     * a hand-rolled wait therefore expires on its own timeout on every call.
+     * That is why such hosts have historically had to spin.
+     *
+     * Pair it with ProcessGuestCalls:
+     *
+     *     while (running) {
+     *         host.WaitForGuestCall(100);
+     *         host.ProcessGuestCalls(handler, 50);
+     *     }
+     *
+     * Single-waiter only: one thread may be inside this at a time (the shared
+     * request event is auto-reset, so two waiters would race for one wake).
+     * Do NOT combine with Start() -- that starts a second waiter.
+     */
+    bool WaitForGuestCall(uint32_t timeoutMs) {
+        return worker_.WaitForRequest(timeoutMs);
+    }
+
+    /**
+     * @brief Releases a thread parked in WaitForGuestCall(), for shutdown.
+     *
+     * A host whose teardown budget is shorter than its park quantum MUST call
+     * this when it clears its stop flag: otherwise the flag flip is invisible to
+     * a thread blocked in the OS wait, the join outlives the budget, and the
+     * host is forced to DETACH a thread that is still executing inside its own
+     * image. Safe when nothing is parked, and safe when there are no guest slots.
+     */
+    void WakeGuestCallWaiter() {
+        worker_.WakeWaiter();
+    }
 };
 
 }

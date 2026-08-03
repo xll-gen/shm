@@ -66,23 +66,78 @@ public:
     // lifecycle still joins via DirectHost::Shutdown(); this only backstops it.
     ~GuestCallWorker() { Stop(); }
 
-    void GuestWorkerLoop(GuestCallHandler handler, int32_t maxBatchSize) {
-        if (pinMask != 0) {
-            Platform::PinCurrentThreadAffinity(pinMask);
+    // Poll cadence for the two fallback paths that have no event to park on
+    // (no guest slots at all, or no shared request event). It is deliberately
+    // NOT the caller's timeout: those paths cannot be woken, so the timeout is
+    // a POLL INTERVAL there, and honouring a 1 s park would make a request wait
+    // up to 1 s and shutdown up to 1 s -- a 10x regression against the 100 ms
+    // the pre-extraction loop used. A caller asking for LESS than this still
+    // gets what it asked for.
+    static constexpr uint32_t kFallbackPollMs = 100;
+
+    /**
+     * @brief The shared request event every guest slot signals on, or nullptr.
+     *
+     * All guest slots share one event (shmName + "_guest_call"), so the first
+     * one answers for all. The size conjunct is the confirmed-correct guard from
+     * GuestWorkerLoop -- reused, deliberately not re-derived.
+     */
+    EventHandle GuestRequestEvent() const {
+        if (alloc && alloc->numGuestSlots > 0 &&
+            alloc->numSlots + alloc->numGuestSlots <= alloc->slots.size()) {
+            return alloc->slots[alloc->numSlots].hReqEvent;
         }
-        EventHandle waitEvent = nullptr;
-        // Since all guest slots share the same reqEvent (shmName + "_guest_call"),
-        // we can wait on the first one.
-        if (alloc->numGuestSlots > 0 && alloc->numSlots + alloc->numGuestSlots <= alloc->slots.size()) {
-             waitEvent = alloc->slots[alloc->numSlots].hReqEvent;
+        return nullptr;
+    }
+
+    /**
+     * @brief Blocks until a guest request looks ready, timeoutMs elapses, or
+     *        WakeWaiter() is called. Returns the advisory readiness observed.
+     *
+     * THIS IS THE ONLY IMPLEMENTATION OF THE SPECIFICATION.md 3.5 DOORBELL GATE.
+     * GuestWorkerLoop calls it rather than carrying its own copy: a second copy
+     * of a Dekker is how a lost wakeup ships. If you are tempted to inline a
+     * variant for a new caller, add a parameter here instead.
+     *
+     * The gate, and why each memory order is what it is: we publish
+     * HOST_STATE_WAITING on every guest slot (seq_cst) so a concurrently-sending
+     * guest may elide its doorbell SetEvent, then RECHECK the request predicate
+     * once (seq_cst) before parking. The sender does
+     * store REQ_READY(seq_cst) -> load hostState(seq_cst); we do
+     * store hostState=WAITING(seq_cst) -> load state(seq_cst). The single seq_cst
+     * total order forbids both loads from missing, so there is no lost wakeup.
+     * On wake we restore ACTIVE so the caller's processing phase runs
+     * doorbell-free.
+     *
+     * The return value is ADVISORY. The caller must still call ProcessGuestCalls,
+     * which re-checks each slot under the ownership CAS -- a `true` here only
+     * means "do not go back to sleep yet".
+     *
+     * FOREIGN CALLERS (a host that runs its own loop instead of Start()): this is
+     * safe to call from any single thread, and it is the ONLY way such a host gets
+     * the doorbell at all. Until it does, hostState on the guest slots stays
+     * HOST_STATE_ACTIVE forever, the Go sender's `if hostState == WAITING` gate
+     * never fires, and every request arrives with no signal behind it -- so a
+     * naive wait in a foreign loop expires on its own timeout every single call.
+     * Call this, do not roll your own.
+     */
+    bool WaitForRequest(uint32_t timeoutMs) {
+        if (!alloc || alloc->numGuestSlots == 0) {
+            // No guest slots exist, so no request can ever arrive. Sleep rather
+            // than returning instantly, so a foreign loop does not turn into the
+            // busy-wait this function exists to end -- but at the POLL cadence,
+            // not the caller's full park (see kFallbackPollMs).
+            if (timeoutMs > 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(
+                    timeoutMs < kFallbackPollMs ? timeoutMs : kFallbackPollMs));
+            }
+            return false;
         }
 
         const uint32_t base = alloc->numSlots;
         const uint32_t count = alloc->numGuestSlots;
+        EventHandle waitEvent = GuestRequestEvent();
 
-        // Any guest slot with a published request. This is the spin predicate
-        // and the pre-park recheck; the seq_cst load pairs with the Go sender's
-        // seq_cst REQ_READY store (Dekker, see sleepAction below).
         auto anyRequestReady = [&]() -> bool {
             for (uint32_t i = base; i < base + count; ++i) {
                 if (alloc->slots[i].header->state.load(std::memory_order_seq_cst) == SLOT_REQ_READY) {
@@ -98,49 +153,66 @@ public:
             }
         };
 
-        if (!spin || !waitEvent) {
-            // Sleep-only loop (also the fallback when there is no shared request
-            // event). Still maintains the HOST_STATE_WAITING/ACTIVE contract
-            // around the park so the Go sender's doorbell gate stays correct
-            // when spin is disabled — the only thing dropped here is the spin
-            // phase, so the sender always signals a parked worker and the loss
-            // is just the spin-catch fast path, never a wakeup.
-            while (guestWorkerRunning.load(std::memory_order_relaxed)) {
-                if (waitEvent) {
-                    setHostState(HOST_STATE_WAITING, std::memory_order_seq_cst);
-                    if (!anyRequestReady()) {
-                        Platform::WaitEvent(waitEvent, 1000);
-                    }
-                    setHostState(HOST_STATE_ACTIVE, std::memory_order_relaxed);
-                } else {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                }
-                ProcessGuestCalls(handler, maxBatchSize);
-            }
-            return;
+        if (!waitEvent) {
+            // No shared request event: there is nothing to park on and nothing
+            // for a sender to signal, so the WAITING/ACTIVE contract would be a
+            // lie. Poll instead.
+            std::this_thread::sleep_for(std::chrono::milliseconds(
+                (timeoutMs > 0 && timeoutMs < kFallbackPollMs) ? timeoutMs : kFallbackPollMs));
+            return anyRequestReady();
         }
 
-        // Runs only when the spin window is exhausted. Publish WAITING on every
-        // guest slot (seq_cst) so a concurrently-sending guest gates its
-        // doorbell on it, then recheck once (Dekker: sender does
-        // store REQ_READY(seq_cst) → load hostState(seq_cst); we do
-        // store hostState=WAITING(seq_cst) → load state(seq_cst) — the seq_cst
-        // total order forbids both loads from missing, so no lost wakeup). Only
-        // park if the recheck is still empty. On wake, restore ACTIVE so the
-        // spin/process phase runs doorbell-free.
         auto sleepAction = [&]() {
             setHostState(HOST_STATE_WAITING, std::memory_order_seq_cst);
             if (anyRequestReady()) {
                 setHostState(HOST_STATE_ACTIVE, std::memory_order_relaxed);
                 return;
             }
-            // 1s cap bounds shutdown latency (Stop() flips guestWorkerRunning).
-            Platform::WaitEvent(waitEvent, 1000);
+            Platform::WaitEvent(waitEvent, timeoutMs);
             setHostState(HOST_STATE_ACTIVE, std::memory_order_relaxed);
         };
 
+        if (!spin) {
+            // Sleep-only: keep the WAITING/ACTIVE contract around the park so the
+            // sender's doorbell gate stays correct; only the spin phase is
+            // dropped, so the sender always signals a parked waiter and the loss
+            // is the spin-catch fast path, never a wakeup.
+            sleepAction();
+            return anyRequestReady();
+        }
+
+        waitStrategy.Wait(anyRequestReady, sleepAction);
+        return anyRequestReady();
+    }
+
+    /**
+     * @brief Releases a thread parked in WaitForRequest(), for shutdown.
+     *
+     * Signals the shared guest request event. A parked waiter wakes, restores
+     * HOST_STATE_ACTIVE and returns; its caller then observes whatever stop flag
+     * it owns. Safe to call when nothing is parked (the event is auto-reset) and
+     * safe when there are no guest slots (no-op).
+     *
+     * A foreign-loop host needs this: without it, stopping the loop waits out the
+     * full park quantum, and a host whose teardown budget is shorter than that
+     * quantum would DETACH a thread that is still executing inside its image.
+     */
+    void WakeWaiter() {
+        if (EventHandle ev = GuestRequestEvent()) {
+            Platform::SignalEvent(ev);
+        }
+    }
+
+    void GuestWorkerLoop(GuestCallHandler handler, int32_t maxBatchSize) {
+        if (pinMask != 0) {
+            Platform::PinCurrentThreadAffinity(pinMask);
+        }
+        // The wait/doorbell gate lives in WaitForRequest so there is exactly one
+        // copy of it (see that function). The 1 s cap bounds shutdown latency:
+        // Stop() flips guestWorkerRunning and signals the event, so the park is
+        // normally cut short rather than waited out.
         while (guestWorkerRunning.load(std::memory_order_relaxed)) {
-            waitStrategy.Wait(anyRequestReady, sleepAction);
+            WaitForRequest(1000);
             ProcessGuestCalls(handler, maxBatchSize);
         }
     }
@@ -162,6 +234,14 @@ public:
      */
     void Stop() {
         if (guestWorkerRunning.exchange(false)) {
+            // Pop the worker out of its park instead of waiting the quantum
+            // out. Without this the join below blocks for up to the full
+            // WaitForRequest timeout (1 s from GuestWorkerLoop) on every
+            // shutdown of an idle host -- the flag flip alone is invisible to
+            // a thread blocked in WaitForSingleObject. The event is auto-reset
+            // and the flag is already false, so a spurious wake just re-tests
+            // the loop condition and exits.
+            WakeWaiter();
             if (guestWorker.joinable()) {
                 guestWorker.join();
             }
