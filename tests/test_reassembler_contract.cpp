@@ -42,20 +42,28 @@ std::vector<uint8_t> startReq(uint64_t streamId, uint64_t totalSize,
     h.streamId = streamId;
     h.totalSize = totalSize;
     h.totalChunks = totalChunks;
-    h.reserved = 0;
+    h.appMsgType = 0;
     std::vector<uint8_t> buf(sizeof(StreamHeader));
     std::memcpy(buf.data(), &h, sizeof(h));
     return buf;
 }
 
 // Build a STREAM_CHUNK request buffer: header + payload.
+//
+// dstOffset (SHM_VERSION 0x00080000, formerly reserved@16) is the ABSOLUTE
+// destination of the payload inside the stream and is REQUIRED here rather than
+// defaulted, because 0 is a legal offset for chunk 0: a call site that forgot
+// the field would silently claim "offset 0" and either pass vacuously or fail
+// as a misplacement for the wrong reason. Every caller below passes the value a
+// conforming sender would write (the prefix sum of the preceding payloadSizes).
 std::vector<uint8_t> chunkReq(uint64_t streamId, uint32_t chunkIndex,
+                              uint32_t dstOffset,
                               const std::vector<uint8_t>& payload) {
     ChunkHeader h;
     h.streamId = streamId;
     h.chunkIndex = chunkIndex;
     h.payloadSize = static_cast<uint32_t>(payload.size());
-    h.reserved = 0;
+    h.dstOffset = dstOffset;
     h.padding = 0;
     std::vector<uint8_t> buf(sizeof(ChunkHeader) + payload.size());
     std::memcpy(buf.data(), &h, sizeof(h));
@@ -103,11 +111,11 @@ int main() {
                   MsgType::NORMAL,
               "valid start ACKs");
         CHECK(handle(r, MsgType::STREAM_CHUNK,
-                     chunkReq(2, 0, {0xAA, 0xBB})) == MsgType::NORMAL,
+                     chunkReq(2, 0, 0, {0xAA, 0xBB})) == MsgType::NORMAL,
               "chunk0 ACKs");
         // Final chunk completes count (2/2) but total is 4 != 6.
         MsgType mt =
-            handle(r, MsgType::STREAM_CHUNK, chunkReq(2, 1, {0xCC, 0xDD}));
+            handle(r, MsgType::STREAM_CHUNK, chunkReq(2, 1, 2, {0xCC, 0xDD}));
         CHECK(mt == MsgType::SYSTEM_ERROR,
               "size-mismatch completion must be SYSTEM_ERROR (drop)");
         CHECK(!fired, "no callback on size-mismatch drop");
@@ -123,10 +131,10 @@ int main() {
                   MsgType::NORMAL,
               "valid start ACKs");
         CHECK(handle(r, MsgType::STREAM_CHUNK,
-                     chunkReq(3, 0, {0x01, 0x02})) == MsgType::NORMAL,
+                     chunkReq(3, 0, 0, {0x01, 0x02})) == MsgType::NORMAL,
               "chunk0 ACKs");
         MsgType mt =
-            handle(r, MsgType::STREAM_CHUNK, chunkReq(3, 1, {0x03, 0x04}));
+            handle(r, MsgType::STREAM_CHUNK, chunkReq(3, 1, 2, {0x03, 0x04}));
         CHECK(mt == MsgType::SYSTEM_ERROR,
               "assembled-length overflow must be SYSTEM_ERROR");
         CHECK(!fired, "no callback on overflow drop");
@@ -146,11 +154,14 @@ int main() {
         CHECK(handle(r, MsgType::STREAM_START, startReq(30, 3, 3)) ==
                   MsgType::NORMAL,
               "valid start ACKs");
+        // dstOffset 1 keeps chunk2 in bounds (1+2 == totalSize), so what refuses
+        // the next chunk is unambiguously the running-length guard and not the
+        // dstOffset bounds guard.
         CHECK(handle(r, MsgType::STREAM_CHUNK,
-                     chunkReq(30, 2, {0x01, 0x02})) == MsgType::NORMAL,
+                     chunkReq(30, 2, 1, {0x01, 0x02})) == MsgType::NORMAL,
               "ooo chunk2 within totalSize ACKs");
         MsgType mt =
-            handle(r, MsgType::STREAM_CHUNK, chunkReq(30, 1, {0x03, 0x04}));
+            handle(r, MsgType::STREAM_CHUNK, chunkReq(30, 1, 0, {0x03, 0x04}));
         CHECK(mt == MsgType::SYSTEM_ERROR,
               "ooo running-length overflow must be SYSTEM_ERROR at arrival");
         CHECK(!fired, "no callback on ooo overflow drop");
@@ -196,9 +207,9 @@ int main() {
                   MsgType::NORMAL,
               "valid start ACKs");
         CHECK(handle(r, MsgType::STREAM_CHUNK,
-                     chunkReq(6, 0, {'A', 'B', 'C'})) == MsgType::NORMAL,
+                     chunkReq(6, 0, 0, {'A', 'B', 'C'})) == MsgType::NORMAL,
               "chunk0 ACKs");
-        CHECK(handle(r, MsgType::STREAM_CHUNK, chunkReq(6, 1, {'D', 'E'})) ==
+        CHECK(handle(r, MsgType::STREAM_CHUNK, chunkReq(6, 1, 3, {'D', 'E'})) ==
                   MsgType::NORMAL,
               "chunk1 completes");
         CHECK(fired == 1, "normal stream fires callback exactly once");
@@ -218,11 +229,11 @@ int main() {
         CHECK(handle(r, MsgType::STREAM_START, startReq(7, 5, 2)) ==
                   MsgType::NORMAL,
               "valid start ACKs");
-        CHECK(handle(r, MsgType::STREAM_CHUNK, chunkReq(7, 1, {'D', 'E'})) ==
+        CHECK(handle(r, MsgType::STREAM_CHUNK, chunkReq(7, 1, 3, {'D', 'E'})) ==
                   MsgType::NORMAL,
               "chunk1 (first) ACKs");
         CHECK(handle(r, MsgType::STREAM_CHUNK,
-                     chunkReq(7, 0, {'A', 'B', 'C'})) == MsgType::NORMAL,
+                     chunkReq(7, 0, 0, {'A', 'B', 'C'})) == MsgType::NORMAL,
               "chunk0 (last) completes");
         CHECK(fired == 1, "reverse-order stream fires callback once");
         CHECK(got.size() == 5 && std::memcmp(got.data(), "ABCDE", 5) == 0,
@@ -271,15 +282,16 @@ int main() {
         CHECK(handle(r, MsgType::STREAM_START, startReq(10, 3, 2)) ==
                   MsgType::NORMAL,
               "valid start ACKs");
-        CHECK(handle(r, MsgType::STREAM_CHUNK, chunkReq(10, 0, {})) ==
+        // Chunk 0 is empty, so chunk 1 legitimately starts at dstOffset 0.
+        CHECK(handle(r, MsgType::STREAM_CHUNK, chunkReq(10, 0, 0, {})) ==
                   MsgType::NORMAL,
               "zero-length chunk0 ACKs");
-        CHECK(handle(r, MsgType::STREAM_CHUNK, chunkReq(10, 0, {})) ==
+        CHECK(handle(r, MsgType::STREAM_CHUNK, chunkReq(10, 0, 0, {})) ==
                   MsgType::NORMAL,
               "duplicate zero-length chunk0 ACKs (ignored, not re-counted)");
         CHECK(fired == 0, "not complete after zero-length chunk0 + its dup");
         CHECK(handle(r, MsgType::STREAM_CHUNK,
-                     chunkReq(10, 1, {'X', 'Y', 'Z'})) == MsgType::NORMAL,
+                     chunkReq(10, 1, 0, {'X', 'Y', 'Z'})) == MsgType::NORMAL,
               "chunk1 completes the stream");
         CHECK(fired == 1, "zero-length+dup stream fires callback exactly once");
         CHECK(got.size() == 3 && std::memcmp(got.data(), "XYZ", 3) == 0,
@@ -294,14 +306,14 @@ int main() {
         CHECK(handle(r, MsgType::STREAM_START, startReq(11, 4, 2)) ==
                   MsgType::NORMAL,
               "valid start ACKs");
-        CHECK(handle(r, MsgType::STREAM_CHUNK, chunkReq(11, 0, {'A', 'B'})) ==
+        CHECK(handle(r, MsgType::STREAM_CHUNK, chunkReq(11, 0, 0, {'A', 'B'})) ==
                   MsgType::NORMAL,
               "chunk0 ACKs");
-        CHECK(handle(r, MsgType::STREAM_CHUNK, chunkReq(11, 0, {'A', 'B'})) ==
+        CHECK(handle(r, MsgType::STREAM_CHUNK, chunkReq(11, 0, 0, {'A', 'B'})) ==
                   MsgType::NORMAL,
               "duplicate chunk0 ignored");
         CHECK(fired == 0, "stream not complete after a duplicate of chunk0");
-        CHECK(handle(r, MsgType::STREAM_CHUNK, chunkReq(11, 1, {'C', 'D'})) ==
+        CHECK(handle(r, MsgType::STREAM_CHUNK, chunkReq(11, 1, 2, {'C', 'D'})) ==
                   MsgType::NORMAL,
               "chunk1 completes");
         CHECK(fired == 1, "completes exactly once despite duplicate");

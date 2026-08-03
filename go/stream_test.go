@@ -168,10 +168,15 @@ func TestStreaming(t *testing.T) {
 		}
 		payload := data[start:end]
 
+		// DstOffset is the ABSOLUTE destination of this chunk (SHM_VERSION
+		// 0x00080000). `start` already is that offset. The chunks go out across
+		// numSlots slots, so the guest's workers can observe them out of order;
+		// DstOffset is what makes that harmless.
 		ch := ChunkHeader{
 			StreamID:    streamID,
 			ChunkIndex:  uint32(i),
 			PayloadSize: uint32(len(payload)),
+			DstOffset:   uint32(start),
 		}
 
 		buf := new(bytes.Buffer)

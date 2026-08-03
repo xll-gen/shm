@@ -63,10 +63,19 @@ configure_package_config_file(
     INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/shm
 )
 
+# SameMinorVersion, not SameMajorVersion: on the 0.x line CMake reads major = 0,
+# so SameMajorVersion made every 0.y release satisfy every other one. That is
+# exactly wrong here — AGENTS.md §Versioning states that on 0.x the MINOR slot
+# plays the major role (0.8.x -> 0.9.0 carried the SHM_VERSION 0x00070000 ->
+# 0x00080000 wire break), and SPEC §2.1 requires mixed-version traffic be
+# impossible by construction rather than by convention. Under SameMajorVersion a
+# consumer that pinned `find_package(shm 0.8.21 REQUIRED)` to the 0x00070000 wire
+# was silently handed 0.9.0's headers, and the mismatch only surfaced as a total
+# attach failure at runtime.
 write_basic_package_version_file(
     "${CMAKE_CURRENT_BINARY_DIR}/shmConfigVersion.cmake"
     VERSION ${PROJECT_VERSION}
-    COMPATIBILITY SameMajorVersion
+    COMPATIBILITY SameMinorVersion
 )
 
 install(FILES

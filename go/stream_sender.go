@@ -25,29 +25,38 @@ const (
 // putStreamHeader writes a StreamHeader at the start of buf, which the caller
 // must have verified holds at least streamHeaderSize bytes. Field offsets are
 // SPEC §3.3.1.
-func putStreamHeader(buf []byte, streamID, totalSize uint64, totalChunks uint32) {
+func putStreamHeader(buf []byte, streamID, totalSize uint64, totalChunks, appMsgType uint32) {
 	binary.LittleEndian.PutUint64(buf[0:], streamID)
 	binary.LittleEndian.PutUint64(buf[8:], totalSize)
 	binary.LittleEndian.PutUint32(buf[16:], totalChunks)
-	binary.LittleEndian.PutUint32(buf[20:], 0) // Reserved
+	binary.LittleEndian.PutUint32(buf[20:], appMsgType)
 }
 
 // putChunkHeader writes a ChunkHeader at the start of buf, which the caller must
 // have verified holds at least chunkHeaderSize bytes. Field offsets are SPEC
 // §3.3.2.
-func putChunkHeader(buf []byte, streamID uint64, chunkIndex, payloadSize uint32) {
+func putChunkHeader(buf []byte, streamID uint64, chunkIndex, payloadSize, dstOffset uint32) {
 	binary.LittleEndian.PutUint64(buf[0:], streamID)
 	binary.LittleEndian.PutUint32(buf[8:], chunkIndex)
 	binary.LittleEndian.PutUint32(buf[12:], payloadSize)
-	binary.LittleEndian.PutUint32(buf[16:], 0) // Reserved
-	binary.LittleEndian.PutUint32(buf[20:], 0) // Padding
+	binary.LittleEndian.PutUint32(buf[16:], dstOffset) // absolute destination
+	binary.LittleEndian.PutUint32(buf[20:], 0)         // Padding
 }
 
 // StreamSender helps sending large data streams to the Host (Guest Stream).
 type StreamSender struct {
 	client      *Client
 	maxInFlight int
+	// appMsgType is written into StreamHeader.appMsgType@20 (SPEC 3.3.1) and is
+	// OPAQUE to shm: an application-defined routing tag, so a receiver can dispatch
+	// a completed stream without a second framing layer inside the payload.
+	// 0 = unspecified, which is what every sender before SHM_VERSION 0x00080000 wrote.
+	appMsgType uint32
 }
+
+// SetAppMsgType sets the routing tag carried on subsequent STREAM_STARTs. shm
+// neither interprets nor validates it.
+func (s *StreamSender) SetAppMsgType(t uint32) { s.appMsgType = t }
 
 // NewStreamSender creates a new StreamSender.
 // c: The Client instance.
@@ -121,6 +130,22 @@ func (s *StreamSender) acquireSlot(abort <-chan error) (*GuestSlot, error) {
 // was derived from, so the number of chunks actually sent always matches the
 // number advertised.
 func (s *StreamSender) sendStart(data []byte, streamID uint64) (maxPayload int, err error) {
+	// A sender MUST refuse a stream whose byte offsets it cannot express, rather
+	// than truncate (SPEC §3.3.2 clause 2). sendChunk narrows the absolute offset
+	// to ChunkHeader.dstOffset with uint32(dstOffset): past 4 GiB that wraps and
+	// every chunk after the wrap lands at a wrong but IN-BOUNDS address, which the
+	// receiver cannot detect. Below 4 GiB but above MaxStreamSize the peer refuses
+	// the STREAM_START anyway, so continuing only burns slots on chunks it will
+	// also refuse — and relying on that refusal is explicitly not equivalent,
+	// because a truncated offset is a legal-looking value.
+	//
+	// ORDER IS LOAD-BEARING, and mirrors the C++ StreamSender::Send guard: this
+	// runs before any slot is acquired and before a single byte of data is read,
+	// so no slot is consumed and nothing reaches the wire.
+	if len(data) > MaxStreamSize {
+		return 0, fmt.Errorf("stream size %d bytes exceeds the %d-byte wire ceiling MaxStreamSize: ChunkHeader.dstOffset is a uint32 and truncating an absolute offset into it would place chunks at legal-looking wrong addresses (SPEC 3.3.2)", len(data), MaxStreamSize)
+	}
+
 	slot, err := s.acquireSlot(nil)
 	if err != nil {
 		return 0, fmt.Errorf("failed to acquire slot for Stream Start: %w", err)
@@ -148,7 +173,7 @@ func (s *StreamSender) sendStart(data []byte, streamID uint64) (maxPayload int, 
 		totalChunks = (len(data) + maxPayload - 1) / maxPayload
 	}
 
-	putStreamHeader(reqBuf, streamID, uint64(len(data)), uint32(totalChunks))
+	putStreamHeader(reqBuf, streamID, uint64(len(data)), uint32(totalChunks), s.appMsgType)
 
 	// The reassembler signals rejection (unknown/duplicate stream, size
 	// overflow, OOM, eviction pressure) not via a transport error but via
@@ -169,7 +194,7 @@ func (s *StreamSender) sendStart(data []byte, streamID uint64) (maxPayload int, 
 // sendChunk writes one MSG_TYPE_STREAM_CHUNK (header + payload) into the slot's
 // request buffer and sends it. Slot acquisition and release belong to the
 // caller, so this is shared verbatim by the inline and pipelined paths.
-func sendChunk(slot *GuestSlot, streamID uint64, idx uint32, payload []byte) error {
+func sendChunk(slot *GuestSlot, streamID uint64, idx uint32, dstOffset uint64, payload []byte) error {
 	reqBuf := slot.RequestBuffer()
 
 	if len(reqBuf) < chunkHeaderSize+len(payload) {
@@ -179,7 +204,7 @@ func sendChunk(slot *GuestSlot, streamID uint64, idx uint32, payload []byte) err
 	// The guard above already gives len(reqBuf) >= chunkHeaderSize+len(payload)
 	// >= chunkHeaderSize (pinned to 24 by the compile-time size assert in
 	// stream.go), so the header write below is in bounds without a separate check.
-	putChunkHeader(reqBuf, streamID, idx, uint32(len(payload)))
+	putChunkHeader(reqBuf, streamID, idx, uint32(len(payload)), uint32(dstOffset))
 
 	copy(reqBuf[chunkHeaderSize:], payload)
 
@@ -215,7 +240,7 @@ func (s *StreamSender) sendChunksInline(data []byte, streamID uint64, maxPayload
 		if err != nil {
 			return err
 		}
-		err = sendChunk(slot, streamID, idx, data[offset:end])
+		err = sendChunk(slot, streamID, idx, uint64(offset), data[offset:end])
 		slot.Release()
 		if err != nil {
 			return err
@@ -263,18 +288,18 @@ func (s *StreamSender) sendChunksPipelined(data []byte, streamID uint64, maxPayl
 			end = len(data)
 		}
 
-		go func(slot *GuestSlot, payload []byte, idx uint32) {
+		go func(slot *GuestSlot, payload []byte, idx uint32, dstOffset uint64) {
 			defer wg.Done()
 			defer func() { <-sem }()
 			defer slot.Release()
 
-			if err := sendChunk(slot, streamID, idx, payload); err != nil {
+			if err := sendChunk(slot, streamID, idx, dstOffset, payload); err != nil {
 				select {
 				case errChan <- err:
 				default:
 				}
 			}
-		}(slot, data[offset:end], idx)
+		}(slot, data[offset:end], idx, uint64(offset))
 
 		offset = end
 	}

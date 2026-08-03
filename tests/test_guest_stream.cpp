@@ -96,7 +96,7 @@ int main() {
         hdr.streamId = 999;
         hdr.totalSize = 5;
         hdr.totalChunks = 2; // Split 5 bytes into 3 + 2
-        hdr.reserved = 0;
+        hdr.appMsgType = 0;
 
         memcpy(buf, &hdr, sizeof(hdr));
 
@@ -122,7 +122,7 @@ int main() {
         hdr.streamId = 999;
         hdr.chunkIndex = 0;
         hdr.payloadSize = 3;
-        hdr.reserved = 0;
+        hdr.dstOffset = 0;
 
         memcpy(buf, &hdr, sizeof(hdr));
         memcpy(buf + sizeof(hdr), "ABC", 3);
@@ -148,7 +148,7 @@ int main() {
         hdr.streamId = 999;
         hdr.chunkIndex = 1;
         hdr.payloadSize = 2;
-        hdr.reserved = 0;
+        hdr.dstOffset = 3; // absolute: chunk 0 carried the first 3 bytes
 
         memcpy(buf, &hdr, sizeof(hdr));
         memcpy(buf + sizeof(hdr), "DE", 2);

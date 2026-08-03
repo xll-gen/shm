@@ -16,12 +16,27 @@ func streamStartReq(streamID, totalSize uint64, totalChunks uint32) []byte {
 	return buf.Bytes()
 }
 
+// streamChunkReq builds a STREAM_CHUNK for a stream whose chunks are all the same
+// length, deriving ChunkHeader.DstOffset as chunkIndex*len(payload).
+//
+// Since SHM_VERSION 0x00080000 DstOffset is load-bearing: the reassembler requires
+// it to equal the running cursor when the index becomes in-order, so a helper that
+// left it zero would have every chunk past index 0 rejected as misplaced. Uniform
+// size is what nearly every test here sends; use streamChunkReqAt when it is not.
 func streamChunkReq(streamID uint64, chunkIndex uint32, payload []byte) []byte {
+	return streamChunkReqAt(streamID, chunkIndex, uint64(chunkIndex)*uint64(len(payload)), payload)
+}
+
+// streamChunkReqAt builds a STREAM_CHUNK with an explicit DstOffset, for streams
+// whose chunks are NOT uniformly sized (or for tests that deliberately misplace a
+// chunk to prove the guard fires).
+func streamChunkReqAt(streamID uint64, chunkIndex uint32, dstOffset uint64, payload []byte) []byte {
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.LittleEndian, ChunkHeader{
 		StreamID:    streamID,
 		ChunkIndex:  chunkIndex,
 		PayloadSize: uint32(len(payload)),
+		DstOffset:   uint32(dstOffset),
 	})
 	buf.Write(payload)
 	return buf.Bytes()

@@ -34,16 +34,19 @@ func TestStreamReassembly_OutOfOrder(t *testing.T) {
 	c0, c1, c2 := []byte("aaaa"), []byte("bbbb"), []byte("cc")
 	want := []byte("aaaabbbbcc")
 
+	// Chunk 2 is short, so DstOffset is 8 rather than the 2*len(c2)=4 the
+	// uniform-size helper would derive.
 	for name, order := range map[string][]struct {
 		idx     uint32
+		off     uint64
 		payload []byte
 	}{
-		"1-0-2": {{1, c1}, {0, c0}, {2, c2}},
-		"2-1-0": {{2, c2}, {1, c1}, {0, c0}},
+		"1-0-2": {{1, 4, c1}, {0, 0, c0}, {2, 8, c2}},
+		"2-1-0": {{2, 8, c2}, {1, 4, c1}, {0, 0, c0}},
 	} {
 		delivered := reassembleWith(t, uint64(len(want)), 3, func(handler func([]byte, []byte, MsgType) (int32, MsgType)) {
 			for _, ch := range order {
-				if _, mt := handler(streamChunkReq(42, ch.idx, ch.payload), nil, MsgTypeStreamChunk); mt != MsgTypeNormal {
+				if _, mt := handler(streamChunkReqAt(42, ch.idx, ch.off, ch.payload), nil, MsgTypeStreamChunk); mt != MsgTypeNormal {
 					t.Fatalf("%s: chunk %d rejected: %v", name, ch.idx, mt)
 				}
 			}
@@ -85,14 +88,17 @@ func TestStreamReassembly_DuplicateChunks(t *testing.T) {
 // TestStreamReassembly_ZeroLengthChunk verifies a zero-length chunk is
 // deduplicated by map presence (not slice nil-ness) and counted exactly once.
 func TestStreamReassembly_ZeroLengthChunk(t *testing.T) {
+	// Chunk 0 carries both bytes, so the empty chunk 1 sits at DstOffset 2 —
+	// the end of the destination, which inBounds must accept (offset ==
+	// totalSize with a zero-length payload).
 	delivered := reassembleWith(t, 2, 2, func(handler func([]byte, []byte, MsgType) (int32, MsgType)) {
-		if _, mt := handler(streamChunkReq(42, 1, nil), nil, MsgTypeStreamChunk); mt != MsgTypeNormal {
+		if _, mt := handler(streamChunkReqAt(42, 1, 2, nil), nil, MsgTypeStreamChunk); mt != MsgTypeNormal {
 			t.Fatalf("zero-length parked chunk rejected: %v", mt)
 		}
-		if _, mt := handler(streamChunkReq(42, 1, nil), nil, MsgTypeStreamChunk); mt != MsgTypeNormal {
+		if _, mt := handler(streamChunkReqAt(42, 1, 2, nil), nil, MsgTypeStreamChunk); mt != MsgTypeNormal {
 			t.Fatalf("duplicate zero-length chunk rejected: %v", mt)
 		}
-		if _, mt := handler(streamChunkReq(42, 0, []byte("ok")), nil, MsgTypeStreamChunk); mt != MsgTypeNormal {
+		if _, mt := handler(streamChunkReqAt(42, 0, 0, []byte("ok")), nil, MsgTypeStreamChunk); mt != MsgTypeNormal {
 			t.Fatalf("final chunk rejected: %v", mt)
 		}
 	})
@@ -122,16 +128,29 @@ func TestStreamReassembly_RunningLengthOverflow(t *testing.T) {
 	}
 }
 
-// TestStreamReassembly_DrainOverflow trips the running-length guard on the
-// out-of-order drain path (the parked chunk, not the directly-delivered one,
-// overflows).
+// TestStreamReassembly_DrainOverflow trips the running-length guard using
+// ALREADY-PARKED bytes: chunk 1 fits on its own, and so does chunk 0, but their
+// sum exceeds the advertisement, so the gap-filling chunk is refused and the
+// stream dropped.
+//
+// Which guard fires moved with SHM_VERSION 0x00080000, and deliberately so. The
+// drain loop no longer re-checks fits(): every chunk is written at its declared
+// dstOffset on arrival, the park-time check already counted its bytes into
+// oooBytes, and the drain releases them again — so offset+oooBytes is invariant
+// and a drain can no longer discover a byte overflow. What can still overflow is
+// the ARRIVAL of the in-order chunk, which is what this asserts, via the
+// AGENTS.md §3.3.4 "parked bytes count" property of fits(). A drain-time
+// contradiction is now a misplacement rather than an overflow; that path is
+// pinned by the misplaced_parked_drops_on_drain parity case.
 func TestStreamReassembly_DrainOverflow(t *testing.T) {
 	delivered := reassembleWith(t, 4, 2, func(handler func([]byte, []byte, MsgType) (int32, MsgType)) {
-		if _, mt := handler(streamChunkReq(42, 1, []byte("bbb")), nil, MsgTypeStreamChunk); mt != MsgTypeNormal {
+		// Offset 1 keeps the 3-byte parked chunk inside the 4-byte destination,
+		// so the bounds guard stays out of the way.
+		if _, mt := handler(streamChunkReqAt(42, 1, 1, []byte("bbb")), nil, MsgTypeStreamChunk); mt != MsgTypeNormal {
 			t.Fatalf("parked chunk 1 rejected: %v", mt)
 		}
-		if _, mt := handler(streamChunkReq(42, 0, []byte("aaa")), nil, MsgTypeStreamChunk); mt != MsgTypeSystemError {
-			t.Fatalf("gap fill draining overflowing chunk: got %v, want SystemError", mt)
+		if _, mt := handler(streamChunkReqAt(42, 0, 0, []byte("aaa")), nil, MsgTypeStreamChunk); mt != MsgTypeSystemError {
+			t.Fatalf("gap fill against parked bytes: got %v, want SystemError", mt)
 		}
 	})
 	if len(delivered) != 0 {

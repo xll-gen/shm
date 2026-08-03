@@ -64,19 +64,24 @@ std::vector<uint8_t> startReq(uint64_t streamId, uint64_t totalSize,
     h.streamId = streamId;
     h.totalSize = totalSize;
     h.totalChunks = totalChunks;
-    h.reserved = 0;
+    h.appMsgType = 0;
     std::vector<uint8_t> buf(sizeof(StreamHeader));
     std::memcpy(buf.data(), &h, sizeof(h));
     return buf;
 }
 
 // A zero-length STREAM_CHUNK request for the given index.
+//
+// dstOffset 0 is in bounds for every stream this test advertises, so the only
+// guard that can refuse these chunks is the parked-COUNT bound under test. A
+// nonsense offset would be refused by InBounds instead and the case would pass
+// for the wrong reason.
 std::vector<uint8_t> emptyChunkReq(uint64_t streamId, uint32_t idx) {
     ChunkHeader h;
     h.streamId = streamId;
     h.chunkIndex = idx;
     h.payloadSize = 0;
-    h.reserved = 0;
+    h.dstOffset = 0;
     h.padding = 0;
     std::vector<uint8_t> buf(sizeof(ChunkHeader));
     std::memcpy(buf.data(), &h, sizeof(h));

@@ -17,10 +17,17 @@ import (
 // easy to break while fixing it — a well-formed out-of-order stream whose sum
 // equals totalSize exactly must still complete.
 
-// chunkStep is one STREAM_CHUNK delivery and its expected reply.
+// chunkStep is one STREAM_CHUNK delivery and its expected reply. off is the
+// ChunkHeader.DstOffset the step writes; the cases below all send unequal chunk
+// sizes, so it cannot be derived from idx*size. Every off here is deliberately
+// IN BOUNDS (off+size <= totalSize) so that the rejection under test is
+// unambiguously the SPEC §3.3.4 running-length guard and not the dstOffset
+// bounds guard, which would answer SystemError for a different reason and make
+// these cases pass vacuously.
 type chunkStep struct {
 	idx  uint32
 	size int
+	off  uint64
 	want MsgType
 }
 
@@ -44,8 +51,8 @@ func TestStreamReassembly_OutOfOrderRunningLengthOverflow(t *testing.T) {
 			totalSize:   1,
 			totalChunks: 1000,
 			steps: []chunkStep{
-				{idx: 1, size: 4096, want: MsgTypeSystemError},
-				{idx: 2, size: 4096, want: MsgTypeSystemError},
+				{idx: 1, size: 4096, off: 0, want: MsgTypeSystemError},
+				{idx: 2, size: 4096, off: 0, want: MsgTypeSystemError},
 			},
 		},
 		{
@@ -55,9 +62,9 @@ func TestStreamReassembly_OutOfOrderRunningLengthOverflow(t *testing.T) {
 			totalSize:   8,
 			totalChunks: 4,
 			steps: []chunkStep{
-				{idx: 3, size: 4, want: MsgTypeNormal},
-				{idx: 2, size: 4, want: MsgTypeNormal},
-				{idx: 1, size: 1, want: MsgTypeSystemError},
+				{idx: 3, size: 4, off: 4, want: MsgTypeNormal},
+				{idx: 2, size: 4, off: 0, want: MsgTypeNormal},
+				{idx: 1, size: 1, off: 0, want: MsgTypeSystemError},
 			},
 		},
 		{
@@ -67,8 +74,8 @@ func TestStreamReassembly_OutOfOrderRunningLengthOverflow(t *testing.T) {
 			totalSize:   8,
 			totalChunks: 3,
 			steps: []chunkStep{
-				{idx: 2, size: 6, want: MsgTypeNormal},
-				{idx: 0, size: 6, want: MsgTypeSystemError},
+				{idx: 2, size: 6, off: 2, want: MsgTypeNormal},
+				{idx: 0, size: 6, off: 0, want: MsgTypeSystemError},
 			},
 		},
 		{
@@ -78,8 +85,8 @@ func TestStreamReassembly_OutOfOrderRunningLengthOverflow(t *testing.T) {
 			totalSize:   4,
 			totalChunks: 3,
 			steps: []chunkStep{
-				{idx: 2, size: 0, want: MsgTypeNormal},
-				{idx: 1, size: 5, want: MsgTypeSystemError},
+				{idx: 2, size: 0, off: 4, want: MsgTypeNormal},
+				{idx: 1, size: 5, off: 0, want: MsgTypeSystemError},
 			},
 		},
 	}
@@ -93,8 +100,8 @@ func TestStreamReassembly_OutOfOrderRunningLengthOverflow(t *testing.T) {
 			}
 			for i, st := range tc.steps {
 				payload := make([]byte, st.size)
-				if _, mt := handler(streamChunkReq(42, st.idx, payload), nil, MsgTypeStreamChunk); mt != st.want {
-					t.Fatalf("step %d (chunk %d, %d bytes): got %v, want %v", i, st.idx, st.size, mt, st.want)
+				if _, mt := handler(streamChunkReqAt(42, st.idx, st.off, payload), nil, MsgTypeStreamChunk); mt != st.want {
+					t.Fatalf("step %d (chunk %d, %d bytes @%d): got %v, want %v", i, st.idx, st.size, st.off, mt, st.want)
 				}
 			}
 			if delivered != 0 {
@@ -119,7 +126,10 @@ func TestStreamReassembly_OutOfOrderOverflowBoundsMemory(t *testing.T) {
 	payload := make([]byte, chunkLen)
 	reqs := make([][]byte, 0, totalChunks-1)
 	for i := 1; i < totalChunks; i++ {
-		reqs = append(reqs, streamChunkReq(7, uint32(i), payload))
+		// dstOffset 0 keeps this a pure running-length rejection: a derived
+		// i*512KiB offset would be out of bounds against the 1024-byte
+		// advertisement and the case would pass on the bounds guard instead.
+		reqs = append(reqs, streamChunkReqAt(7, uint32(i), 0, payload))
 	}
 
 	handler := NewStreamReassembler(func(uint64, []byte) {
@@ -158,9 +168,14 @@ func TestStreamReassembly_OutOfOrderPatternsComplete(t *testing.T) {
 	var total uint64
 	want := make([]byte, 0, 512)
 	payloads := make([][]byte, n)
+	// offsets[i] is the prefix sum of sizes[0..i-1] — the ChunkHeader.DstOffset a
+	// conforming sender writes for chunk i. Unequal sizes are the whole point of
+	// this test, so it cannot use the idx*len derivation.
+	offsets := make([]uint64, n)
 	for i, sz := range sizes {
 		p := bytes.Repeat([]byte{byte('A' + i)}, sz)
 		payloads[i] = p
+		offsets[i] = total
 		want = append(want, p...)
 		total += uint64(sz)
 	}
@@ -206,7 +221,7 @@ func TestStreamReassembly_OutOfOrderPatternsComplete(t *testing.T) {
 				t.Fatalf("StreamStart rejected: %v", mt)
 			}
 			for step, idx := range order {
-				if _, mt := handler(streamChunkReq(99, idx, payloads[idx]), nil, MsgTypeStreamChunk); mt != MsgTypeNormal {
+				if _, mt := handler(streamChunkReqAt(99, idx, offsets[idx], payloads[idx]), nil, MsgTypeStreamChunk); mt != MsgTypeNormal {
 					t.Fatalf("step %d (chunk %d of order %v): got %v, want Normal — a valid out-of-order stream was rejected", step, idx, order, mt)
 				}
 			}
@@ -240,9 +255,16 @@ func TestStreamReassembly_OutOfOrderExactFillAccepted(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			payloads := make([][]byte, len(tc.sizes))
+			// Prefix sums again: "parked_chunk_fills_everything" is exactly the
+			// case where one chunk is empty and the next carries the whole
+			// advertisement, so idx*len derives the wrong offset.
+			offsets := make([]uint64, len(tc.sizes))
 			want := make([]byte, 0, tc.totalSize)
+			var run uint64
 			for i, sz := range tc.sizes {
 				payloads[i] = bytes.Repeat([]byte{byte('a' + i)}, sz)
+				offsets[i] = run
+				run += uint64(sz)
 				want = append(want, payloads[i]...)
 			}
 			var delivered [][]byte
@@ -253,7 +275,7 @@ func TestStreamReassembly_OutOfOrderExactFillAccepted(t *testing.T) {
 				t.Fatalf("StreamStart rejected: %v", mt)
 			}
 			for _, idx := range tc.order {
-				if _, mt := handler(streamChunkReq(5, idx, payloads[idx]), nil, MsgTypeStreamChunk); mt != MsgTypeNormal {
+				if _, mt := handler(streamChunkReqAt(5, idx, offsets[idx], payloads[idx]), nil, MsgTypeStreamChunk); mt != MsgTypeNormal {
 					t.Fatalf("chunk %d rejected: %v — exact fill must not trip the overflow guard", idx, mt)
 				}
 			}

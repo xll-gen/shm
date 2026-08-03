@@ -35,15 +35,34 @@ namespace shm {
 static const uint32_t SHM_MAGIC = 0x584C4C21;
 
 /**
- * @brief Wire protocol version (0x00070000). High 16 bits: Major, low 16 bits: Minor.
+ * @brief Wire protocol version (0x00080000). High 16 bits: Major, low 16 bits: Minor.
  *
- * Intentionally PINNED across the entire ABI-compatible v0.7.x series — patch
- * releases add fields carved from `reserved` (atomic uint64 `lease` at SlotHeader
- * offset 96 in v0.7.0 for crash-recovery reclamation; atomic uint64 `gen` at offset
- * 104 in v0.7.5 for the reclamation ABA guard) without bumping this constant, since
- * old readers never touched those bytes. Only breaking layout changes increment Major.
+ * SSOT PAIR: the twin of this constant is `Version` in `go/direct.go`. They MUST
+ * be edited in the same commit (AGENTS.md §Codebase Authority). A mismatch is not
+ * a soft degradation — it is a total attach failure ("protocol version mismatch") —
+ * so a half-applied bump takes the product down rather than producing a subtle bug.
+ *
+ * It was PINNED at 0x00070000 across the whole ABI-compatible v0.7.x–v0.8.x line:
+ * patch releases added fields carved from never-written `reserved` space (atomic
+ * uint64 `lease` at SlotHeader offset 96 in v0.7.0 for crash-recovery reclamation;
+ * atomic uint64 `gen` at offset 104 in v0.7.5 for the reclamation ABA guard;
+ * `ExchangeHeader::fastPathAllowed` in v0.8.8) WITHOUT bumping this constant,
+ * because a legacy zero in those slots is distinguishable from any value a new peer
+ * writes, so each side can degrade on its own.
+ *
+ * 0x00080000 is the first bump since, and the reason is exactly that
+ * distinguishability failing: `ChunkHeader::reserved`@16 became `dstOffset` and
+ * `StreamHeader::reserved`@20 became `appMsgType`, and 0 is a LEGAL `dstOffset` —
+ * it is what chunk 0 of every conforming stream declares. So there is no in-band
+ * discriminator between "offset zero" and "sender predates the field": a
+ * 0x00070000 sender against a 0x00080000 reader would stack every chunk at offset 0
+ * and complete a silently corrupt stream. The attach-time version check is the only
+ * safe discriminator. See SPECIFICATION.md §2.1 "Version compatibility is a HARD
+ * FAILURE at attach".
+ *
+ * Bump it only when the *bytes* change meaning.
  */
-static const uint32_t SHM_VERSION = 0x00070000;
+static const uint32_t SHM_VERSION = 0x00080000;
 
 /**
  * @brief Message Types for control messages.

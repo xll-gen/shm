@@ -61,7 +61,7 @@ std::vector<uint8_t> startReq(uint64_t streamId, uint64_t totalSize,
     h.streamId = streamId;
     h.totalSize = totalSize;
     h.totalChunks = totalChunks;
-    h.reserved = 0;
+    h.appMsgType = 0;
     std::vector<uint8_t> buf(sizeof(StreamHeader));
     std::memcpy(buf.data(), &h, sizeof(h));
     return buf;

@@ -2,8 +2,14 @@
 
 SimpleIPC is a high-performance, low-latency shared-memory IPC library connecting C++ (Host) and Go (Guest). It uses a lock-free, direct slot exchange model to achieve sub-microsecond latency.
 
-> This project is currently in **beta** (v0.8.9) and under active development.
+> This project is currently in **beta** and under active development.
 > APIs and memory layouts may still change between minor versions.
+> The current release version lives in the [`VERSION`](VERSION) file and in the
+> newest [CHANGELOG.md](CHANGELOG.md) entry — it is deliberately not restated
+> here (`AGENTS.md` §Codebase Authority: `VERSION` is the release-version SSOT
+> and the only place the number is written by hand). Version strings that do
+> appear below are **provenance labels on measurements and features** ("measured
+> on v0.8.9"), not the current version, and must not be bumped.
 
 ## Features
 

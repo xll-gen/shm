@@ -13,7 +13,9 @@ type StreamHeader struct {
 	StreamID    uint64
 	TotalSize   uint64
 	TotalChunks uint32
-	Reserved    uint32
+	// AppMsgType is an application-defined routing tag, OPAQUE to shm
+	// (0 = unspecified). Was Reserved before SHM_VERSION 0x00080000.
+	AppMsgType uint32
 }
 
 // ChunkHeader represents the metadata for a Stream Chunk message.
@@ -21,8 +23,13 @@ type ChunkHeader struct {
 	StreamID    uint64
 	ChunkIndex  uint32
 	PayloadSize uint32
-	Reserved    uint32
-	Padding     uint32 // Padding to match C++ alignment (24 bytes)
+	// DstOffset is the ABSOLUTE byte offset of this chunk's payload within the
+	// reassembled stream. Was Reserved before SHM_VERSION 0x00080000; giving it
+	// meaning is precisely why that bump exists, because a pre-0x00080000 sender
+	// writes 0 here and 0 is a LEGAL offset for chunk 0 — so a new reader against
+	// an old sender would stack every chunk at offset 0 with nothing to detect it.
+	DstOffset uint32
+	Padding   uint32 // Padding to match C++ alignment (24 bytes)
 }
 
 // Compile-time size assertions for streaming protocol headers.
@@ -34,6 +41,40 @@ var (
 	_ [unsafe.Sizeof(StreamHeader{}) - 24]byte
 	_ [24 - unsafe.Sizeof(ChunkHeader{})]byte
 	_ [unsafe.Sizeof(ChunkHeader{}) - 24]byte
+)
+
+// Per-field offset guards (AGENTS.md R25 idiom, same dual zero-array shape as
+// direct.go's SlotHeader/ExchangeHeader guards). The size asserts above cannot
+// see a size-preserving field reorder, and the two 24-byte stream headers are
+// full of same-width fields: swapping ChunkHeader.DstOffset with
+// ChunkHeader.Padding, or StreamHeader.TotalChunks with StreamHeader.AppMsgType,
+// still compiles at 24 bytes. That would be a SILENT wire break, not a build
+// error — DstOffset is read by the peer, and the three test files that build
+// chunk bytes via binary.Write on this struct would move with the bug, so the
+// suite could not catch it either.
+//
+// These mirror the C++ offsetof static_asserts in include/shm/Stream.h
+// (§3.3.1/§3.3.2 offset columns in SPECIFICATION.md); change all three together.
+var (
+	_ [0 - unsafe.Offsetof(StreamHeader{}.StreamID)]byte
+	_ [unsafe.Offsetof(StreamHeader{}.StreamID) - 0]byte
+	_ [8 - unsafe.Offsetof(StreamHeader{}.TotalSize)]byte
+	_ [unsafe.Offsetof(StreamHeader{}.TotalSize) - 8]byte
+	_ [16 - unsafe.Offsetof(StreamHeader{}.TotalChunks)]byte
+	_ [unsafe.Offsetof(StreamHeader{}.TotalChunks) - 16]byte
+	_ [20 - unsafe.Offsetof(StreamHeader{}.AppMsgType)]byte
+	_ [unsafe.Offsetof(StreamHeader{}.AppMsgType) - 20]byte
+
+	_ [0 - unsafe.Offsetof(ChunkHeader{}.StreamID)]byte
+	_ [unsafe.Offsetof(ChunkHeader{}.StreamID) - 0]byte
+	_ [8 - unsafe.Offsetof(ChunkHeader{}.ChunkIndex)]byte
+	_ [unsafe.Offsetof(ChunkHeader{}.ChunkIndex) - 8]byte
+	_ [12 - unsafe.Offsetof(ChunkHeader{}.PayloadSize)]byte
+	_ [unsafe.Offsetof(ChunkHeader{}.PayloadSize) - 12]byte
+	_ [16 - unsafe.Offsetof(ChunkHeader{}.DstOffset)]byte
+	_ [unsafe.Offsetof(ChunkHeader{}.DstOffset) - 16]byte
+	_ [20 - unsafe.Offsetof(ChunkHeader{}.Padding)]byte
+	_ [unsafe.Offsetof(ChunkHeader{}.Padding) - 20]byte
 )
 
 // Wire sizes of the streaming headers, as untyped constants so the parsers
@@ -130,12 +171,24 @@ type streamContext struct {
 	buf         []byte // preallocated destination, len == totalSize
 	next        uint32 // next in-order chunk index to consume into buf
 	offset      uint64 // bytes written into buf so far (running Σ payloadSize)
-	// ooo holds copies of chunks received ahead of next, keyed by chunk
-	// index. Presence in the map (not slice nil-ness) is the dedup marker so
-	// zero-length chunks are counted exactly once. nil until first needed.
-	ooo map[uint32][]byte
-	// oooBytes is Σ len(ooo[i]) — the bytes currently parked ahead of the
-	// cursor. offset+oooBytes is the running *received* length of the stream,
+	// ooo records chunks placed AHEAD of next, keyed by chunk index. Presence in
+	// the map is the dedup marker, so zero-length chunks are counted exactly
+	// once. nil until first needed.
+	//
+	// Since SHM_VERSION 0x00080000 it holds NO PAYLOAD — every chunk is written
+	// straight to buf[dstOffset] on arrival, so an out-of-order chunk costs a
+	// 12-byte record instead of a copy of itself, and the drain copies nothing.
+	//
+	// The map REMAINS, deliberately: with offset placement and NO dedup, two
+	// copies of chunk 0 (len 5) of a totalSize=10 / totalChunks=2 stream give
+	// receivedChunks=2 and receivedBytes==totalSize, so the stream COMPLETES with
+	// its second half never written. Dedup is what makes "count the chunks and
+	// count the bytes" a sound completion test.
+	ooo map[uint32]placedChunk
+	// oooBytes is Σ ooo[i].size — the bytes ALREADY PLACED in buf ahead of the
+	// cursor but not yet accounted in order (the map values carry no payload and
+	// therefore no length of their own).
+	// offset+oooBytes is the running *received* length of the stream,
 	// which is what the SPEC §3.3.4 per-chunk overflow guard bounds by
 	// totalSize; without it, a peer that only ever sends ahead-of-cursor
 	// indices parks unbounded memory and is caught only once the gap fills.
@@ -184,43 +237,52 @@ func (c *streamContext) fits(n int) bool {
 	return c.offset+c.oooBytes+uint64(n) <= c.totalSize
 }
 
-// consume appends data at the in-order cursor, enforcing the per-chunk
-// running-length guard. Returns false if the guard trips; the caller must then
-// drop the stream and answer MSG_TYPE_SYSTEM_ERROR. Draining a parked chunk
-// releases its oooBytes first (see the drain loop), so a chunk that fit when it
-// was parked still fits when it is consumed. Must be called under c.mu.
-func (c *streamContext) consume(data []byte) bool {
-	if !c.fits(len(data)) {
-		return false
-	}
-	copy(c.buf[c.offset:], data)
-	c.offset += uint64(len(data))
-	c.next++
-	return true
+// placedChunk records a chunk already written to its destination but not yet
+// accounted in order. It carries no payload: the bytes are in buf already.
+type placedChunk struct {
+	dstOffset uint64
+	size      uint32
 }
 
-// park buffers a chunk that arrived ahead of the in-order cursor. Both guards
-// run BEFORE the copy is allocated, so an over-advertised or over-fragmented
-// stream is rejected at arrival time instead of after all of its bytes (or all
-// of its map entries) are resident. Returns false if either guard trips; the
-// caller must then drop the stream. Must be called under c.mu.
-func (c *streamContext) park(index uint32, data []byte) bool {
-	if !c.fits(len(data)) {
+// inBounds reports whether [dstOffset, dstOffset+n) lies inside buf. dstOffset is
+// PEER-CONTROLLED, so this subtracts rather than adds — dstOffset+n could wrap.
+func (c *streamContext) inBounds(dstOffset uint64, n int) bool {
+	if dstOffset > c.totalSize {
 		return false
 	}
-	// Count bound (SPEC §3.3.4). Independent of fits: parked-entry overhead
-	// exists at zero payload, and a zero-length chunk can never trip the byte
-	// guard. See MaxParkedChunks.
+	return uint64(n) <= c.totalSize-dstOffset
+}
+
+// write puts a chunk at its absolute destination. Bounds-checked by the caller.
+func (c *streamContext) write(dstOffset uint64, data []byte) {
+	if len(data) > 0 {
+		copy(c.buf[dstOffset:], data)
+	}
+}
+
+// accountInOrder advances the cursor over a chunk already written.
+func (c *streamContext) accountInOrder(n int) {
+	c.offset += uint64(n)
+	c.next++
+}
+
+// notePlaced records an ahead-of-cursor chunk that has already been written to
+// buf. Returns false if the count bound trips; the caller must then drop the
+// stream. Must be called under c.mu.
+//
+// Count bound (SPEC §3.3.4), independent of fits(): a record costs memory at zero
+// payload, and a zero-length chunk can never trip the byte guard. It is now the
+// ONLY thing this bounds — the payload is no longer duplicated here — but that
+// makes it no less necessary. See MaxParkedChunks.
+func (c *streamContext) notePlaced(index uint32, dstOffset uint64, n int) bool {
 	if len(c.ooo) >= MaxParkedChunks {
 		return false
 	}
 	if c.ooo == nil {
-		c.ooo = make(map[uint32][]byte)
+		c.ooo = make(map[uint32]placedChunk)
 	}
-	parked := make([]byte, len(data))
-	copy(parked, data)
-	c.ooo[index] = parked
-	c.oooBytes += uint64(len(data))
+	c.ooo[index] = placedChunk{dstOffset: dstOffset, size: uint32(n)}
+	c.oooBytes += uint64(n)
 	return true
 }
 
@@ -266,6 +328,28 @@ func NewStreamReassembler(onStream StreamHandler, fallback func(req []byte, resp
 //     that a concurrent StreamStart already replaced cannot evict the fresh
 //     one.
 func newStreamReassembler(onStream StreamHandler, fallback func(req []byte, resp []byte, msgType MsgType) (int32, MsgType), timeout time.Duration, now func() time.Time) func(req []byte, resp []byte, msgType MsgType) (int32, MsgType) {
+	handler, _ := newStreamReassemblerPeek(onStream, fallback, timeout, now)
+	return handler
+}
+
+// newStreamReassemblerPeek is newStreamReassembler plus peek, which returns the
+// live streamContext for a stream ID (nil if there is none).
+//
+// It exists for ONE property that is unobservable from outside: whether an
+// ahead-of-cursor chunk's payload is already sitting at buf[dstOffset] while the
+// stream is still INCOMPLETE. Every other observable — delivered bytes, digests,
+// accept/reject — is identical between a dstOffset-honouring receiver and a
+// cursor-appending one, because the in-order invariant forces dstOffset to equal
+// the cursor for every index at the moment it becomes in-order. buf is handed out
+// only at completion, by which point both shapes have filled it, so the
+// distinguishing observation has to be taken mid-stream. See
+// go/stream_dstoffset_placement_test.go.
+//
+// peek takes the map mutex, so it is safe to call concurrently with the handler,
+// but the *contents* of the returned context must be read under ctx.mu. It is a
+// test seam in the same sense newStreamReassembler itself is (clock injection):
+// production goes through NewStreamReassembler and never sees it.
+func newStreamReassemblerPeek(onStream StreamHandler, fallback func(req []byte, resp []byte, msgType MsgType) (int32, MsgType), timeout time.Duration, now func() time.Time) (handler func(req []byte, resp []byte, msgType MsgType) (int32, MsgType), peek func(streamID uint64) *streamContext) {
 	// Map to store partial streams
 	streams := make(map[uint64]*streamContext)
 	var mu sync.Mutex
@@ -285,7 +369,13 @@ func newStreamReassembler(onStream StreamHandler, fallback func(req []byte, resp
 		mu.Unlock()
 	}
 
-	return func(req []byte, resp []byte, msgType MsgType) (int32, MsgType) {
+	peek = func(streamID uint64) *streamContext {
+		mu.Lock()
+		defer mu.Unlock()
+		return streams[streamID]
+	}
+
+	handler = func(req []byte, resp []byte, msgType MsgType) (int32, MsgType) {
 		if msgType == MsgTypeStreamStart {
 			if len(req) < streamHeaderSize {
 				return 0, MsgTypeSystemError
@@ -386,6 +476,10 @@ func newStreamReassembler(onStream StreamHandler, fallback func(req []byte, resp
 			streamID := binary.LittleEndian.Uint64(req[0:8])
 			chunkIndex := binary.LittleEndian.Uint32(req[8:12])
 			payloadSize := binary.LittleEndian.Uint32(req[12:16])
+			// Absolute destination (SPEC §3.3.2, SHM_VERSION 0x00080000). Widened
+			// to u64 for the bounds arithmetic below; the wire field is u32, which
+			// is sufficient only because MaxStreamSize is 1 GiB.
+			dstOffset := uint64(binary.LittleEndian.Uint32(req[16:20]))
 
 			// Unsigned arithmetic: on 32-bit builds int(payloadSize) of a
 			// hostile value >= 2^31 would go negative and slip past a signed
@@ -438,35 +532,56 @@ func newStreamReassembler(onStream StreamHandler, fallback func(req []byte, resp
 			}
 
 			corrupt := false
-			if chunkIndex == ctx.next {
-				// In-order fast path: copy straight from the slot buffer into
-				// the preallocated destination, then drain any parked chunks
-				// the cursor has caught up to.
-				ok := ctx.consume(data)
-				for ok {
-					buffered, present := ctx.ooo[ctx.next]
-					if !present {
-						break
+			// Guards BEFORE the copy, in the order SPEC §3.3.4 fixes: the
+			// running-length bound, then the destination bounds. dstOffset is
+			// peer-controlled, so inBounds is what keeps the copy inside buf.
+			if !ctx.fits(len(data)) || !ctx.inBounds(dstOffset, len(data)) {
+				corrupt = true
+			} else {
+				// EVERY chunk goes straight to its final home, whatever the
+				// arrival order. That is what dstOffset bought: an out-of-order
+				// chunk is no longer copied into a parked slice and then copied
+				// a second time when the gap fills.
+				ctx.write(dstOffset, data)
+
+				if chunkIndex == ctx.next {
+					// In-order. A conforming sender puts exactly the running
+					// cursor on chunk `next`, so this equality IS the
+					// misplacement check — and it is exact rather than
+					// heuristic: it runs for every index once that index becomes
+					// in-order, so a sender that misplaces ANY chunk is caught
+					// before the stream can complete. That is what lets this keep
+					// index dedup instead of tracking covered intervals.
+					if dstOffset != ctx.offset {
+						corrupt = true
+					} else {
+						ctx.accountInOrder(len(data))
+						// Drain the indices the cursor has caught up to. No
+						// payload moves here any more — the bytes are already in
+						// place; only the bookkeeping advances.
+						for !corrupt {
+							placed, present := ctx.ooo[ctx.next]
+							if !present {
+								break
+							}
+							delete(ctx.ooo, ctx.next)
+							// Move these bytes from "placed" to "assembled"
+							// before re-accounting, so offset+oooBytes stays
+							// invariant and a legitimately-sized stream cannot be
+							// rejected for bytes it counted twice.
+							ctx.oooBytes -= uint64(placed.size)
+							if placed.dstOffset != ctx.offset {
+								corrupt = true // misplaced, caught on drain
+								break
+							}
+							ctx.accountInOrder(int(placed.size))
+						}
 					}
-					delete(ctx.ooo, ctx.next)
-					// These bytes move from "parked" to "assembled"; releasing
-					// the count first keeps offset+oooBytes invariant across the
-					// drain, so a legitimately-sized stream cannot be rejected
-					// for bytes it counted twice.
-					ctx.oooBytes -= uint64(len(buffered))
-					ok = ctx.consume(buffered)
-				}
-				if !ok {
-					// Running length exceeded totalSize: the stream is corrupt.
-					// Drop it rather than deliver truncated/garbled data.
+				} else if !ctx.notePlaced(chunkIndex, dstOffset, len(data)) {
+					// Ahead of the cursor (pipelined sender). The payload is
+					// already written; only the 12-byte record is bounded.
 					corrupt = true
 				}
-			} else if !ctx.park(chunkIndex, data) {
-				// Ahead of the cursor (pipelined sender): the byte offset is
-				// unknown until the gap fills, so park a copy — but only if the
-				// running received length still fits totalSize. Rejected here
-				// the parked bytes are never allocated at all.
-				corrupt = true
 			}
 
 			ready := false
@@ -507,4 +622,6 @@ func newStreamReassembler(onStream StreamHandler, fallback func(req []byte, resp
 		}
 		return 0, MsgTypeNormal
 	}
+
+	return handler, peek
 }

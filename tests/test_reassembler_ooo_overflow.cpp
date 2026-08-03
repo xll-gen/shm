@@ -47,19 +47,22 @@ std::vector<uint8_t> startReq(uint64_t streamId, uint64_t totalSize,
     h.streamId = streamId;
     h.totalSize = totalSize;
     h.totalChunks = totalChunks;
-    h.reserved = 0;
+    h.appMsgType = 0;
     std::vector<uint8_t> buf(sizeof(StreamHeader));
     std::memcpy(buf.data(), &h, sizeof(h));
     return buf;
 }
 
+// dstOffset is REQUIRED, not defaulted: 0 is a legal offset for chunk 0, so a
+// call site that forgot it would silently claim "offset 0".
 std::vector<uint8_t> chunkReq(uint64_t streamId, uint32_t chunkIndex,
+                              uint32_t dstOffset,
                               const std::vector<uint8_t>& payload) {
     ChunkHeader h;
     h.streamId = streamId;
     h.chunkIndex = chunkIndex;
     h.payloadSize = static_cast<uint32_t>(payload.size());
-    h.reserved = 0;
+    h.dstOffset = dstOffset;
     h.padding = 0;
     std::vector<uint8_t> buf(sizeof(ChunkHeader) + payload.size());
     std::memcpy(buf.data(), &h, sizeof(h));
@@ -85,9 +88,17 @@ std::vector<uint8_t> payload(size_t n, uint8_t marker) {
     return std::vector<uint8_t>(n, marker);
 }
 
+// One STREAM_CHUNK delivery and its expected reply. `off` is the
+// ChunkHeader.dstOffset the step writes; the cases below all send unequal chunk
+// sizes, so it cannot be derived from index*size. Every `off` here is
+// deliberately IN BOUNDS (off+size <= totalSize) so that the rejection under
+// test is unambiguously the SPEC §3.3.4 running-length guard and not the
+// dstOffset bounds guard, which would answer SYSTEM_ERROR for a different
+// reason and make these cases pass vacuously.
 struct Step {
     uint32_t index;
     size_t size;
+    uint32_t off;
     MsgType want;
 };
 
@@ -104,12 +115,13 @@ void runRejectCase(const char* name, uint64_t streamId, uint64_t totalSize,
           std::string(name) + ": valid start must ACK");
     for (size_t i = 0; i < steps.size(); ++i) {
         MsgType mt = handle(r, MsgType::STREAM_CHUNK,
-                            chunkReq(streamId, steps[i].index,
+                            chunkReq(streamId, steps[i].index, steps[i].off,
                                      payload(steps[i].size, 0x5A)));
         CHECK(mt == steps[i].want,
               std::string(name) + ": step " + std::to_string(i) + " (chunk " +
                   std::to_string(steps[i].index) + ", " +
-                  std::to_string(steps[i].size) + " bytes) reply mismatch");
+                  std::to_string(steps[i].size) + " bytes @" +
+                  std::to_string(steps[i].off) + ") reply mismatch");
     }
     CHECK(fired == 0, std::string(name) + ": corrupt stream must not deliver");
 }
@@ -123,9 +135,14 @@ void runCompleteCase(const char* name, uint64_t streamId,
     uint64_t totalSize = 0;
     std::vector<std::vector<uint8_t>> payloads;
     std::vector<uint8_t> want;
+    // offsets[i] is the prefix sum of sizes[0..i-1] — the ChunkHeader.dstOffset a
+    // conforming sender writes for chunk i. Unequal sizes are the whole point of
+    // this test, so it cannot use the index*len derivation.
+    std::vector<uint32_t> offsets;
     for (size_t i = 0; i < sizes.size(); ++i) {
         payloads.push_back(payload(sizes[i], static_cast<uint8_t>('A' + i)));
         want.insert(want.end(), payloads[i].begin(), payloads[i].end());
+        offsets.push_back(static_cast<uint32_t>(totalSize));
         totalSize += sizes[i];
     }
 
@@ -142,8 +159,8 @@ void runCompleteCase(const char* name, uint64_t streamId,
           std::string(name) + ": valid start must ACK");
     for (size_t s = 0; s < order.size(); ++s) {
         uint32_t idx = order[s];
-        MsgType mt =
-            handle(r, MsgType::STREAM_CHUNK, chunkReq(streamId, idx, payloads[idx]));
+        MsgType mt = handle(r, MsgType::STREAM_CHUNK,
+                            chunkReq(streamId, idx, offsets[idx], payloads[idx]));
         CHECK(mt == MsgType::NORMAL,
               std::string(name) + ": step " + std::to_string(s) + " (chunk " +
                   std::to_string(idx) +
@@ -163,31 +180,36 @@ int main() {
     // scenario), and rejection waited for index 0.
     {
         const size_t big = 512 * 1024;
+        // dstOffset 0 keeps this a pure running-length rejection: a derived
+        // index*512KiB offset would be out of bounds against the 1-byte
+        // advertisement and the case would pass on the bounds guard instead.
         runRejectCase("tiny_total_big_ooo_chunks", 1, /*totalSize=*/1,
                       /*totalChunks=*/1000,
-                      {{1, big, MsgType::SYSTEM_ERROR},
-                       {2, big, MsgType::SYSTEM_ERROR}});
+                      {{1, big, 0, MsgType::SYSTEM_ERROR},
+                       {2, big, 0, MsgType::SYSTEM_ERROR}});
     }
 
     // ---- No single parked chunk overflows; their sum does. A per-chunk-only
     // (non-accumulating) guard would miss this.
     runRejectCase("accumulated_ooo_chunks_overflow", 2, /*totalSize=*/8,
                   /*totalChunks=*/4,
-                  {{3, 4, MsgType::NORMAL},
-                   {2, 4, MsgType::NORMAL},
-                   {1, 1, MsgType::SYSTEM_ERROR}});
+                  {{3, 4, 4, MsgType::NORMAL},
+                   {2, 4, 0, MsgType::NORMAL},
+                   {1, 1, 0, MsgType::SYSTEM_ERROR}});
 
     // ---- Already-received bytes must also constrain a later chunk that fits
     // on its own.
     runRejectCase("later_chunk_overflows_against_received", 3, /*totalSize=*/8,
                   /*totalChunks=*/3,
-                  {{2, 6, MsgType::NORMAL}, {0, 6, MsgType::SYSTEM_ERROR}});
+                  {{2, 6, 2, MsgType::NORMAL}, {0, 6, 0, MsgType::SYSTEM_ERROR}});
 
     // ---- A zero-length chunk contributes nothing, so the guard must not fire
-    // on it; the following oversized one must.
+    // on it; the following oversized one must. dstOffset 4 == totalSize with a
+    // zero-length payload is the legal end-of-buffer boundary InBounds must
+    // ACCEPT (the mirror of the parity table's dstoffset_zero_len_past_end_drops).
     runRejectCase("zero_length_then_overflow", 4, /*totalSize=*/4,
                   /*totalChunks=*/3,
-                  {{2, 0, MsgType::NORMAL}, {1, 5, MsgType::SYSTEM_ERROR}});
+                  {{2, 0, 4, MsgType::NORMAL}, {1, 5, 0, MsgType::SYSTEM_ERROR}});
 
     // ---- No-regression: well-formed streams with uneven chunk sizes
     // (including a zero-length one) must complete in every arrival order. These

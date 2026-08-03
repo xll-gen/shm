@@ -87,7 +87,10 @@ func TestStreamReassembly_ParkedChunkCountBoundedResidency(t *testing.T) {
 	// Indices 1..totalChunks-1: never index 0, so the cursor never advances and
 	// nothing is ever drained.
 	for i := uint32(1); i < totalChunks; i++ {
-		putChunkHeader(req, streamID, i, 0)
+		// Every chunk is zero-length, so a conforming sender puts dstOffset 0 on
+		// all of them -- the offsets are the running sum of prior sizes, and that
+		// sum is 0 throughout. This test is about the COUNT bound, not placement.
+		putChunkHeader(req, streamID, i, 0, 0)
 		handler(req, nil, MsgTypeStreamChunk)
 	}
 

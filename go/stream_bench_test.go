@@ -90,7 +90,9 @@ func BenchmarkStreamReassembler_ConcurrentChunks(b *testing.B) {
 				// Rebuilt per stream because the header carries the stream ID;
 				// the slice itself is reused to keep the sender-side cost out of
 				// the measurement.
-				reqs[c] = streamChunkReqInto(reqs[c], streamID, uint32(c), payload)
+				// dstOffset is the absolute position of chunk c: every chunk here is
+				// the same length, so it is c*len(payload).
+				reqs[c] = streamChunkReqInto(reqs[c], streamID, uint32(c), uint64(c)*uint64(len(payload)), payload)
 				if _, mt := handler(reqs[c], nil, MsgTypeStreamChunk); mt != MsgTypeNormal {
 					b.Errorf("chunk %d rejected: %v", c, mt)
 					return
@@ -102,13 +104,13 @@ func BenchmarkStreamReassembler_ConcurrentChunks(b *testing.B) {
 
 // streamChunkReqInto builds a StreamChunk request into buf (grown as needed),
 // avoiding a fresh allocation per benchmark iteration.
-func streamChunkReqInto(buf []byte, streamID uint64, chunkIndex uint32, payload []byte) []byte {
+func streamChunkReqInto(buf []byte, streamID uint64, chunkIndex uint32, dstOffset uint64, payload []byte) []byte {
 	need := chunkHeaderSize + len(payload)
 	if cap(buf) < need {
 		buf = make([]byte, need)
 	}
 	buf = buf[:need]
-	putChunkHeader(buf, streamID, chunkIndex, uint32(len(payload)))
+	putChunkHeader(buf, streamID, chunkIndex, uint32(len(payload)), uint32(dstOffset))
 	copy(buf[chunkHeaderSize:], payload)
 	return buf
 }

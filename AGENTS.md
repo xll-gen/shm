@@ -72,7 +72,10 @@ same LP, periodically stalling the spin).
 *   **SPECIFICATION.md:** This file is the **single source of truth** for the protocol, memory layout, and architecture. Always consult `SPECIFICATION.md` before making changes to the core IPC logic.
 *   **Feature Parity:** All features must be implemented in both C++ (Host) and Go (Guest). If you add a feature to one, you **must** add it to the other.
 *   **Tests:** New features must include regression tests.
-*   **Versioning:** Patch version updates (x.y.Z) must maintain API compatibility and memory layout (ABI) compatibility. Breaking changes require a Major version update.
+*   **Versioning:** Patch version updates (x.y.Z) must maintain API compatibility and memory layout (ABI) compatibility. Breaking changes require a Major version update — on the 0.x line the minor slot plays that role (0.8.x → 0.9.0), since 0.y.z has no major slot to move.
+    *   **`VERSION` is the release-version SSOT and the only place the number is written by hand.** `CMakeLists.txt` does `file(READ VERSION)` → `string(STRIP)` → `project(shm VERSION ...)`, so the CMake package version derives from it and cannot drift. Nothing else in the repo may restate the release version as a literal; a literal elsewhere is a bug to delete or to derive, not a second copy to maintain.
+    *   **Bump `VERSION` in the release commit, before the tag** (see §Tag Message Guidelines). It went stale once and the failure mode is instructive: `v0.8.21` was tagged while `VERSION` still read `0.8.20`, so the CMake package version of the *tagged* tree was wrong, and the next release found three disagreeing numbers (`VERSION` 0.8.20, newest tag v0.8.21, `CHANGELOG.md` head 0.9.0). Resolved at the `0x00080000` wire bump by setting `VERSION` to **`0.9.0`**: a breaking wire change cannot be a patch bump, and on the 0.x line the minor slot is the major slot, so 0.8.x → 0.9.0 regardless of which 0.8.z the file happened to be sitting on. Do not "fix" a stale `VERSION` by retro-editing it to the last tag — jump it forward to the release being prepared.
+*   **Wire version is separate from the release version.** `SHM_VERSION` (C++ `include/shm/IPCUtils.h`, Go `shm.Version` in `go/direct.go`) is **`0x00080000`** as of the stream-header bump; it was pinned at `0x00070000` across the whole v0.7.x–v0.8.x line. The two constants MUST be edited in the same commit — a mismatch is not a soft degradation, it is a total attach failure (`protocol version mismatch`), so a half-applied bump takes the product down rather than producing a subtle bug. **That MUST is enforced by a regression pair, not by discipline:** `tests/test_go_version_parity.cpp` and `go/version_wire_guard_test.go`, each reading the *other* language's source as data so neither can self-disable on a toolchain-less build. See §Co-Change Clusters → Protocol & Memory Layout for why the pre-existing tests could not see a half-applied bump (they were green through one). Bump it only when the *bytes* change meaning; a field carved from never-written `reserved` space does not qualify (that is why `lease`, `gen` and `fastPathAllowed` did not bump it), but giving meaning to a reserved field whose legacy zero value is **indistinguishable from a legitimate value** does — see `SPECIFICATION.md` §2.1 "Version compatibility is a HARD FAILURE at attach".
 
 ## **Development Environment**
 
@@ -146,6 +149,15 @@ The Shared Memory layout is the contract between C++ (Host) and Go (Guest).
 2.  **C++ Headers**: `include/shm/IPCUtils.h` (Structs like `ExchangeHeader`, `SlotHeader`).
 3.  **Go Types**: `go/direct.go` (Structs like `ExchangeHeader`, `SlotHeader`).
 **Constraint**: These must be byte-compatible. Check alignment and padding carefully.
+**Stream headers are the same cluster**: `StreamHeader`/`ChunkHeader` live in `include/shm/Stream.h` (C++) and `go/stream.go` (Go), are both **24 bytes**, and since `ChunkHeader.reserved@16` became `dstOffset` and `StreamHeader.reserved@20` became `appMsgType` at `SHM_VERSION 0x00080000` both carry per-field offset guards on **both** sides, field for field:
+
+* **C++** (`include/shm/Stream.h`): `static_assert(sizeof(...) == 24)` per struct plus a `static_assert(offsetof(...) == N)` for every named field — `StreamHeader` `streamId@0`/`totalSize@8`/`totalChunks@16`/`appMsgType@20` (**four**) and `ChunkHeader` `streamId@0`/`chunkIndex@8`/`payloadSize@12`/`dstOffset@16`/`padding@20` (**five**).
+* **Go** (`go/stream.go`): the original `var(...)` block of dual zero-array `unsafe.Sizeof` asserts (24 bytes, both structs, both directions), plus a **second** `var(...)` block of **nine bidirectional `unsafe.Offsetof` guards** — `[N - off]byte` *and* `[off - N]byte` per field — covering the same nine fields as the C++ list above.
+
+`dstOffset` is read by the peer, so a field reorder here is a silent stream corruption, not a compile error, without those guards. `padding@20` is guarded on both sides even though nothing reads it, because the concrete way this table changes is a widening of `dstOffset`, which moves it. The senders (`StreamSender` on both sides) and the reassemblers (`include/shm/StreamReassembler.h`, `go/stream.go`) are part of the same co-change set: a sender that stops writing absolute offsets makes every receiver drop the stream. `SPECIFICATION.md` §3.3.2 carries the same two lists as normative text — update both when you add, move or resize a field.
+
+**The `SHM_VERSION` / `shm.Version` pair has a cross-language regression guard, and it is a pair on purpose.** The two constants (`include/shm/IPCUtils.h`, `go/direct.go`) must be edited in the same commit; the guard that enforces it is `tests/test_go_version_parity.cpp` (a C++ test that parses `go/direct.go` as data — the path is injected as `SHM_GO_DIRECT_GO` by `tests/CMakeLists.txt`, and a missing definition is `#error`) together with `go/version_wire_guard_test.go` (a Go test that parses `include/shm/IPCUtils.h`). Neither needs the other language's toolchain, which is the whole design: during the `0x00080000` work the bump WAS half-applied — `IPCUtils.h` at `0x00080000`, `go/direct.go` still at `0x00070000` — and **both suites reported green**, because `tests/test_protocol_version.cpp` only compares a C++ constant against the value C++ itself wrote into the segment (tautological across the boundary), and `tests/test_stream_integration.cpp` — the only test that runs Go — returns CTest's `SKIP_RETURN_CODE` whenever `find_program(NAMES go)` misses, i.e. on the ordinary C++-only build. Both halves are written so that *every* way of failing to reach a value (file missing, no declaration, more than one, unparseable literal) is a hard FAIL and never a skip. **If you rename or reshape either constant's declaration, fix the regexes in the same commit** — the failure they exist to prevent is precisely "the guard quietly stops running", and both are written to fail loudly rather than tolerate a parse miss, so a rename breaks the build instead of disarming it. See `SPECIFICATION.md` §2.1.
+
 **Per-field offset guards (R25)**: Beyond the total-size `static_assert`s, every named field of `SlotHeader`/`ExchangeHeader` now has a compile-time offset guard on **both** sides — C++ `static_assert(offsetof(...) == N)` (needs `<cstddef>`) in `IPCUtils.h`, and Go dual `unsafe.Offsetof` zero-array guards in `direct.go`. The Go guard is bidirectional (`[N - off]byte` *and* `[off - N]byte`) so moving a field either direction fails the build. A field reorder that preserves total size (e.g. swapping two same-width fields) slips past a size-only assert but is caught here. **When you add/move/resize a field, update the per-field offset asserts on both sides in the same commit** — they are the SSOT enforcement, with `SPECIFICATION.md §2.1/§2.2.1` carrying the human-readable offset columns.
 
 ### **Platform Primitives**
@@ -200,12 +212,27 @@ flagged by past reviews and confirmed correct — do not "fix" or re-propose:
   could advertise `totalSize = 1`, park unbounded bytes under out-of-order
   indices, and only be refused once the gap filled — after every byte was
   resident. Three parts are load-bearing and must move together: (a) the check
-  runs **before** the payload copy/`assign`, not after; (b) it counts parked
+  runs **before** the payload write, not after; (b) it counts ahead-of-cursor
   bytes, so `offset + oooBytes` is the running received length; (c) the drain
-  loop releases `oooBytes` for a parked chunk **before** consuming it, or a
-  well-formed out-of-order stream is rejected as over-sized. Do not "simplify"
-  the guard back onto the in-order path only, and do not move it after the copy
-  "since we reject anyway" — the point is *when* the rejection happens.
+  loop releases `oooBytes` for a parked index **before** accounting it in order,
+  keeping the pair indivisible. Do not
+  "simplify" the guard back onto the in-order path only, and do not move it after
+  the write "since we reject anyway" — the point is *when* the rejection happens.
+  Since `SHM_VERSION 0x00080000` an ahead-of-cursor chunk's bytes are already in
+  the destination buffer, so `oooBytes` now counts *placed-but-not-accounted*
+  bytes rather than parked copies; the counter is no less necessary — it is still
+  the only thing that makes `offset` alone not understate the received length.
+  **Note on (c), updated at `0x00080000`:** its old justification was "or a
+  well-formed out-of-order stream is rejected as over-sized", which described a
+  drain-time re-check of the byte bound. **That re-check no longer exists** — the
+  drain only re-verifies `dstOffset` against the cursor (SPEC §3.3.4 "Where each
+  guard fires", step 8), so an inverted order is no longer *caught* anywhere and
+  (c) now rests on the `offset + oooBytes` invariant alone. That is the weaker of
+  the two positions, so treat the release-then-account pair as one indivisible
+  step, and do not read the absence of a drain-time byte check as licence to
+  reorder it. Corollary for the accept/reject table: a drain-time rejection is
+  **always** a misplacement and **never** a byte overflow; a byte overflow can
+  only be raised at the arriving chunk's own check.
   Regression: `go/stream_ooo_guard_test.go`,
   `tests/test_reassembler_ooo_overflow.cpp`.
 * **Stream reassembly state is sized by `totalSize`, never by `totalChunks`, and
@@ -217,8 +244,9 @@ flagged by past reviews and confirmed correct — do not "fix" or re-propose:
   stream** at `totalChunks = 2^20`, ~26 GB at `maxStreams`. The byte guard above
   cannot see that dimension (the overhead exists at zero payload, and a
   zero-length chunk can never trip a `Σ payloadSize > totalSize` test). Both
-  peers now preallocate a `totalSize` destination, copy in-order chunks straight
-  in at a cursor, park only ahead-of-cursor chunks sparsely, and refuse a park
+  peers now preallocate a `totalSize` destination, write every chunk straight
+  into it at its `dstOffset`, keep only a sparse payload-free record for
+  ahead-of-cursor indices, and refuse a park
   past `maxParkedChunks` / `MaxParkedChunks` (1024 =
   `maxStreamChunks / maxStreams`; keep the two sides equal — it is an
   accept/reject parity value, not a tuning knob). Do **not** reintroduce a
@@ -233,10 +261,194 @@ flagged by past reviews and confirmed correct — do not "fix" or re-propose:
   against a constant rather than against the other implementation's current
   behavior. They pin what the §3.3.4 prose cannot state chunk-by-chunk: which
   rejections drop the stream vs. leave it completable, first-arrival-wins dedup
-  (including a duplicate that declares a different `payloadSize`), and
-  `STREAM_START` replacing a live context. A digest change is a **wire behavior
-  change**: update SPEC §3.3.4 and both halves in the same commit, or don't make
-  it.
+  (including a duplicate that declares a different `payloadSize` **or
+  `dstOffset`** — the dedup gate runs ahead of every guard), `STREAM_START`
+  replacing a live context, and — added at `SHM_VERSION 0x00080000` — the
+  `dstOffset` **drop** cases: an out-of-bounds offset, an in-bounds offset with an
+  overhanging payload (on both the in-order and the ahead-of-cursor path), the
+  32-bit wrap offsets that make the subtraction form of the bounds test
+  load-bearing, a zero-length chunk at an out-of-bounds offset, and a cursor
+  mismatch caught at *either* detection site (the in-order arrival and the drain).
+  A digest change is a **wire behavior change**: update SPEC §3.3.4 and both
+  halves in the same commit, or don't make it.
+
+  **What the parity table canNOT see: placement.** This is a correction of an
+  earlier version of this bullet, which claimed the table pins `dstOffset` as
+  "honoured as an absolute destination on reverse-order delivery of unequal chunk
+  sizes". **That claim is false, and the reason is structural rather than a gap in
+  the case list — do not try to fix it by adding cases.** Placement check 2
+  (SPEC §3.3.4) forces `dstOffset == the running cursor` for every index at the
+  moment that index becomes in-order, on every stream that is not dropped.
+  Therefore a `dstOffset`-honouring receiver and a receiver that ignores
+  `dstOffset` entirely and appends at its own cursor write every byte to the same
+  address, accept and reject exactly the same messages, and deliver
+  byte-identical output — for every stream, not merely for the cases listed.
+  **No output-byte test can distinguish them.** (That is also why all 20 legacy
+  digests survived the `0x00080000` rework unchanged.) Verified, not reasoned:
+  reimplementing the pre-bump receiver — park a payload copy under the
+  out-of-order index, drain in index order, append at the cursor, never consult
+  `dstOffset` for placement — leaves **all 29 parity cases and the whole
+  `AppMsgTypeIsInertToReassembly` replay PASSING**, and flips exactly four tests
+  red out of the entire Go suite:
+  `TestStreamReassembly_AheadOfCursorChunkIsResidentAtDstOffset`
+  ("destination buffer holds \"\\x00\\x00\\x00\" at dstOffset 3 while the stream is
+  incomplete, want \"CCC\""),
+  `TestStreamReassembly_ParkedChunksAreAllResidentBeforeTheGapFills`,
+  `TestStreamReassembly_ParkedRecordHoldsNoPayload` ("parked record is 40 bytes,
+  want <= 16") and
+  `TestStreamReassembly_ParkedResidencyIndependentOfChunkSize`. Those four are the
+  whole guard.
+
+  So the guard set splits cleanly, and each half must be maintained on its own:
+  * The **parity table** guards the accept/reject contract — every `dstOffset`
+    row in it that distinguishes anything is a *drop* case. Those genuinely
+    distinguish: a receiver that skips the bounds or the cursor-consistency check
+    changes digests. The one non-drop row,
+    `nonuniform_offsets_reverse_completes`, is the case that was believed to pin
+    placement; it does not, and it is kept only as an accept-path smoke case.
+  * **Placement and the zero-copy property** are guarded ONLY by the residency
+    and early-placement tests — on the Go side
+    `go/stream_dstoffset_residency_test.go`
+    (`TestStreamReassembly_ParkedRecordHoldsNoPayload` asserts the parked record
+    holds no payload bytes and no reference to any;
+    `TestStreamReassembly_ParkedResidencyIndependentOfChunkSize` asserts parked
+    residency does not grow with chunk size) together with the early-placement
+    tests in `go/stream_dstoffset_placement_test.go`
+    (`TestStreamReassembly_AheadOfCursorChunkIsResidentAtDstOffset`,
+    `TestStreamReassembly_ParkedChunksAreAllResidentBeforeTheGapFills`), which
+    inspect the destination buffer *before* the in-order cursor reaches the
+    chunk's index and so assert the positive form of the contract — the bytes are
+    at `buf[dstOffset]` on arrival — rather than the absence of a second copy.
+    On the C++ side the mirror is
+    `tests/test_reassembler_dstoffset_placement.cpp`.
+    Deleting or weakening any of those leaves placement **unguarded**, and the
+    parity table will stay green while it rots.
+
+    **Parity status of that pair on the C++ side — the two halves differ, do not
+    treat them as one gap.** Both Go tests above are Go-only as *tests*, but only
+    one of the two properties they assert is unguarded in C++:
+
+    * **The "no parked payload copy" half is guarded, and better than in Go — at
+      compile time.** `include/shm/StreamReassembler.h` carries
+      `static_assert(sizeof(StreamContext::Placed) == 16)` and
+      `static_assert(std::is_trivially_copyable<StreamContext::Placed>::value)`.
+      `Placed` is `{uint64_t dstOffset; uint32_t size;}` + tail padding, so every
+      route back to a parked copy — an owning `std::vector`/`std::string` member,
+      or an inline byte array — is a **build failure**, not a test failure. That is
+      strictly stronger than Go's `TestStreamReassembly_ParkedRecordHoldsNoPayload`,
+      which can only notice a copy once it clears the test's byte slack. Treat the
+      two asserts as the C++ half of the residency pair and do not delete them as
+      "redundant with the parity table" — the parity table cannot see this either.
+      A field added to `Placed` is a deliberate act: update the number **and**
+      SPEC §3.3.4, or do not add it.
+    * **The early-placement half — "the bytes are at `buf[dstOffset]` BEFORE the
+      in-order cursor reaches that index" — is guarded by
+      `tests/test_reassembler_dstoffset_placement.cpp`**, which reads the
+      destination buffer while the stream is still incomplete via the
+      `StreamReassembler::PeekStream` / `StreamSnapshot` seam (added for this;
+      `StreamContext` and `Placed` stay private, and the snapshot copies plain
+      values out under `streamsMutex`). A `static_assert` cannot supply this half:
+      a C++ regression that keeps `Placed` payload-free — asserts still satisfied —
+      but writes each payload at its own running cursor instead of at `dstOffset`
+      is invisible to the parity digests by the structural argument above, and the
+      residency asserts are about the record's *type*, not about where bytes land.
+      That test is the **only** ctest guard for it; confirmed by mutation twice, at
+      the `0.9.0` cycle: writing at `ctx.offset` instead of `header->dstOffset`,
+      and an honest revert to the pre-`0x00080000` parking shape (which deletes
+      `Placed` and both static_asserts with it). Under either mutant
+      `test_reassembler_contract`, `test_reassembler_parity_table`,
+      `test_reassembler_ooo_overflow` and `test_reassembler_park_cap` all stay
+      GREEN. Do **not** delete it as "redundant with the static_asserts" — they
+      cover the parked-copy half only — and do **not** re-widen this bullet back to
+      "C++ placement is guarded by nothing"; both halves are now guarded.
+
+  Corollary for future work: if you change how chunks are placed, the parity
+  digests staying identical is **expected and is not evidence the change is
+  correct**. Reach for the residency/early-placement tests instead.
+* **`ChunkHeader.dstOffset` is load-bearing; `StreamHeader.appMsgType` is
+  deliberately inert (`SHM_VERSION 0x00080000`).** These two formerly-reserved
+  slots were claimed in one bump, on purpose, but they are *not* symmetric.
+  `dstOffset` is the absolute destination of the payload and both reassemblers
+  place every chunk by it on arrival — the receiver enforces
+  `dstOffset + payloadSize <= totalSize` (by subtraction; `dstOffset` is
+  peer-controlled and the sum would wrap) and that the offset equals the running
+  cursor when its index becomes in-order, dropping the stream on either failure.
+  `appMsgType` is an application routing tag that shm never interprets: senders
+  write it, **the receive side does not surface it to the stream handler, and that
+  is deferred by decision, not by oversight** — the slot was claimed at this bump
+  so the future receive-side API needs no second bump. Do not
+  "finish" it by inventing a delivery path without the SPEC §3.3.1 update, and do
+  not read the inertness tripwire as evidence the field is unused.
+  The field has **two** guards, one per side of the deferral, and they assert
+  opposite things — keep both:
+  * *Receive side (negative):* `TestStreamReassembly_AppMsgTypeIsInertToReassembly`
+    (`go/stream_parity_table_test.go`) and its C++ twin at the end of
+    `tests/test_reassembler_parity_table.cpp` replay every parity case with the tag
+    set to garbage and require byte-identical digests.
+  * *Send side (positive):* `go/stream_sender_appmsgtype_test.go`
+    (`TestStreamSender_WritesAppMsgTypeAtWireOffset20`,
+    `TestStreamSender_DefaultAppMsgTypeIsZero`). Every *other* `appMsgType` test
+    hand-builds the `StreamHeader` bytes, so none of them touches
+    `StreamSender.SetAppMsgType` or `putStreamHeader` — the tag could have been
+    dropped, written at the wrong offset, or written into the `ChunkHeader`
+    instead, and the whole suite would still have been green. These two drive the
+    exported sender against a real segment and read the bytes back off the wire.
+* **Reserved and padding bytes MUST reach the wire as zero** (SPEC §3.3.2
+  "Reserved and padding space"). This is not hygiene: every field this protocol
+  added *without* a version bump — `lease`, `gen`, `fastPathAllowed` — was safe to
+  carve only because an older peer had written `0` into that space, which is what
+  lets a new reader tell "peer does not implement this" from a real value. A sender
+  that leaks uninitialised bytes forfeits that carve-out. `ChunkHeader.padding@20`
+  is the **last** reserved slot in `ChunkHeader` as of `0x00080000`, so it is the
+  only place in that struct the carve-out could ever be used again. Composing a
+  stream header on the stack and `memcpy`'ing it whole is the way this goes wrong —
+  the receiver never looks at the field, so nothing fails, and host stack bytes
+  ship. Receivers, symmetrically, MUST NOT read, validate, or branch on those
+  bytes.
+  Both senders now discharge this explicitly — C++ value-initializes
+  (`ChunkHeader ch{}` / `StreamHeader header{}` in `include/shm/Stream.h`, *not*
+  `ChunkHeader ch;`), Go's `putChunkHeader` writes a literal `0`.
+  Regression: `tests/test_stream_chunk_padding.cpp`, which reads `padding@20` out
+  of the real sender's `STREAM_CHUNK` request bytes. **Read its failability caveat
+  before trusting a green run**: uninitialised stack is very often incidentally
+  zero, so the test scribbles the frame the sender's `Send` will occupy — and that
+  is best-effort and toolchain-dependent by its own measurement (it reports
+  `0xdededede` for a default-initialized `ChunkHeader` under MinGW/GCC 14 but
+  PASSES under MSVC 19.41 `/O2`, where `Send` is inlined and the scribbled frame is
+  never reused). It is a bug detector on one toolchain, not a guarantee on any. The
+  value-initialization is the contract; the test is a tripwire for removing it.
+* **`maxStreamSize` = 1 GiB is a wire ceiling, not a tuning knob, and it binds the
+  SENDER too** (SPEC §3.3.2 / §3.3.4). `ChunkHeader.dstOffset` is `uint32`, so the
+  bound is what makes the field wide enough at all, *and* it is an accept/reject
+  parity value. It is the one row of the §3.3.4 bounds table that MUST NOT be
+  raised: an implementation exposing it as mutable must refuse or clamp a larger
+  value (C++ does — `shm::kMaxStreamSize`, `StreamReassemblerConfig::IsValid()`, a
+  `static_assert` on the default, and a constructor clamp; Go's `MaxStreamSize` is
+  a `const`). A **sender** MUST refuse a stream whose offsets it cannot express
+  rather than truncate `dstOffset` into 32 bits — a truncated offset is a
+  legal-looking value, so relying on the peer's `STREAM_START` bound is not
+  equivalent. Do not "make maxStreamSize configurable for large transfers";
+  raising it past 4 GiB requires widening `dstOffset`, which moves `padding@20` and
+  is its own `SHM_VERSION` bump.
+  Both peers implement the sender obligation: C++ `StreamSender::Send` and Go
+  `sendStart` (`go/stream_sender.go`), each refusing before a slot is acquired.
+  Regression: `tests/test_stream_size_ceiling.cpp` covers **both** obligations —
+  the config half (`IsValid()` reports an over-ceiling value; the constructor clamp
+  is observable through the new `StreamReassembler::Config()` accessor) and the
+  sender half (`StreamSender::Send` → `Error::InvalidArgs`);
+  `go/stream_sender_size_ceiling_test.go` covers the Go sender half
+  (`TestStreamSender_RefusesStreamAboveWireCeiling` asserts no request reaches the
+  host and the guest slot is left untouched;
+  `TestStreamSender_AcceptsStreamAtWireCeilingBoundary` pins the comparison as
+  strict `>`, so an exactly-`MaxStreamSize` stream is not refused). Note that the sender's
+  ceiling check is deliberately placed **before** any slot acquisition and before
+  `data` is dereferenced; that ordering is what lets the test reach the guard
+  without committing a 1 GiB buffer, so moving the check later breaks the test for
+  a reason that will not be obvious from the failure. There is deliberately **one**
+  ceiling constant with one meaning — do not add a second, looser
+  "physically expressible in a uint32" (4 GiB) limit anywhere: enforcing 4 GiB
+  would leave the 1–4 GiB accept/reject parity break, which is the defect this
+  closed.
 * `go/race_annotate_on.go` / `race_annotate_off.go` are **not dead code and not
   synchronization** (2026-07-26). Slot ownership is handed over through the
   atomics on `SlotHeader.State`, which lives in the file-mapped region. Go's

@@ -39,7 +39,6 @@ int main() {
         uint32_t slotSize = ex->slotSize;
         uint32_t numSlots = ex->numSlots;
         uint32_t reqOffset = ex->reqOffset;
-        uint32_t respOffset = ex->respOffset;
 
         size_t totalSize = sizeof(ExchangeHeader) + numSlots * (sizeof(SlotHeader) + slotSize);
         Platform::CloseShm(hMap, addr, 64);
@@ -77,10 +76,14 @@ int main() {
                      if (ch->streamId == expectedStreamID) {
                          uint8_t* payload = reqBuf + sizeof(ChunkHeader);
 
-                         uint32_t maxReq = respOffset - reqOffset;
-                         uint32_t maxPayload = maxReq - sizeof(ChunkHeader);
-
-                         size_t offset = ch->chunkIndex * maxPayload;
+                         // Trust the sender's absolute destination (SHM_VERSION
+                         // 0x00080000) instead of re-deriving it from
+                         // chunkIndex * maxPayload. This mock guest is the only
+                         // C++ test that reads StreamSender's own dstOffset off
+                         // the wire, so a sender that stopped writing it — or
+                         // wrote it wrong — assembles garbage here rather than
+                         // being masked by the receiver recomputing the value.
+                         size_t offset = ch->dstOffset;
                          if (offset + ch->payloadSize <= receivedData.size()) {
                              memcpy(receivedData.data() + offset, payload, ch->payloadSize);
                          }

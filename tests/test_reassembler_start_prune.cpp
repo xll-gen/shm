@@ -39,19 +39,20 @@ std::vector<uint8_t> startReq(uint64_t streamId, uint64_t totalSize, uint32_t to
     h.streamId = streamId;
     h.totalSize = totalSize;
     h.totalChunks = totalChunks;
-    h.reserved = 0;
+    h.appMsgType = 0;
     std::vector<uint8_t> buf(sizeof(StreamHeader));
     std::memcpy(buf.data(), &h, sizeof(h));
     return buf;
 }
 
 std::vector<uint8_t> chunkReq(uint64_t streamId, uint32_t chunkIndex,
+                              uint32_t dstOffset,
                               const std::vector<uint8_t>& payload) {
     ChunkHeader h;
     h.streamId = streamId;
     h.chunkIndex = chunkIndex;
     h.payloadSize = static_cast<uint32_t>(payload.size());
-    h.reserved = 0;
+    h.dstOffset = dstOffset;
     h.padding = 0;
     std::vector<uint8_t> buf(sizeof(ChunkHeader) + payload.size());
     std::memcpy(buf.data(), &h, sizeof(h));
@@ -92,13 +93,13 @@ int main() {
     // refused as unknown. If the START had not pruned, this chunk would be
     // accepted into the surviving context and complete it, firing the callback.
     int before = completed;
-    handle(r, MsgType::STREAM_CHUNK, chunkReq(1, 0, std::vector<uint8_t>(4, 0xAA)));
+    handle(r, MsgType::STREAM_CHUNK, chunkReq(1, 0, 0, std::vector<uint8_t>(4, 0xAA)));
     CHECK(completed == before,
           "a chunk for the aged-out stream completed it, so the START did not prune "
           "(the context was still resident)");
 
     // The live stream must be untouched by the prune.
-    handle(r, MsgType::STREAM_CHUNK, chunkReq(2, 0, std::vector<uint8_t>(4, 0xBB)));
+    handle(r, MsgType::STREAM_CHUNK, chunkReq(2, 0, 0, std::vector<uint8_t>(4, 0xBB)));
     CHECK(completed == before + 1, "the prune dropped the LIVE stream as well");
 
     if (g_failures == 0) {

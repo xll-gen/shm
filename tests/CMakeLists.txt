@@ -39,6 +39,26 @@ if(TARGET test_stream_integration)
     set_tests_properties(test_stream_integration PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
+# --- test_go_version_parity: reads go/direct.go as DATA ----------------------
+# The cross-language SHM_VERSION SSOT check. It deliberately needs NO Go toolchain
+# (unlike test_stream_integration above, which SKIPs without one and therefore
+# checks nothing on a C++-only build) — it parses the `Version` literal out of the
+# Go source and compares it to the C++ constant. Path is handed in at configure
+# time, relative to this source dir, the same mechanism test_stream_integration
+# uses; the test itself #errors if this definition is absent, so the check cannot
+# silently disable itself.
+if(TARGET test_go_version_parity)
+    set(SHM_GO_DIRECT_GO "${CMAKE_CURRENT_SOURCE_DIR}/../go/direct.go")
+    if(NOT EXISTS "${SHM_GO_DIRECT_GO}")
+        message(FATAL_ERROR
+            "test_go_version_parity: go/direct.go not found at ${SHM_GO_DIRECT_GO}. "
+            "This is the Go half of the SHM_VERSION SSOT pair; a missing file must "
+            "break the build rather than let the parity check quietly stop running.")
+    endif()
+    target_compile_definitions(test_go_version_parity PRIVATE
+        SHM_GO_DIRECT_GO="${SHM_GO_DIRECT_GO}")
+endif()
+
 # Build guest_call_test but do not add it to CTest (requires external Go process)
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/guest_call_test.cpp")
     add_executable(guest_call_test guest_call_test.cpp)

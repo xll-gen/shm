@@ -67,12 +67,26 @@ const (
 
 	// Magic is the magic number for validating shared memory ("XLL!").
 	Magic uint32 = 0x584C4C21
-	// Version is the wire protocol version. Intentionally PINNED across the
-	// ABI-compatible v0.7.x series — patch releases add fields carved from
-	// reserved space (SlotHeader.Lease at offset 96 in v0.7.0 for crash-recovery
-	// reclamation; SlotHeader.Gen at offset 104 in v0.7.5 for the reclamation ABA
-	// guard) without bumping this constant. Only breaking layout changes bump it.
-	Version uint32 = 0x00070000
+	// Version is the wire protocol version. It MUST equal the C++ SHM_VERSION in
+	// include/shm/IPCUtils.h — a mismatch is not a soft degradation but a total
+	// attach failure ("protocol version mismatch"), so the two constants are
+	// edited in the same commit or not at all.
+	//
+	// It was PINNED at 0x00070000 across the whole ABI-compatible v0.7.x–v0.8.x
+	// line: patch releases added fields carved from never-written reserved space
+	// (SlotHeader.Lease at offset 96 in v0.7.0 for crash-recovery reclamation,
+	// SlotHeader.Gen at offset 104 in v0.7.5 for the reclamation ABA guard,
+	// ExchangeHeader.FastPathAllowed in v0.8.8) without bumping it, because a
+	// legacy zero in those fields is distinguishable from any value a new peer
+	// writes.
+	//
+	// 0x00080000 is the first bump since, and the reason is exactly that
+	// distinguishability failing: ChunkHeader.reserved@16 became DstOffset and
+	// StreamHeader.reserved@20 became AppMsgType, and 0 is a LEGAL DstOffset for
+	// chunk 0. A 0x00070000 sender against a 0x00080000 reader would stack every
+	// chunk at offset 0 and corrupt the stream with nothing to detect it, so the
+	// attach-time version check is the only safe discriminator.
+	Version uint32 = 0x00080000
 
 	// HostStateActive indicates the Host is spinning or processing.
 	HostStateActive = 0
@@ -273,13 +287,24 @@ func NewDirectGuest(name string) (*DirectGuest, error) {
 
 	header := (*ExchangeHeader)(unsafe.Pointer(addr))
 
-	if header.Magic != Magic {
+	// Copy both discriminators out of the mapping BEFORE any unmap. `header`
+	// points into the MapViewOfFile region, so reading header.Magic /
+	// header.Version inside the fmt.Errorf argument list — which is evaluated
+	// AFTER CloseShm has torn the view down — is a use-after-unmap that faults
+	// with an access violation instead of returning the error. That fault is
+	// unreachable while the peers agree, which is why it survived; the
+	// 0x00080000 bump makes the version-mismatch branch the product's only
+	// defence against an old sender, so it has to actually report.
+	gotMagic := header.Magic
+	gotVersion := header.Version
+
+	if gotMagic != Magic {
 		CloseShm(h, addr, HeaderMapSize)
-		return nil, fmt.Errorf("invalid magic number: 0x%x (expected 0x%x)", header.Magic, Magic)
+		return nil, fmt.Errorf("invalid magic number: 0x%x (expected 0x%x)", gotMagic, Magic)
 	}
-	if header.Version != Version {
+	if gotVersion != Version {
 		CloseShm(h, addr, HeaderMapSize)
-		return nil, fmt.Errorf("protocol version mismatch: 0x%x (expected 0x%x)", header.Version, Version)
+		return nil, fmt.Errorf("protocol version mismatch: 0x%x (expected 0x%x)", gotVersion, Version)
 	}
 
 	numSlots := header.NumSlots
