@@ -56,11 +56,26 @@ type parityCase struct {
 // deliberately disagree with the number of bytes supplied (declared > size
 // exercises the framing guard).
 func parityChunkReq(streamID uint64, idx uint32, declared uint32, payload []byte) []byte {
+	return parityChunkReqReserved(streamID, idx, declared, payload, 0)
+}
+
+// parityChunkReqReserved additionally writes ChunkHeader.reserved@16, so the
+// inert-field tripwire in TestStreamReassembly_ReservedFieldsAreInert can set it
+// to garbage.
+func parityChunkReqReserved(streamID uint64, idx uint32, declared uint32, payload []byte, reserved uint32) []byte {
 	req := make([]byte, chunkHeaderSize+len(payload))
 	binary.LittleEndian.PutUint64(req[0:8], streamID)
 	binary.LittleEndian.PutUint32(req[8:12], idx)
 	binary.LittleEndian.PutUint32(req[12:16], declared)
+	binary.LittleEndian.PutUint32(req[16:20], reserved)
 	copy(req[chunkHeaderSize:], payload)
+	return req
+}
+
+// parityStartReqReserved is streamStartReq with StreamHeader.reserved@20 set.
+func parityStartReqReserved(streamID, totalSize uint64, totalChunks uint32, reserved uint32) []byte {
+	req := streamStartReq(streamID, totalSize, totalChunks)
+	binary.LittleEndian.PutUint32(req[20:24], reserved)
 	return req
 }
 
@@ -77,6 +92,10 @@ func replyChar(mt MsgType) string {
 
 // runParityCase drives one case and returns its digest.
 func runParityCase(tc parityCase, streamID uint64) string {
+	return runParityCaseReserved(tc, streamID, 0, 0)
+}
+
+func runParityCaseReserved(tc parityCase, streamID uint64, chunkReserved, startReserved uint32) string {
 	var delivered [][]byte
 	handler := NewStreamReassembler(func(_ uint64, data []byte) {
 		cp := make([]byte, len(data))
@@ -85,7 +104,7 @@ func runParityCase(tc parityCase, streamID uint64) string {
 	}, nil)
 
 	start := func() string {
-		_, mt := handler(streamStartReq(streamID, tc.totalSize, tc.totalChunks), nil, MsgTypeStreamStart)
+		_, mt := handler(parityStartReqReserved(streamID, tc.totalSize, tc.totalChunks, startReserved), nil, MsgTypeStreamStart)
 		return replyChar(mt)
 	}
 
@@ -112,7 +131,7 @@ func runParityCase(tc parityCase, streamID uint64) string {
 		if st.otherID {
 			id = streamID ^ 0xDEAD
 		}
-		_, mt := handler(parityChunkReq(id, st.idx, uint32(declared), payload), nil, MsgTypeStreamChunk)
+		_, mt := handler(parityChunkReqReserved(id, st.idx, uint32(declared), payload, chunkReserved), nil, MsgTypeStreamChunk)
 		steps.WriteString(replyChar(mt))
 	}
 
@@ -335,5 +354,46 @@ func TestStreamReassembly_ParityTable(t *testing.T) {
 func TestStreamReassembly_ParityTableDump(t *testing.T) {
 	for i, tc := range parityCases {
 		t.Logf("%s", runParityCase(tc, uint64(1000+i)))
+	}
+}
+
+// TestStreamReassembly_ReservedFieldsAreInert is a TRIPWIRE, not a feature test.
+// The C++ half carries the identical check at the end of
+// tests/test_reassembler_parity_table.cpp.
+//
+// ChunkHeader.reserved@16 and StreamHeader.reserved@20 carry no meaning as of
+// SHM_VERSION 0x00070000, and both shipped senders write them as literal 0
+// (putChunkHeader / putStreamHeader here, `ch.reserved = 0` in C++ Stream.h).
+// Every parity case is replayed with both fields set to garbage and the digest
+// must be IDENTICAL.
+//
+// WHY. There is a queued proposal to give ChunkHeader@16 meaning (an absolute
+// dstOffset) and StreamHeader@20 meaning (an appMsgType). That is a WIRE BREAK
+// exactly because old senders write 0 and 0 is a LEGAL offset for chunk 0: a new
+// reader against an old sender would place every chunk at offset 0 and corrupt the
+// stream SILENTLY, with an attach-time SHM_VERSION mismatch as the only safe
+// detector.
+//
+// So this passes today and FAILS THE MOMENT EITHER FIELD IS GIVEN MEANING -- which
+// is the alarm. It forces the SHM_VERSION bump, the SPEC update and both parity
+// halves to be revised deliberately and together, instead of a field quietly
+// acquiring semantics that one implementation honours and the other ignores.
+//
+// If you are here because this failed: you are making a wire change. Bump
+// SHM_VERSION, update SPECIFICATION.md, update BOTH parity halves, and replace
+// this test with the new field's own cases.
+func TestStreamReassembly_ReservedFieldsAreInert(t *testing.T) {
+	const garbageChunk = uint32(0xDEADBEEF)
+	const garbageStart = uint32(0xCAFEBABE)
+	for i, tc := range parityCases {
+		t.Run(tc.name, func(t *testing.T) {
+			plain := runParityCaseReserved(tc, uint64(5000+i), 0, 0)
+			dirty := runParityCaseReserved(tc, uint64(5000+i), garbageChunk, garbageStart)
+			if plain != dirty {
+				t.Errorf("reserved fields are NOT inert -- this is a WIRE BEHAVIOR CHANGE "+
+					"(see the comment above this test)\n  reserved=0:       %s\n  reserved=garbage: %s",
+					plain, dirty)
+			}
+		})
 	}
 }

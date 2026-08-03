@@ -73,12 +73,12 @@ Step chunkOtherId(uint32_t idx, size_t size) { return Step{false, idx, size, -1,
 Step restartThenChunk(uint32_t idx, size_t size) { return Step{true, idx, size, -1, false, 0}; }
 
 std::vector<uint8_t> startReq(uint64_t streamId, uint64_t totalSize,
-                              uint32_t totalChunks) {
+                              uint32_t totalChunks, uint32_t reserved = 0) {
     StreamHeader h;
     h.streamId = streamId;
     h.totalSize = totalSize;
     h.totalChunks = totalChunks;
-    h.reserved = 0;
+    h.reserved = reserved;
     std::vector<uint8_t> buf(sizeof(StreamHeader));
     std::memcpy(buf.data(), &h, sizeof(h));
     return buf;
@@ -88,12 +88,13 @@ std::vector<uint8_t> startReq(uint64_t streamId, uint64_t totalSize,
 // disagree with the number of bytes supplied (declared > size exercises the
 // framing guard).
 std::vector<uint8_t> chunkReq(uint64_t streamId, uint32_t idx, uint32_t declared,
-                              const std::vector<uint8_t>& payload) {
+                              const std::vector<uint8_t>& payload,
+                              uint32_t reserved = 0) {
     ChunkHeader h;
     h.streamId = streamId;
     h.chunkIndex = idx;
     h.payloadSize = declared;
-    h.reserved = 0;
+    h.reserved = reserved;
     h.padding = 0;
     std::vector<uint8_t> buf(sizeof(ChunkHeader) + payload.size());
     std::memcpy(buf.data(), &h, sizeof(h));
@@ -132,7 +133,8 @@ std::string toHexUpper(const std::vector<uint8_t>& d) {
     return out;
 }
 
-std::string runCase(const Case& tc, uint64_t streamId) {
+std::string runCase(const Case& tc, uint64_t streamId,
+                    uint32_t chunkReserved = 0, uint32_t startReserved = 0) {
     std::vector<std::vector<uint8_t>> delivered;
     StreamReassembler r([&](uint64_t, const std::vector<uint8_t>& d) {
         delivered.push_back(d);
@@ -141,7 +143,7 @@ std::string runCase(const Case& tc, uint64_t streamId) {
     auto start = [&]() {
         return replyChar(
             handle(r, MsgType::STREAM_START,
-                   startReq(streamId, tc.totalSize, tc.totalChunks)));
+                   startReq(streamId, tc.totalSize, tc.totalChunks, startReserved)));
     };
 
     std::string startReply = start();
@@ -161,7 +163,7 @@ std::string runCase(const Case& tc, uint64_t streamId) {
                                 : static_cast<uint32_t>(st.declared);
         uint64_t id = st.otherId ? (streamId ^ 0xDEADull) : streamId;
         steps += replyChar(handle(r, MsgType::STREAM_CHUNK,
-                                  chunkReq(id, st.idx, declared, payload)));
+                                  chunkReq(id, st.idx, declared, payload, chunkReserved)));
     }
 
     std::string data = "-";
@@ -288,6 +290,49 @@ int main() {
             std::cerr << "FAIL: digest mismatch\n got: " << got
                       << "\nwant: " << table[i].want << std::endl;
             ++g_failures;
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // THE RESERVED FIELDS ARE INERT. This is a TRIPWIRE, not a feature test.
+    // ---------------------------------------------------------------------
+    // ChunkHeader.reserved@16 and StreamHeader.reserved@20 carry no meaning as of
+    // SHM_VERSION 0x00070000, and both shipped senders write them as literal 0
+    // (Stream.h `ch.reserved = 0`, Go putChunkHeader/putStreamHeader). Every case
+    // above is therefore replayed with those two fields set to garbage, and the
+    // digest must be IDENTICAL apart from the case name.
+    //
+    // WHY IT IS HERE. There is a queued proposal to give ChunkHeader@16 meaning
+    // (an absolute dstOffset) and StreamHeader@20 meaning (an appMsgType). Doing so
+    // is a WIRE BREAK precisely because old senders write 0 and 0 is a legal
+    // offset for chunk 0: a new reader against an old sender would place every
+    // chunk at offset 0 and corrupt the stream SILENTLY. The only safe detector is
+    // an attach-time SHM_VERSION mismatch.
+    //
+    // So this check passes today and FAILS THE MOMENT EITHER FIELD IS GIVEN
+    // MEANING. That failure is the alarm: it forces the SHM_VERSION bump, the SPEC
+    // update and the digest table to be revised deliberately and together, instead
+    // of a field quietly acquiring semantics that one implementation honours and
+    // the other ignores.
+    //
+    // If you are here because this failed: you are making a wire change. Bump
+    // SHM_VERSION, update SPECIFICATION.md, update BOTH parity halves, and replace
+    // this block with the new field's own cases.
+    {
+        const uint32_t kGarbageChunk = 0xDEADBEEFu;
+        const uint32_t kGarbageStart = 0xCAFEBABEu;
+        for (size_t i = 0; i < table.size(); ++i) {
+            std::string plain = runCase(table[i], 5000 + i);
+            std::string dirty = runCase(table[i], 5000 + i, kGarbageChunk, kGarbageStart);
+            if (plain != dirty) {
+                std::cerr << "FAIL: reserved fields are NOT inert for case '"
+                          << table[i].name << "'" << std::endl;
+                std::cerr << "  reserved=0:       " << plain << std::endl;
+                std::cerr << "  reserved=garbage: " << dirty << std::endl;
+                std::cerr << "  This is a WIRE BEHAVIOR CHANGE. See the comment above "
+                             "this check." << std::endl;
+                ++g_failures;
+            }
         }
     }
 
