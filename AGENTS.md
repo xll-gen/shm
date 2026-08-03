@@ -366,25 +366,56 @@ flagged by past reviews and confirmed correct — do not "fix" or re-propose:
   digests staying identical is **expected and is not evidence the change is
   correct**. Reach for the residency/early-placement tests instead.
 * **`ChunkHeader.dstOffset` is load-bearing; `StreamHeader.appMsgType` is
-  deliberately inert (`SHM_VERSION 0x00080000`).** These two formerly-reserved
+  delivered but INERT to reassembly (`SHM_VERSION 0x00080000` + receive-side
+  delivery).** These two formerly-reserved
   slots were claimed in one bump, on purpose, but they are *not* symmetric.
   `dstOffset` is the absolute destination of the payload and both reassemblers
   place every chunk by it on arrival — the receiver enforces
   `dstOffset + payloadSize <= totalSize` (by subtraction; `dstOffset` is
   peer-controlled and the sum would wrap) and that the offset equals the running
   cursor when its index becomes in-order, dropping the stream on either failure.
-  `appMsgType` is an application routing tag that shm never interprets: senders
-  write it, **the receive side does not surface it to the stream handler, and that
-  is deferred by decision, not by oversight** — the slot was claimed at this bump
-  so the future receive-side API needs no second bump. Do not
-  "finish" it by inventing a delivery path without the SPEC §3.3.1 update, and do
-  not read the inertness tripwire as evidence the field is unused.
-  The field has **two** guards, one per side of the deferral, and they assert
-  opposite things — keep both:
+  `appMsgType` is an application routing tag that shm never interprets. It was
+  WRITE-ONLY for one release — senders wrote it, both reassemblers parsed past it,
+  and nothing could read it. **That is closed** (SPEC §3.3.1 "Receive-side
+  delivery"): both peers now hand the tag to the completion callback through a
+  **parallel, additive** entry point — Go `NewStreamReassemblerTyped` /
+  `TypedStreamHandler`, C++ the `StreamReassembler(OnStreamTypedFn, cfg)`
+  constructor overload — while `NewStreamReassembler` / `StreamReassembler(OnStreamFn, cfg)`
+  keep their signatures and are *defined as* the typed form with the tag dropped,
+  so there is one reassembly implementation, not two. It cost **no `SHM_VERSION`
+  bump**, which is exactly what claiming the slot at `0x00080000` bought.
+  **"Additive" has one C++ exception — do not restate it as "purely additive".**
+  Adding a constructor overload made arguments convertible to BOTH function types
+  ambiguous: `StreamReassembler r(nullptr)`, `r({})`, `r([](auto&&...){})` compiled
+  before 0.9.1 and no longer do (verified by compiling one TU against the old and
+  new headers; g++ 14.2 `-std=c++17`). No caller here is affected and the failure is
+  always a compile error, never a behavior change, but the doc line must not claim
+  otherwise. Recorded on the `OnStreamFn` constructor in `include/shm/StreamReassembler.h`
+  and in SPEC §3.3.1 obligation 1. Go has no such exception (new name, no overloading).
+  Delivering the tag is **not** licence to branch on it: nothing in reassembly may
+  read `appMsgType`, and if you make it a guard, a bound or a completion test, the
+  peers stop agreeing on accept/reject.
+  The field now has **three** guards, and they assert different things — keep all
+  three; none implies another:
   * *Receive side (negative):* `TestStreamReassembly_AppMsgTypeIsInertToReassembly`
     (`go/stream_parity_table_test.go`) and its C++ twin at the end of
-    `tests/test_reassembler_parity_table.cpp` replay every parity case with the tag
-    set to garbage and require byte-identical digests.
+    `tests/test_reassembler_parity_table.cpp` replay every parity case through the
+    UNTYPED entry point with the tag set to garbage and require byte-identical
+    digests. This one is a *negative* assertion by construction: it was green
+    through the entire write-only period and would be green against a reassembler
+    that never touched offset 20.
+  * *Receive side (positive):* `go/stream_apptype_delivery_test.go` and
+    `tests/test_reassembler_appmsgtype_delivery.cpp` — one artifact, same cases on
+    both sides. They are the ONLY thing that can fail for "the tag never reaches
+    the handler". Non-vacuity is designed in and confirmed by mutation (deliver a
+    constant; read `totalChunks@16` instead of `appMsgType@20`; keep a
+    reassembler-wide "last tag seen"): every mutant flips these red while
+    `test_reassembler_parity_table`, `test_reassembler_dstoffset_placement` and
+    `test_reassembler_contract` all stay GREEN. Three properties are load-bearing
+    and must survive any edit — a tag value that collides with no other header
+    field, a case asserting a **zero** tag on a header whose every other field is
+    nonzero, and a case interleaving two streams with different tags that complete
+    in the reverse of their start order.
   * *Send side (positive):* `go/stream_sender_appmsgtype_test.go`
     (`TestStreamSender_WritesAppMsgTypeAtWireOffset20`,
     `TestStreamSender_DefaultAppMsgTypeIsZero`). Every *other* `appMsgType` test
@@ -393,6 +424,7 @@ flagged by past reviews and confirmed correct — do not "fix" or re-propose:
     dropped, written at the wrong offset, or written into the `ChunkHeader`
     instead, and the whole suite would still have been green. These two drive the
     exported sender against a real segment and read the bytes back off the wire.
+    They stop at the wire and say nothing about delivery.
 * **Reserved and padding bytes MUST reach the wire as zero** (SPEC §3.3.2
   "Reserved and padding space"). This is not hygiene: every field this protocol
   added *without* a version bump — `lease`, `gen`, `fastPathAllowed` — was safe to

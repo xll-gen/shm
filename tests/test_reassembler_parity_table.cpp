@@ -417,13 +417,21 @@ int main() {
     //
     // StreamHeader.appMsgType@20 (formerly reserved@20; named as of SHM_VERSION
     // 0x00080000) is an application-defined routing tag that is OPAQUE to shm.
-    // Senders write it — StreamSender::Send's appMsgType parameter here, Go
-    // StreamSender.SetAppMsgType there — and the wire slot was claimed at the
-    // 0x00080000 bump specifically so that a future receive-side API needs no
-    // second bump. SURFACING IT TO THE STREAM HANDLER IS DEFERRED AND OUT OF
-    // SCOPE. So the one checkable property today is exactly this: the value MUST
-    // NOT alter reassembly. Every parity case is replayed with the field set to
-    // garbage and every digest must be byte-identical.
+    // It is now DELIVERED to the receive side (SPEC §3.3.1 "Receive-side
+    // delivery", the StreamReassembler(OnStreamTypedFn) constructor), and that
+    // did NOT retire this check — it made the two halves of the contract
+    // explicit instead:
+    //
+    //   * POSITIVE, in tests/test_reassembler_appmsgtype_delivery.cpp: the tag
+    //     reaches the typed handler, per stream, on both completion paths.
+    //   * NEGATIVE, here: the tag MUST NOT alter reassembly. Every parity case
+    //     is replayed through the UNTYPED constructor with the field set to
+    //     garbage and every digest must be byte-identical.
+    //
+    // Neither half implies the other. Delivering the tag is not licence to
+    // branch on it: the moment a guard, a bound or a completion test consults
+    // appMsgType, this goes red and a stream one peer accepts becomes one the
+    // other rejects.
     //
     // Note what is NOT asserted here any more, and why. The predecessor of this
     // block also replayed the table with ChunkHeader@16 set to garbage. That
@@ -431,12 +439,11 @@ int main() {
     // be asserting the opposite of the contract; the dstOffset cases at the end
     // of the table above replace it.
     //
-    // If you are here because this failed: you are making a wire change. When
-    // appMsgType is finally surfaced to the receive side it stops being inert,
-    // and at that point bump SHM_VERSION only if the *wire* changes (it does not
-    // — the slot is already claimed), but do update SPECIFICATION.md §3.3.1,
-    // both parity halves, and replace this tripwire with the routing tag's own
-    // cases. Do not "fix" it by loosening the comparison.
+    // If you are here because this failed: you are making a wire behavior
+    // change. Update SPECIFICATION.md §3.3.1 and both parity halves in the same
+    // commit, or don't make it. Do not "fix" it by loosening the comparison. (A
+    // SHM_VERSION bump is a separate question and the answer is normally no —
+    // the slot has been on the wire since 0x00080000.)
     {
         const uint32_t kGarbageAppMsgType = 0xCAFEBABEu;
         for (size_t i = 0; i < table.size(); ++i) {

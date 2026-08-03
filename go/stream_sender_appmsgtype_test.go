@@ -7,10 +7,13 @@ import (
 	"time"
 )
 
-// This file covers the WRITE side of StreamHeader.appMsgType@20 — the only half
-// of that field which is supposed to work at SHM_VERSION 0x00080000 (receive-side
-// surfacing is deliberately deferred; see the AppMsgTypeIsInertToReassembly
-// tripwire in go/stream_parity_table_test.go).
+// This file covers the WRITE side of StreamHeader.appMsgType@20 and NOTHING
+// downstream of the wire. It proves the byte lands at offset 20 of the segment;
+// it cannot tell whether anything ever reads it — for most of the field's life
+// nothing did. The receive half lives in go/stream_apptype_delivery_test.go
+// (positive: the tag reaches the handler) and in the
+// AppMsgTypeIsInertToReassembly tripwire in go/stream_parity_table_test.go
+// (negative: it changes nothing about reassembly). All three are needed.
 //
 // Every other appMsgType test hand-builds the StreamHeader bytes, so none of them
 // touches StreamSender.SetAppMsgType or putStreamHeader. The tag could have been

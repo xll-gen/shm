@@ -1,5 +1,77 @@
 # Changelog
 
+## [Unreleased]
+
+### Added — `StreamHeader.appMsgType` reaches the receive side
+
+**No wire change and NO `SHM_VERSION` bump.** `StreamHeader.appMsgType@20` has
+been on the wire since `0x00080000`; only local API surface changes here. That
+the slot was claimed at that bump is exactly what makes this free — it is the
+plan being spent, not a new one.
+
+The field was **write-only** for the whole of 0.9.0: both senders wrote it, both
+reassemblers parsed past it, and the application had no way to read it. Both
+peers now surface it through a **parallel, additive** entry point:
+
+- **Go** — `shm.TypedStreamHandler` (`func(streamID uint64, appMsgType uint32, data []byte)`)
+  and `shm.NewStreamReassemblerTyped`. `NewStreamReassembler` and `StreamHandler`
+  are unchanged.
+- **C++** — `StreamReassembler::OnStreamTypedFn` and the
+  `StreamReassembler(OnStreamTypedFn, cfg)` constructor overload. The
+  `StreamReassembler(OnStreamFn, cfg)` constructor is unchanged.
+
+On both sides the untyped form is *defined as* the typed form with the tag
+discarded, so there is one reassembly implementation rather than two kept in
+sync. The tag is captured into the per-stream reassembly context at
+`STREAM_START` and delivered from there on **both** completion paths (the
+`totalChunks == 0` stream, which completes inside `STREAM_START`, and ordinary
+chunk completion), so interleaved streams each report their own tag. A dropped
+or evicted stream delivers nothing, as before. `0` is delivered as `0`: there is
+no validation, normalisation or default substitution.
+
+`appMsgType` remains **inert to reassembly** — nothing in the accept/reject path
+reads it, and the existing inertness tripwires
+(`TestStreamReassembly_AppMsgTypeIsInertToReassembly` and its C++ twin) stay in
+place unchanged. Delivery and inertness are the two halves of SPEC §3.3.1 and
+neither implies the other.
+
+New regression pair, one artifact in two languages:
+`go/stream_apptype_delivery_test.go` and
+`tests/test_reassembler_appmsgtype_delivery.cpp`. They exist because neither
+pre-existing guard could fail for "the tag never reaches the handler" — the
+send-side test stops at wire offset 20, and the inertness tripwire is a negative
+assertion that was green throughout the write-only period. Non-vacuity is
+confirmed by mutation on both sides (deliver a constant; read `totalChunks@16`
+instead of `appMsgType@20`; keep a reassembler-wide "last tag seen"): every
+mutant flips the new tests red while the parity table, the `dstOffset` placement
+test and the reassembler contract test all stay green.
+
+`SPECIFICATION.md` §3.3.1 carries the four normative obligations (additive,
+per-stream, both completion paths, unvalidated).
+
+**"Additive" has one C++ exception, and the spec now says so.** Adding the
+`StreamReassembler(OnStreamTypedFn, cfg)` overload makes an argument convertible
+to BOTH function types ambiguous: `StreamReassembler r(nullptr)`, `r({})` and
+`r([](auto&&...){})` compiled against the pre-change header and no longer do
+(one TU compiled against both headers; g++ 14.2 `-std=c++17`). No caller in this
+tree or any documented usage is affected and the failure is always a compile
+error, but the earlier "purely additive / an existing caller MUST NOT have to
+change" wording was unqualified and therefore false. Recorded on the `OnStreamFn`
+constructor, in SPEC §3.3.1 obligation 1 and in `AGENTS.md`. Go is unaffected —
+`NewStreamReassemblerTyped` is a new name, not an overload.
+
+**Chunk-completion retires the context by `extract`, not `erase`.** Two values
+have to come out of the context at completion (the payload, moved out; the
+routing tag, copied out) and both are read AFTER the node leaves the map. Under
+`streams.erase(it)` that ordering is a use-after-free that the shipped test suite
+cannot fail — the freed node's bytes are still intact, so
+`test_reassembler_appmsgtype_delivery` exits 0 under the mutation. `extract`
+transfers ownership of the node to a local, so the reference stays valid and the
+hazard is gone by construction rather than guarded by a comment. Demonstrated by
+rebuilding that test against a poisoning global `operator delete` (0xAB fill,
+leak): `extract` passes, `erase` fails 7 checks with `delivered appMsgType
+0xABABABAB`. No ASAN on this toolchain, hence the hand-rolled poisoner.
+
 ## [0.9.0] - 2026-08-03
 
 **BREAKING WIRE CHANGE.** `SHM_VERSION` goes `0x00070000` → `0x00080000`, the

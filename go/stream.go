@@ -143,6 +143,15 @@ const DefaultStreamTimeout = 10 * time.Second
 // StreamHandler is a function type for processing assembled streams.
 type StreamHandler func(streamID uint64, data []byte)
 
+// TypedStreamHandler is StreamHandler plus the routing tag the stream's own
+// STREAM_START carried in StreamHeader.AppMsgType (SPEC §3.3.1). shm neither
+// interprets nor validates the tag: 0 arrives as 0, every other value verbatim.
+//
+// appMsgType is the tag captured when THIS stream's context was created, not the
+// most recently observed one — with several streams in flight each completion
+// reports its own.
+type TypedStreamHandler func(streamID uint64, appMsgType uint32, data []byte)
+
 // streamContext holds the state of a stream being reassembled.
 //
 // 2026-07-03 direct-into-destination: the final buffer is preallocated at
@@ -168,9 +177,15 @@ type streamContext struct {
 
 	totalSize   uint64 // immutable after construction
 	totalChunks uint32 // immutable after construction
-	buf         []byte // preallocated destination, len == totalSize
-	next        uint32 // next in-order chunk index to consume into buf
-	offset      uint64 // bytes written into buf so far (running Σ payloadSize)
+	// appMsgType is the SPEC §3.3.1 routing tag from the STREAM_START that
+	// created THIS context. Immutable after construction, which is what makes
+	// the per-stream delivery obligation hold under interleaved streams: a
+	// reassembler-wide "last tag seen" would report the wrong stream's tag.
+	// Opaque to every guard below — nothing in reassembly reads it.
+	appMsgType uint32
+	buf        []byte // preallocated destination, len == totalSize
+	next       uint32 // next in-order chunk index to consume into buf
+	offset     uint64 // bytes written into buf so far (running Σ payloadSize)
 	// ooo records chunks placed AHEAD of next, keyed by chunk index. Presence in
 	// the map is the dedup marker, so zero-length chunks are counted exactly
 	// once. nil until first needed.
@@ -295,6 +310,24 @@ func NewStreamReassembler(onStream StreamHandler, fallback func(req []byte, resp
 	return newStreamReassembler(onStream, fallback, DefaultStreamTimeout, time.Now)
 }
 
+// NewStreamReassemblerTyped is NewStreamReassembler with a completion callback
+// that also receives StreamHeader.AppMsgType (SPEC §3.3.1 "Receive-side
+// delivery"). It is the PARALLEL entry point required there: NewStreamReassembler
+// keeps its signature and its behavior, and is defined as this one with the tag
+// discarded, so the two cannot diverge in reassembly behavior.
+//
+// The tag reaches onStream on both completion paths — the empty stream
+// (TotalChunks == 0, completed inside STREAM_START) and ordinary chunk
+// completion. A dropped or evicted stream delivers nothing at all.
+//
+// This costs no version bump: StreamHeader.AppMsgType@20 has been on the wire
+// since SHM_VERSION 0x00080000, written by both senders and read by nobody. Only
+// local API surface changes here.
+func NewStreamReassemblerTyped(onStream TypedStreamHandler, fallback func(req []byte, resp []byte, msgType MsgType) (int32, MsgType)) func(req []byte, resp []byte, msgType MsgType) (int32, MsgType) {
+	handler, _ := newStreamReassemblerTypedPeek(onStream, fallback, DefaultStreamTimeout, time.Now, nil)
+	return handler
+}
+
 // newStreamReassembler is the clock- and timeout-injectable core of
 // NewStreamReassembler. timeout <= 0 disables the age-based prune (LRU only).
 // now supplies the current time; production passes time.Now, tests pass a
@@ -350,6 +383,44 @@ func newStreamReassembler(onStream StreamHandler, fallback func(req []byte, resp
 // test seam in the same sense newStreamReassembler itself is (clock injection):
 // production goes through NewStreamReassembler and never sees it.
 func newStreamReassemblerPeek(onStream StreamHandler, fallback func(req []byte, resp []byte, msgType MsgType) (int32, MsgType), timeout time.Duration, now func() time.Time) (handler func(req []byte, resp []byte, msgType MsgType) (int32, MsgType), peek func(streamID uint64) *streamContext) {
+	return newStreamReassemblerTypedPeek(func(streamID uint64, _ uint32, data []byte) {
+		onStream(streamID, data)
+	}, fallback, timeout, now, nil)
+}
+
+// newStreamReassemblerTypedPeek is the single implementation; every other
+// constructor in this file adapts onto it. The untyped forms pass a shim that
+// drops appMsgType, so "the untyped entry point behaves exactly like the typed
+// one minus the tag" is true by construction rather than by two code paths kept
+// in sync (SPEC §3.3.1 obligation 1).
+//
+// newBuf is a BENCHMARK-ONLY seam, not a buffer supplier feature. EVERY public
+// constructor passes nil, so production allocates the destination with
+// make([]byte, totalSize) exactly as it always has. It exists so the cost of
+// that zero-fill can be measured against a receive path that is otherwise
+// byte-identical (go/stream_zerofill_bench_test.go); the backlog item proposing
+// an opt-in supplier had been picked up and abandoned twice for want of that
+// number. The measurement was taken on 2026-08-03 and the opt-in was DECLINED —
+// see EXPERIMENTS.md "2026-08-03 stream destination zero-fill". Do not export
+// this: a public supplier hands the caller a lifetime obligation shm cannot
+// enforce IN GO — StreamHandler passes the destination out as a []byte, and
+// retaining that slice past the callback is legal, undetectable Go, so a
+// recycled buffer silently corrupts data the previous receiver still holds. The
+// C++ reassembler has no equivalent exposure (its callback takes a
+// const std::vector<uint8_t>& to a vector destroyed right after the call), so do
+// not carry this reason across; what the C++ side does owe is a matching hook
+// per AGENTS.md feature parity, which is ADDITIVE there — StreamReassembler.h
+// moves ctx.buf into a local it still owns across onStream, so an acquire/
+// release pair needs no signature change. That is a cost in duplicated work and
+// tests, not a breaking API change.
+//
+// A seam implementation MUST return a slice with len == n; the caller installs
+// it as ctx.buf verbatim and every bounds guard in reassembly is expressed
+// against it.
+func newStreamReassemblerTypedPeek(onStream TypedStreamHandler, fallback func(req []byte, resp []byte, msgType MsgType) (int32, MsgType), timeout time.Duration, now func() time.Time, newBuf func(int) []byte) (handler func(req []byte, resp []byte, msgType MsgType) (int32, MsgType), peek func(streamID uint64) *streamContext) {
+	if newBuf == nil {
+		newBuf = func(n int) []byte { return make([]byte, n) }
+	}
 	// Map to store partial streams
 	streams := make(map[uint64]*streamContext)
 	var mu sync.Mutex
@@ -388,6 +459,10 @@ func newStreamReassemblerPeek(onStream StreamHandler, fallback func(req []byte, 
 			streamID := binary.LittleEndian.Uint64(req[0:8])
 			totalSize := binary.LittleEndian.Uint64(req[8:16])
 			totalChunks := binary.LittleEndian.Uint32(req[16:20])
+			// SPEC §3.3.1 routing tag. Parsed here and NEVER consulted below —
+			// it is carried alongside the reassembled bytes, not used while
+			// producing them, which is what keeps the inertness MUST true.
+			appMsgType := binary.LittleEndian.Uint32(req[20:24])
 
 			if totalChunks > MaxStreamChunks || totalSize > MaxStreamSize {
 				return 0, MsgTypeSystemError
@@ -398,7 +473,7 @@ func newStreamReassemblerPeek(onStream StreamHandler, fallback func(req []byte, 
 				if totalSize != 0 {
 					return 0, MsgTypeSystemError
 				}
-				onStream(streamID, nil)
+				onStream(streamID, appMsgType, nil)
 				return 0, MsgTypeNormal // ACK
 			}
 
@@ -406,10 +481,18 @@ func newStreamReassemblerPeek(onStream StreamHandler, fallback func(req []byte, 
 			// reaches MaxStreamSize (1 GiB), and the runtime zeroes the whole
 			// allocation; holding the reassembler-wide lock across that memclr
 			// stalled every other stream's chunk traffic.
+			//
+			// The zero-fill itself is NOT wasted work that can simply be dropped,
+			// even though delivery requires every byte to have been overwritten
+			// (next == totalChunks AND offset == totalSize): Go has no allocation
+			// that skips it, so removing it means not allocating at all — i.e.
+			// recycling a buffer the application handed back. newBuf is the
+			// benchmark seam for that; production is make([]byte, totalSize).
 			ctx := &streamContext{
 				totalSize:   totalSize,
 				totalChunks: totalChunks,
-				buf:         make([]byte, totalSize),
+				appMsgType:  appMsgType,
+				buf:         newBuf(int(totalSize)),
 			}
 
 			mu.Lock()
@@ -611,7 +694,11 @@ func newStreamReassemblerPeek(onStream StreamHandler, fallback func(req []byte, 
 				return 0, MsgTypeSystemError
 			}
 			if ready {
-				onStream(streamID, fullData)
+				// ctx.appMsgType, not a reassembler-wide value: the tag belongs
+				// to the STREAM_START that opened THIS context (SPEC §3.3.1
+				// obligation 2). Immutable since construction, so reading it
+				// after the context lock was dropped is safe.
+				onStream(streamID, ctx.appMsgType, fullData)
 			}
 
 			return 0, MsgTypeNormal // ACK

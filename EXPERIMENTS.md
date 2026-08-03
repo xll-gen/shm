@@ -577,3 +577,144 @@ guest-call cells from a single run.**
 **Not measured here (and it is the actual motivation):** the idle-CPU saving for a host
 that adopts `WaitForGuestCall` instead of spinning. That is a property of the CONSUMER's
 loop, not of shm, so it belongs in the consumer's record — see xll-gen's `WorkerLoop`.
+
+---
+
+## 2026-08-03: stream destination zero-fill — measured, opt-in supplier DECLINED
+
+**Question.** `stream.go` StreamStart allocates the reassembly destination with
+`make([]byte, totalSize)` (up to 1 GiB), and the Go runtime zeroes every byte of
+it. The backlog carried a proposal to skip that with an opt-in buffer supplier,
+gated on one precondition: *first* show `runtime.memclrNoHeapPointers` is a
+meaningful share of the receive path. Two earlier attempts were abandoned
+without ever taking that measurement.
+
+**Instrument.** `go/stream_zerofill_bench_test.go`. `BenchmarkStreamReceive`
+drives whole streams through the reassembler at the three harness stream sizes,
+shaped like the wire path: 4072-byte chunk payloads (harness `-c 4096`), the
+chunk request buffer REUSED across chunks (on the wire `req` points at the
+peer's fixed slot buffer, so the copy source is a hot 4 KiB region), one stream
+per iteration driven to completion. `newStreamReassemblerTypedPeek` gained an
+unexported `newBuf` seam — every public constructor passes nil, so production is
+unchanged — which lets the same path run against supplied buffers.
+
+**Precondition: CONFIRMED.** CPU profile, Ryzen 9 3900X, go1.26.3, `-cpu=1`,
+`runtime.memclrNoHeapPointers` flat share, with **100 % of it reached via
+`mallocgcLarge`** — the StreamStart allocation and nothing else:
+
+| stream size | memclr share of receive path |
+|-------------|------------------------------|
+| 64 KiB      | 23.5 % |
+| 1 MiB       | 33.2 % |
+| 16 MiB      | 46.4 % |
+
+**Ceiling: SIZE-SLOPING, ~1.2× at 64 KiB rising to ~1.6–1.9× at 16 MiB.**
+`BenchmarkStreamReceive` vs `BenchmarkStreamReceivePooledCold` (supplier rotates
+a ring of buffers totalling ~128 MiB, so the destination is as cold as a fresh
+allocation and only the zero-fill and its GC work are removed), medians of 5
+within one session. Three independent sessions on the same host and the same
+code:
+
+| stream size | run 1 default | run 1 pooled | run 1 | run 2 | run 3 default | run 3 pooled | run 3 |
+|-------------|---------------|--------------|-------|-------|---------------|--------------|-------|
+| 64 KiB      | 8228 ns       | 5457 ns      | 1.51× | 1.15× | 5828 ns       | 4984 ns      | 1.17× |
+| 1 MiB       | 135.4 µs      | 79.7 µs      | 1.70× | 1.25× | 107.7 µs      | 79.3 µs      | 1.36× |
+| 16 MiB      | 2.204 ms      | 1.286 ms     | 1.71× | 1.64× | 2.369 ms      | 1.278 ms     | 1.85× |
+
+⚠ **Run 1's 64 KiB and 1 MiB cells DID NOT REPRODUCE** — two later sessions put
+them at 1.15–1.17× and 1.25–1.36×, not 1.51× and 1.70×. Only the 16 MiB cell is
+stable across sessions (1.64–1.85×). Quote the sloping range, never a flat
+"1.5–1.7×".
+
+⚠ And the "both A/Bs are within-session" caveat below does NOT cover this. The
+±30 % drift lands ASYMMETRICALLY: the POOLED arm is steady across all three
+sessions (5457 / 4984 ns at 64 KiB, 79.7 / 79.3 µs at 1 MiB — under 9 %), while
+the DEFAULT arm swings 8228 → 5828 ns (41 %). Being in one session does not
+protect a ratio when the drift only moves one arm; the small-size cells are
+essentially reading the default arm's state. The 16 MiB cell survives because
+the real memclr share there (46 %) is larger than the drift.
+
+⚠ `BenchmarkStreamReceivePooled` (a single reused buffer) reports 2.9–5.1×.
+That number is an artifact: at 64 KiB / 1 MiB the whole destination stays in
+cache, so it also removes the payload copy's memory traffic. Use the cold-ring
+figure.
+
+⚠ Cross-session drift on the SAME code: `BenchmarkStreamReceive/64KiB` measured
+6158–6464 ns in one session and 8048–8750 ns in the next (+30 %). Both A/Bs
+above are within-session for that reason.
+
+**End-to-end it would be worth ~3 % at 64 KiB, ~7 % at 1 MiB, ~13–16 % at
+16 MiB — it slopes with size exactly as the ratio does, and the flat "~10–14 %"
+an earlier draft carried was wrong below 16 MiB.** The harness stream cell is
+per-chunk-RTT dominated at the default 4 KiB chunk (16 MiB measures 2.46 GB/s ≈
+1.66 µs per 4072-byte chunk; see IMPROVEMENT_BACKLOG.md's stream preamble).
+Per-chunk saving = (default − pooled) ÷ (size ÷ 4072), from run 3's medians:
+
+| stream size | saving / stream | chunks | saving / chunk | share of the 1.66 µs RTT |
+|-------------|-----------------|--------|----------------|--------------------------|
+| 64 KiB      | 844 ns          | 16.1   | **52 ns**      | **3.2 %** |
+| 1 MiB       | 28.4 µs         | 257    | **110 ns**     | **6.7 %** |
+| 16 MiB      | 1.091 ms        | 4121   | **265 ns**     | **16 %**  |
+
+The earlier draft's "173 ns/chunk at 64 KiB, the same ballpark" came from run 1's
+unreproduced 8228 ns default; at 52 ns/chunk it is not the same ballpark, it is a
+third of it. The Go-level ratio is a share of ONE term in the round trip, not of
+the round trip. **Not verified against the harness**: the cross-language matrix
+was not run for this item (a real-Excel measurement had the machine), so every
+percentage here is arithmetic on a Go microbenchmark, not a measurement.
+
+**Declined anyway.** The premise is right and the win is real, and it still does
+not pay for itself here:
+
+1. **Opt-in means the default path gains exactly zero.** Nothing improves until a
+   caller supplies buffers.
+2. **There is no such caller.** Outside `shm/go` itself, the only users of
+   `NewStreamReassembler` in the ecosystem are `benchmarks/go/main.go` and
+   `tests/go_integration/main.go`. The production consumer does not use shm
+   streams at all — see xll-gen `pkg/chunk/chunk.go` ("xll-gen does not use shm
+   streams") and `pkg/server/realshm_chunk_test.go` ("xll-gen never uses shm's
+   StreamSender"). The feature would ship with zero real consumers.
+3. **Moving the harness to pooled buffers would make the published numbers
+   unrepresentative.** BENCHMARK_RESULTS.md's stream rows would jump for a
+   configuration no default user gets, and the series would take another
+   discontinuity.
+4. **Parity work on the C++ side is real but ADDITIVE — it is not a breaking API
+   change.** An earlier draft claimed it was; that was wrong and is corrected
+   here. `StreamReassembler` completes by moving `ctx.buf` into a LOCAL
+   `std::vector<uint8_t> fullData` which the reassembler still OWNS across
+   `onStream(streamId, appMsgType, fullData)` and destroys at the end of that
+   scope (`include/shm/StreamReassembler.h:664–676`). A pool therefore drops in
+   with no signature change anywhere: an optional acquire hook where `ctx.buf`
+   is sized, and a release after the callback returns. The cost is the second
+   implementation and its tests, which is a real reason to decline — but say
+   that, not "breaking".
+5. **The API hands out a lifetime obligation shm cannot enforce — in Go.** A
+   buffer may only be recycled once the previous `onStream` receiver is done
+   with it, and a violation corrupts delivered payloads silently. This is
+   GO-SPECIFIC, not a cross-language argument: `StreamHandler` is
+   `func(streamID uint64, data []byte)` (`go/stream.go:144`), and retaining
+   that slice past the call is legal, ordinary Go that nothing can detect. The
+   C++ callback takes `const std::vector<uint8_t>&` to a vector the reassembler
+   destroys immediately after the call, so retention is already not expressible
+   there. Do not carry reason 5 over to the C++ side.
+
+**Safety facts established while measuring** (they hold today and are worth
+keeping whether or not a supplier ever lands):
+
+* A delivered stream has had **every** byte of its destination overwritten.
+  Delivery requires `next == totalChunks` **and** `offset == totalSize`; each
+  in-order chunk must carry `dstOffset == offset`, and `fits`/`inBounds` keep
+  every write inside `[0, totalSize)`. So the coverage is contiguous from 0 to
+  totalSize, and a recycled buffer could not leak residue through a *completed*
+  stream. `go/stream_zerofill_residue_test.go` pins this with a poisoned
+  destination.
+* An **incomplete** stream's buffer must never go back to a pool. Prune, LRU
+  eviction, same-ID replacement and every corrupt-drop path retire the context
+  without calling `onStream`, so no one is told the buffer is free; and drop the
+  `offset == totalSize` conjunct and the same paths would deliver a tail of
+  whatever the buffer held before. Ownership of a delivered buffer passes to the
+  `onStream` receiver, and shm never takes it back.
+
+**Reopen if** a real consumer of the stream receive path appears with a
+throughput problem at ≥ 64 KiB. The instrument is committed; re-running it is
+one `go test -bench` away, so the next look costs minutes, not a day.

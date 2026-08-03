@@ -533,13 +533,20 @@ func TestStreamReassembly_ParityTableDump(t *testing.T) {
 //
 // StreamHeader.appMsgType@20 (formerly reserved@20; named as of SHM_VERSION
 // 0x00080000) is an application-defined routing tag that is OPAQUE to shm.
-// Senders write it — Go StreamSender.SetAppMsgType, C++ StreamSender::Send's
-// appMsgType parameter — and the wire slot was claimed at the 0x00080000 bump
-// specifically so that a future receive-side API needs no second bump.
-// SURFACING IT TO THE STREAM HANDLER IS DEFERRED AND OUT OF SCOPE. So the one
-// checkable property today is exactly this: the value MUST NOT alter
-// reassembly. Every parity case is replayed with the field set to garbage and
-// every digest must be byte-identical.
+// It is now DELIVERED to the receive side (SPEC §3.3.1 "Receive-side delivery",
+// NewStreamReassemblerTyped), and that did NOT retire this check — it made the
+// two halves of the contract explicit instead:
+//
+//   - POSITIVE, in stream_apptype_delivery_test.go: the tag reaches the typed
+//     handler, per stream, on both completion paths.
+//   - NEGATIVE, here: the tag MUST NOT alter reassembly. Every parity case is
+//     replayed through the UNTYPED entry point with the field set to garbage,
+//     and every digest must be byte-identical — same acceptances, same
+//     rejections, same delivered bytes.
+//
+// Neither half implies the other. Delivering the tag is not licence to branch on
+// it: the moment a guard, a bound or a completion test consults appMsgType, this
+// goes red and a stream one peer accepts becomes one the other rejects.
 //
 // Note what is NOT asserted here any more, and why. Its predecessor,
 // TestStreamReassembly_ReservedFieldsAreInert, also replayed the table with
@@ -547,12 +554,11 @@ func TestStreamReassembly_ParityTableDump(t *testing.T) {
 // LOAD-BEARING, so an equivalent check would be asserting the opposite of the
 // contract; the dstOffset cases at the end of parityCases replace it.
 //
-// If you are here because this failed: you are making a wire change. When
-// appMsgType is finally surfaced to the receive side it stops being inert, and
-// at that point bump SHM_VERSION only if the *wire* changes (it does not — the
-// slot is already claimed), but do update SPECIFICATION.md §3.3.1, both parity
-// halves, and replace this tripwire with the routing tag's own cases. Do not
-// "fix" it by loosening the comparison.
+// If you are here because this failed: you are making a wire behavior change.
+// Update SPECIFICATION.md §3.3.1 and both parity halves in the same commit, or
+// don't make it. Do not "fix" it by loosening the comparison. (A SHM_VERSION
+// bump is a separate question and the answer is normally no — the slot has been
+// on the wire since 0x00080000.)
 func TestStreamReassembly_AppMsgTypeIsInertToReassembly(t *testing.T) {
 	const garbageAppMsgType = uint32(0xCAFEBABE)
 	for i, tc := range parityCases {

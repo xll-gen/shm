@@ -98,6 +98,20 @@ public:
      */
     using OnStreamFn = std::function<void(uint64_t streamId, const std::vector<uint8_t>& data)>;
 
+    /**
+     * @brief OnStreamFn plus the routing tag this stream's STREAM_START carried
+     *        in StreamHeader::appMsgType (SPEC §3.3.1 "Receive-side delivery").
+     *
+     * shm neither interprets nor validates the tag: 0 arrives as 0, every other
+     * value verbatim. It is the tag captured when THIS stream's context was
+     * created — not the most recently observed one, so with several streams in
+     * flight each completion reports its own.
+     *
+     * The Go counterpart is `shm.TypedStreamHandler` (go/stream.go).
+     */
+    using OnStreamTypedFn =
+        std::function<void(uint64_t streamId, uint32_t appMsgType, const std::vector<uint8_t>& data)>;
+
 private:
     /**
      * @brief Reassembly state for one in-flight stream.
@@ -117,6 +131,17 @@ private:
     struct StreamContext {
         uint64_t totalSize = 0;
         uint32_t totalChunks = 0;
+        /**
+         * @brief SPEC §3.3.1 routing tag from the STREAM_START that created THIS
+         *        context.
+         *
+         * Set once at STREAM_START and never read by any guard below — that is
+         * what keeps the inertness MUST true while the tag is still delivered.
+         * Per-context rather than per-reassembler is the load-bearing part: a
+         * "last appMsgType seen" member would report the wrong stream's tag
+         * whenever two streams are in flight.
+         */
+        uint32_t appMsgType = 0;
         uint32_t next = 0;    ///< next in-order chunk index to account for
         uint64_t offset = 0;  ///< bytes accounted in order (Σ payloadSize of 0..next-1)
         /**
@@ -240,7 +265,13 @@ private:
 
     std::unordered_map<uint64_t, StreamContext> streams;
     std::mutex streamsMutex;
-    OnStreamFn onStream;
+    /**
+     * @brief The single completion sink. The (streamId, data) constructor wraps
+     *        its callback into one of these with the tag dropped, so the untyped
+     *        form IS the typed form minus the tag — one code path, not two kept
+     *        in sync (SPEC §3.3.1 obligation 1).
+     */
+    OnStreamTypedFn onStream;
     StreamReassemblerConfig config;
 
     void PruneInternal() {
@@ -257,12 +288,28 @@ private:
 
 public:
     /**
-     * @brief Constructs a StreamReassembler.
+     * @brief Constructs a StreamReassembler whose completion callback also
+     *        receives StreamHeader::appMsgType (SPEC §3.3.1 "Receive-side
+     *        delivery").
+     *
+     * This is the PARALLEL entry point required there, and the Go counterpart is
+     * `shm.NewStreamReassemblerTyped`. It is purely additive: the (streamId,
+     * data) constructor below keeps its signature and its behavior, and is
+     * defined in terms of this one.
+     *
+     * The tag reaches @p callback on both completion paths — the empty stream
+     * (totalChunks == 0, completed inside STREAM_START) and ordinary chunk
+     * completion. A dropped or evicted stream delivers nothing at all.
+     *
+     * No version bump: StreamHeader::appMsgType@20 has been on the wire since
+     * SHM_VERSION 0x00080000, written by both senders and read by nobody. Only
+     * local API surface changes here.
+     *
      * @param callback Function to call when a stream is completed.
      * @param cfg Configuration object.
      */
-    StreamReassembler(OnStreamFn callback, StreamReassemblerConfig cfg = StreamReassemblerConfig())
-        : onStream(callback), config(cfg) {
+    StreamReassembler(OnStreamTypedFn callback, StreamReassemblerConfig cfg = StreamReassemblerConfig())
+        : onStream(std::move(callback)), config(cfg) {
         // maxStreamSize is a wire-format precondition, not a knob (SPEC §3.3.4,
         // shm::kMaxStreamSize). A host that raised it would accept a STREAM_START
         // the Go peer rejects outright — an accept/reject parity break — and, past
@@ -279,6 +326,46 @@ public:
             config.maxStreamSize = kMaxStreamSize;
         }
     }
+
+    /**
+     * @brief Constructs a StreamReassembler with the pre-0.9.x (streamId, data)
+     *        completion callback. Unchanged; every existing caller keeps working.
+     *
+     * It delegates to the typed constructor with the tag discarded, so there is
+     * exactly ONE reassembly implementation and the two entry points cannot
+     * drift apart in accept/reject or delivered bytes (SPEC §3.3.1 obligation 1).
+     * An empty @p callback still throws std::bad_function_call at completion,
+     * exactly as before — the wrapper forwards, it does not guard.
+     *
+     * A two-argument lambda is not convertible to OnStreamTypedFn and a
+     * three-argument one is not convertible to OnStreamFn, so overload resolution
+     * between the two constructors is unambiguous for any non-generic callable.
+     *
+     * KNOWN SOURCE-COMPATIBILITY EXCEPTION (0.9.1, measured with g++ 14.2 -std=c++17).
+     * "Purely additive" holds for every callable that names its parameters, which is
+     * every caller in this tree and every documented usage. It does NOT hold for an
+     * argument that is convertible to BOTH std::function types, because adding a
+     * second constructor makes those calls ambiguous where one constructor accepted
+     * them silently:
+     *
+     *     StreamReassembler r(nullptr);          // ambiguous since 0.9.1
+     *     StreamReassembler r({});               // ambiguous since 0.9.1
+     *     StreamReassembler r([](auto&&...){});  // ambiguous since 0.9.1 (generic lambda)
+     *
+     * Confirmed by compiling one TU against the pre-change header (exit 0) and against
+     * this one (three "call of overloaded ... is ambiguous" errors). It is a COMPILE
+     * error, never a silent behavior change, and the first two shapes built a
+     * reassembler that would throw std::bad_function_call on the first completion
+     * anyway. Fix at the call site by naming the form you want:
+     * `StreamReassembler(OnStreamFn(nullptr))` or `StreamReassembler(OnStreamTypedFn(nullptr))`.
+     */
+    StreamReassembler(OnStreamFn callback, StreamReassemblerConfig cfg = StreamReassemblerConfig())
+        : StreamReassembler(
+              OnStreamTypedFn([cb = std::move(callback)](uint64_t streamId, uint32_t,
+                                                         const std::vector<uint8_t>& data) {
+                  cb(streamId, data);
+              }),
+              cfg) {}
 
     /**
      * @brief The configuration actually in force, after the constructor's clamp.
@@ -387,7 +474,10 @@ public:
                      return true;
                  }
                  std::vector<uint8_t> empty;
-                 onStream(header->streamId, empty);
+                 // Second delivery site (SPEC §3.3.1 obligation 3): an empty
+                 // stream never reaches the chunk path, so the tag has to be
+                 // carried from the header right here.
+                 onStream(header->streamId, header->appMsgType, empty);
                  msgType = MsgType::NORMAL;
                  respSize = 0;
                  return true;
@@ -417,6 +507,7 @@ public:
             StreamContext ctx;
             ctx.totalSize = header->totalSize;
             ctx.totalChunks = header->totalChunks;
+            ctx.appMsgType = header->appMsgType;
             ctx.startTime = std::chrono::steady_clock::now();
 
             try {
@@ -554,13 +645,33 @@ public:
                 // what catches an UNDER-sized stream, which no per-chunk guard
                 // can see; an over-sized one was already refused at arrival.
                 if (ctx.offset == ctx.totalSize) {
+                    // RETIRE BY EXTRACT, NOT ERASE — this is a safety property,
+                    // not a style choice. Two values still have to come out of
+                    // the context (the payload and the routing tag), and with
+                    // `streams.erase(it)` the code was only correct because both
+                    // reads happened to be written ABOVE the erase: swapping the
+                    // erase with either read is a use-after-free that no test in
+                    // this repo can fail (the freed node's bytes are almost always
+                    // still intact, so test_reassembler_appmsgtype_delivery exits 0
+                    // under that mutation — measured 2026-08-03). `extract` removes
+                    // the node from the map while TRANSFERRING OWNERSHIP of it to
+                    // `node`, so `ctx` — a reference into that node — stays valid
+                    // until `node` dies at the end of this scope. The ordering
+                    // hazard is gone by construction rather than guarded by a
+                    // comment. Do not "simplify" this back to erase().
+                    auto node = streams.extract(it);
                     // Hand the destination out by move: the old layout built a
                     // second full-size buffer here, doubling peak residency.
                     std::vector<uint8_t> fullData = std::move(ctx.buf);
-                    streams.erase(it);
+                    // The tag is THIS stream's, read off its own context — not
+                    // from the chunk header (which has no appMsgType) and not
+                    // from any reassembler-wide "last seen" value, which would
+                    // report the wrong stream's tag whenever two streams are in
+                    // flight (SPEC §3.3.1 obligation 2).
+                    const uint32_t appMsgType = ctx.appMsgType;
                     lock.unlock(); // Unlock before callback to prevent deadlock
 
-                    onStream(header->streamId, fullData);
+                    onStream(header->streamId, appMsgType, fullData);
 
                     msgType = MsgType::NORMAL;
                     respSize = 0;
